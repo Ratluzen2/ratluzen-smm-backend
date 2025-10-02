@@ -1,1 +1,5 @@
-
+DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/DB?sslmode=require
+API_URL=https://kd1s.com/api/v2
+API_KEY=YOUR_KD1S_KEY
+ADMIN_ID=7655504656
+JWT_SECRET=change-me
