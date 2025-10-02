@@ -1,1 +1,9 @@
-
+fastapi
+uvicorn[standard]
+python-dotenv
+pydantic
+psycopg[binary]
+psycopg_pool
+requests
+pyjwt
+gunicorn
