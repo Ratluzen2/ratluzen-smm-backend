@@ -1,4 +1,4 @@
-# db.py
+# app/db.py
 import os
 from typing import AsyncGenerator
 
@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine, AsyncConnec
 from sqlalchemy import text
 
 def _make_async_db_url(url: str) -> str:
-    # هيروكو غالباً يعطي postgres:// — نحتاج asyncpg:
+    # Heroku/Neon قد يعطون postgres:// — نحتاج asyncpg:
     # نحول postgres:// -> postgresql+asyncpg://
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+asyncpg://", 1)
@@ -16,7 +16,7 @@ def _make_async_db_url(url: str) -> str:
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 if not DATABASE_URL:
-    raise RuntimeError("متغير البيئة DATABASE_URL غير مضبوط في Heroku!")
+    raise RuntimeError("متغير البيئة DATABASE_URL غير مضبوط!")
 
 ASYNC_DB_URL = _make_async_db_url(DATABASE_URL)
 
@@ -26,7 +26,7 @@ engine: AsyncEngine = create_async_engine(
     pool_pre_ping=True,
 )
 
-# تهيئة الجداول عند بدء التشغيل
+# إنشاء الجداول عند الإقلاع
 CREATE_USERS_SQL = """
 CREATE TABLE IF NOT EXISTS users (
   uid TEXT PRIMARY KEY,
@@ -54,6 +54,6 @@ async def init_db() -> None:
         await conn.execute(text(CREATE_ORDERS_SQL))
 
 async def get_db() -> AsyncGenerator[AsyncConnection, None]:
-    # نستخدم Transaction تلقائي (BEGIN/COMMIT) لكل طلب
+    # Transaction تلقائي لكل طلب
     async with engine.begin() as conn:
         yield conn
