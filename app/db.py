@@ -1,59 +1,55 @@
 # app/db.py
 import os
-from typing import AsyncGenerator
+import ssl
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine, AsyncConnection
-from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
-def _make_async_db_url(url: str) -> str:
-    # Heroku/Neon قد يعطون postgres:// — نحتاج asyncpg:
-    # نحول postgres:// -> postgresql+asyncpg://
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
-    elif url.startswith("postgresql://"):
-        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    return url
+# سننشئ URL متوافق مع asyncpg ونزيل أي مفاتيح لا يدعمها (sslmode, channel_binding)
+def _build_async_url() -> str:
+    raw = os.getenv("DATABASE_URL") or os.getenv("NEON_DATABASE_URL")
+    if not raw:
+        raise RuntimeError("DATABASE_URL not set")
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-if not DATABASE_URL:
-    raise RuntimeError("متغير البيئة DATABASE_URL غير مضبوط!")
+    # normalize scheme
+    if raw.startswith("postgres://"):
+        raw = raw.replace("postgres://", "postgresql://", 1)
+    if raw.startswith("postgresql://"):
+        raw = raw.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-ASYNC_DB_URL = _make_async_db_url(DATABASE_URL)
+    parts = urlsplit(raw)
+    q = dict(parse_qsl(parts.query, keep_blank_values=True))
+    # مفاتيح خاصة بـ libpq وليست مدعومة في asyncpg:
+    q.pop("sslmode", None)
+    q.pop("channel_binding", None)
+    # لا نحتاج لوضع ssl في الURL؛ سنمرّره عبر connect_args
+    new_query = urlencode(q)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
 
-engine: AsyncEngine = create_async_engine(
-    ASYNC_DB_URL,
-    echo=False,
+
+ASYNC_DATABASE_URL = _build_async_url()
+
+# سياق SSL افتراضي مع التحقق من الشهادة (مطلوب ل Neon/Heroku)
+_sslctx = ssl.create_default_context()
+
+engine = create_async_engine(
+    ASYNC_DATABASE_URL,
     pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=10,
+    connect_args={"ssl": _sslctx},  # هذا يفرض SSL مع تحقق الشهادة
 )
 
-# إنشاء الجداول عند الإقلاع
-CREATE_USERS_SQL = """
-CREATE TABLE IF NOT EXISTS users (
-  uid TEXT PRIMARY KEY,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-"""
+# جلسات
+SessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
-CREATE_ORDERS_SQL = """
-CREATE TABLE IF NOT EXISTS orders (
-  id SERIAL PRIMARY KEY,
-  uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
-  service_name TEXT NOT NULL,
-  quantity INTEGER NOT NULL,
-  price NUMERIC(12,2) NOT NULL,
-  link TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  provider_order_id TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-"""
-
-async def init_db() -> None:
+# تهيئة الجداول عند الإقلاع
+async def init_db():
+    from .models import Base  # نتأكد من استيراد الموديلات
     async with engine.begin() as conn:
-        await conn.execute(text(CREATE_USERS_SQL))
-        await conn.execute(text(CREATE_ORDERS_SQL))
+        await conn.run_sync(Base.metadata.create_all)
 
-async def get_db() -> AsyncGenerator[AsyncConnection, None]:
-    # Transaction تلقائي لكل طلب
-    async with engine.begin() as conn:
-        yield conn
+# تبعية FastAPI: الحصول على Session
+async def get_session() -> AsyncSession:
+    async with SessionLocal() as session:
+        yield session
