@@ -7,11 +7,10 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is missing")
 
-# ملاحظة: لا نجبر درايفر معيّن؛ SQLAlchemy سيختار المناسب وفقًا للرابط.
-# نفعّل pool_pre_ping لتفادي انقطاع الاتصالات الخاملة على هيروكو.
+# ملاحظة: psycopg2-binary يتعامل بسلاسة مع ?sslmode=require لدى Neon/Heroku
 engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True,            # يتحقق قبل كل طلب
+    pool_pre_ping=True,   # يتحقق قبل كل طلب لتفادي انقطاع الاتصالات
     pool_size=5,
     max_overflow=5,
 )
@@ -33,7 +32,7 @@ def get_db():
 
 def init_db() -> None:
     """
-    فحص اتصال القاعدة عند الإقلاع. لا ننشئ الجداول هنا (أنت أنشأتها على Neon).
+    فحص اتصال القاعدة عند الإقلاع. (إنشاء الجداول ممكن يكون على Neon مسبقاً)
     """
     try:
         with engine.connect() as conn:
