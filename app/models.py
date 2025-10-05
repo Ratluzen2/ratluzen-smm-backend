@@ -1,52 +1,45 @@
+# app/models.py
+from sqlalchemy import (
+    Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text, func, MetaData
+)
 from sqlalchemy.orm import declarative_base, relationship
-from sqlalchemy import Column, Integer, String, Float, Text, ForeignKey, BigInteger, UniqueConstraint
 
-Base = declarative_base()
+# <- مهم: نجعل كل الجداول داخل schema "smm"
+metadata = MetaData(schema="smm")
+Base = declarative_base(metadata=metadata)
 
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100), default="user")
-    wallet = relationship("Wallet", uselist=False, back_populates="user")
+    username = Column(String(64), unique=True, nullable=True)
+    is_admin = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    wallet = relationship("Wallet", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    orders = relationship("Order", back_populates="user", cascade="all, delete-orphan")
 
 class Wallet(Base):
     __tablename__ = "wallets"
-    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    user_id = Column(Integer, ForeignKey("smm.users.id", ondelete="CASCADE"), primary_key=True)
     balance = Column(Float, default=0.0)
     user = relationship("User", back_populates="wallet")
 
-class Moderator(Base):
-    __tablename__ = "moderators"
-    user_id = Column(Integer, primary_key=True)
+class Service(Base):
+    __tablename__ = "services"
+    id = Column(Integer, primary_key=True, index=True)
+    category = Column(String(50), nullable=False)
+    name = Column(String(100), nullable=False)
+    price = Column(Float, nullable=False)
 
 class Order(Base):
     __tablename__ = "orders"
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, index=True)
-    category = Column(String(50))
-    service_name = Column(String(200))
-    qty = Column(Integer, default=0)
-    price = Column(Float, default=0.0)
-    status = Column(String(30), default="pending")
-    link = Column(Text, default="")
-    ts = Column(BigInteger)
-
-class PriceOverride(Base):
-    __tablename__ = "price_overrides"
-    id = Column(Integer, primary_key=True)
-    service = Column(String(200), unique=True, index=True)
-    price = Column(Float, default=0.0)
-
-class QtyOverride(Base):
-    __tablename__ = "qty_overrides"
-    id = Column(Integer, primary_key=True)
-    service = Column(String(200), unique=True, index=True)
-    qty = Column(Integer, default=1000)
-
-class CardSubmission(Base):
-    __tablename__ = "card_submissions"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, index=True)
-    digits = Column(String(80), index=True)
-    ts = Column(BigInteger, index=True)
-    __table_args__ = (UniqueConstraint('user_id','digits', name='uq_user_digits'),)
+    user_id = Column(Integer, ForeignKey("smm.users.id", ondelete="CASCADE"), nullable=False)
+    category = Column(String(50), nullable=False)
+    service_name = Column(String(120), nullable=False)
+    qty = Column(Integer, nullable=False)
+    price = Column(Float, nullable=False)
+    link = Column(Text, nullable=True)
+    status = Column(String(20), default="pending")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    user = relationship("User", back_populates="orders")
