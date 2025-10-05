@@ -1,39 +1,59 @@
+# db.py
 import os
-import re
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from typing import AsyncGenerator
 
-def normalize_database_url(url: str) -> str:
-    if not url:
-        return url
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine, AsyncConnection
+from sqlalchemy import text
 
-    # 1) postgres:// → postgresql://
+def _make_async_db_url(url: str) -> str:
+    # هيروكو غالباً يعطي postgres:// — نحتاج asyncpg:
+    # نحول postgres:// -> postgresql+asyncpg://
     if url.startswith("postgres://"):
-        url = "postgresql://" + url[len("postgres://"):]
-
-    # 2) أزل أي سائق صريح مثل +psycopg أو +pg8000 أو غيره
-    #    مثال: postgresql+psycopg:// → postgresql://
-    url = re.sub(r"^postgresql\+\w+://", "postgresql://", url, count=1, flags=re.IGNORECASE)
-
-    # 3) أضمن sslmode=require موجود
-    lower = url.lower()
-    if lower.startswith("postgresql://") and "sslmode=" not in lower:
-        sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}sslmode=require"
-
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
     return url
 
-DATABASE_URL = normalize_database_url(os.getenv("DATABASE_URL", ""))
-
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
+    raise RuntimeError("متغير البيئة DATABASE_URL غير مضبوط في Heroku!")
 
-# اتصال متين على Heroku
-engine = create_engine(
-    DATABASE_URL,
+ASYNC_DB_URL = _make_async_db_url(DATABASE_URL)
+
+engine: AsyncEngine = create_async_engine(
+    ASYNC_DB_URL,
+    echo=False,
     pool_pre_ping=True,
-    pool_recycle=1800,
-    future=True,
 )
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# تهيئة الجداول عند بدء التشغيل
+CREATE_USERS_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+  uid TEXT PRIMARY KEY,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+CREATE_ORDERS_SQL = """
+CREATE TABLE IF NOT EXISTS orders (
+  id SERIAL PRIMARY KEY,
+  uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+  service_name TEXT NOT NULL,
+  quantity INTEGER NOT NULL,
+  price NUMERIC(12,2) NOT NULL,
+  link TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  provider_order_id TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+async def init_db() -> None:
+    async with engine.begin() as conn:
+        await conn.execute(text(CREATE_USERS_SQL))
+        await conn.execute(text(CREATE_ORDERS_SQL))
+
+async def get_db() -> AsyncGenerator[AsyncConnection, None]:
+    # نستخدم Transaction تلقائي (BEGIN/COMMIT) لكل طلب
+    async with engine.begin() as conn:
+        yield conn
