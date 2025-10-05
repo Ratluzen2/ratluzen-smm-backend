@@ -1,55 +1,43 @@
-# app/db.py
 import os
-import ssl
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
 
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+# احصل على رابط قاعدة البيانات من متغيرات البيئة في هيروكو (Config Vars)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL env var is missing")
 
-# سننشئ URL متوافق مع asyncpg ونزيل أي مفاتيح لا يدعمها (sslmode, channel_binding)
-def _build_async_url() -> str:
-    raw = os.getenv("DATABASE_URL") or os.getenv("NEON_DATABASE_URL")
-    if not raw:
-        raise RuntimeError("DATABASE_URL not set")
-
-    # normalize scheme
-    if raw.startswith("postgres://"):
-        raw = raw.replace("postgres://", "postgresql://", 1)
-    if raw.startswith("postgresql://"):
-        raw = raw.replace("postgresql://", "postgresql+asyncpg://", 1)
-
-    parts = urlsplit(raw)
-    q = dict(parse_qsl(parts.query, keep_blank_values=True))
-    # مفاتيح خاصة بـ libpq وليست مدعومة في asyncpg:
-    q.pop("sslmode", None)
-    q.pop("channel_binding", None)
-    # لا نحتاج لوضع ssl في الURL؛ سنمرّره عبر connect_args
-    new_query = urlencode(q)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
-
-
-ASYNC_DATABASE_URL = _build_async_url()
-
-# سياق SSL افتراضي مع التحقق من الشهادة (مطلوب ل Neon/Heroku)
-_sslctx = ssl.create_default_context()
-
-engine = create_async_engine(
-    ASYNC_DATABASE_URL,
-    pool_pre_ping=True,
+# ملاحظة: لا نجبر درايفر معيّن؛ SQLAlchemy سيختار المناسب وفقًا للرابط.
+# نفعّل pool_pre_ping لتفادي انقطاع الاتصالات الخاملة على هيروكو.
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,            # يتحقق قبل كل طلب
     pool_size=5,
-    max_overflow=10,
-    connect_args={"ssl": _sslctx},  # هذا يفرض SSL مع تحقق الشهادة
+    max_overflow=5,
 )
 
-# جلسات
-SessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+# مصنع جلسات SQLAlchemy (Sync)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# تهيئة الجداول عند الإقلاع
-async def init_db():
-    from .models import Base  # نتأكد من استيراد الموديلات
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+def get_db():
+    """
+    Dependency للاستخدام مع FastAPI:
+    from fastapi import Depends
+    def endpoint(db: Session = Depends(get_db)): ...
+    """
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-# تبعية FastAPI: الحصول على Session
-async def get_session() -> AsyncSession:
-    async with SessionLocal() as session:
-        yield session
+def init_db() -> None:
+    """
+    فحص اتصال القاعدة عند الإقلاع. لا ننشئ الجداول هنا (أنت أنشأتها على Neon).
+    """
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except Exception as exc:
+        # اطبع للّوج فقط كي لا يمنع الإقلاع
+        print(f"[init_db] database ping failed: {exc}")
