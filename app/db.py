@@ -1,1 +1,9 @@
-from app.database import Base, engine, SessionLocal, get_db  # re-export
+from typing import Generator
+from .database import SessionLocal
+
+def get_db() -> Generator:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
