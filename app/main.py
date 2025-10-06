@@ -1,15 +1,30 @@
 from fastapi import FastAPI
-from .database import Base, engine
-from .routers.smm import router as smm_router
-from .routers.routes_provider import router as provider_router
+from fastapi.middleware.cors import CORSMiddleware
+from .database import engine
+from .models import Base
+from .routers.smm import r as public_router
+from .routers.routes_provider import r as provider_router
+from .routers.admin import r as admin_router
 
-# إنشاء الجداول عند الإقلاع (بسيط بدون Alembic)
+app = FastAPI(title="ratluzen-smm-backend", version="1.0.0")
+
+# إنشاء الجداول تلقائياً عند الإقلاع
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="ratluzen-smm-backend")
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# صحّة الخادم + upsert المستخدم
-app.include_router(smm_router)
+# مسارات
+app.include_router(public_router, prefix="/api")
+app.include_router(provider_router, prefix="/api")
+app.include_router(admin_router, prefix="/api")
 
-# مزوّد الخدمات + لوحات المالك
-app.include_router(provider_router)
+@app.get("/")
+def root():
+    return {"ok": True, "name": "ratluzen-smm-backend"}
