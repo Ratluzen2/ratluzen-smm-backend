@@ -1,13 +1,12 @@
 import os
+from dataclasses import dataclass
 
-DATABASE_URL   = os.getenv("DATABASE_URL", "")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "2000")
-JWT_SECRET     = os.getenv("JWT_SECRET", "change_me")
-JWT_EXPIRE_DAYS = int(os.getenv("JWT_EXPIRE_DAYS", "7"))
+@dataclass(frozen=True)
+class Settings:
+    DATABASE_URL: str = os.environ["DATABASE_URL"]
+    SMM_API_URL: str = os.getenv("SMM_API_URL", "https://kd1s.com/api/v2")
+    SMM_API_KEY: str = os.getenv("SMM_API_KEY", "")
+    ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "2000")
 
-# يدعم الاسمين: PROVIDER_* أو SMM_API_*
-PROVIDER_BASE  = (os.getenv("PROVIDER_BASE") or os.getenv("SMM_API_URL") or "").strip()
-PROVIDER_KEY   = (os.getenv("PROVIDER_KEY")  or os.getenv("SMM_API_KEY")  or "").strip()
-
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
-FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "").strip()  # اختياري
+def get_settings() -> Settings:
+    return Settings()
