@@ -1,29 +1,15 @@
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from .database import Base, engine
+from .routers.smm import router as smm_router
+from .routers.routes_provider import router as provider_router
 
-from app.database import Base, engine
-from app.config import ALLOWED_ORIGINS
-from app.routers import smm, admin
+# إنشاء الجداول عند الإقلاع (بسيط بدون Alembic)
+Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Ratluzén SMM Backend", version="1.0.0")
+app = FastAPI(title="ratluzen-smm-backend")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# صحّة الخادم + upsert المستخدم
+app.include_router(smm_router)
 
-@app.on_event("startup")
-def on_startup():
-    # إنشاء الجداول تلقائيًا (بسيط — يمكنك لاحقًا استخدام Alembic)
-    Base.metadata.create_all(bind=engine)
-
-# تضمين المسارات
-app.include_router(smm.router, prefix="/api", tags=["public"])
-app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
-
-@app.get("/health")
-async def health():
-    return {"ok": True}
+# مزوّد الخدمات + لوحات المالك
+app.include_router(provider_router)
