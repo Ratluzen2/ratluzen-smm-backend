@@ -1,198 +1,259 @@
-import datetime as dt
-import httpx
-import jwt
 from fastapi import APIRouter, Depends, Header, HTTPException
-from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from typing import Optional
 
-from app.config import ADMIN_PASSWORD, JWT_SECRET, JWT_EXPIRE_DAYS, FCM_SERVER_KEY
-from app.database import get_db
-from app.models import Order, Wallet, WalletLedger, Notification, User, AsiacellCard, DeviceToken
-from app.providers.smm_client import provider_balance
-from app.provider_map import SERVICE_CATALOG
+from ..config import settings
+from ..database import get_db
+from ..models import User, ServiceOrder, WalletCard, ItunesOrder, PhoneTopup, PubgOrder, LudoOrder, Notice, Token
+from ..providers.smm_client import provider_add_order, provider_balance, provider_status
 
-router = APIRouter()
+r = APIRouter(prefix="/admin")
 
-# ====== نماذج ======
-class AdminLoginIn(BaseModel):
-    password: str
+def guard(pass_hdr: Optional[str] = Header(default=None, alias="x-admin-pass")):
+    if (pass_hdr or "").strip() != settings.ADMIN_PASSWORD:
+        raise HTTPException(401, "unauthorized")
 
-class ApproveIn(BaseModel):
-    order_id: str
-
-class RejectIn(BaseModel):
-    order_id: str
-    reason: str | None = None
-
-class RefundIn(BaseModel):
-    order_id: str
-
-class WalletChangeIn(BaseModel):
-    uid: str
-    amount: float
-    note: str | None = None
-
-# ====== JWT ======
-def make_token() -> str:
-    expiry = dt.datetime.utcnow() + dt.timedelta(days=JWT_EXPIRE_DAYS)
-    return jwt.encode({"role": "admin", "exp": expiry}, JWT_SECRET, algorithm="HS256")
-
-def require_admin(authorization: str = Header(default="")):
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="UNAUTHORIZED")
-    token = authorization[7:]
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        if payload.get("role") != "admin":
-            raise HTTPException(status_code=401, detail="UNAUTHORIZED")
-    except Exception:
-        raise HTTPException(status_code=401, detail="UNAUTHORIZED")
-
-# ====== Routes ======
-@router.post("/login")
-def login(body: AdminLoginIn):
-    if body.password != ADMIN_PASSWORD:
-        raise HTTPException(status_code=401, detail="UNAUTHORIZED")
-    return {"ok": True, "token": make_token()}
-
-@router.get("/pending/services", dependencies=[Depends(require_admin)])
+# ---------- الخدمات المعلّقة ----------
+@r.get("/pending/services", dependencies=[Depends(guard)])
 def pending_services(db: Session = Depends(get_db)):
-    q = db.query(Order).filter(Order.type=="provider", Order.status.in_(("PENDING","REVIEW")))\
-        .order_by(Order.created_at.desc()).all()
-    return {"ok": True, "items": [serialize_order(o) for o in q]}
+    lst = db.query(ServiceOrder).filter_by(status="pending").order_by(ServiceOrder.created_at.desc()).all()
+    return {"ok": True, "list": lst}
 
-@router.get("/pending/itunes", dependencies=[Depends(require_admin)])
+@r.post("/pending/services/{order_id}/approve", dependencies=[Depends(guard)])
+def approve_service(order_id: int, db: Session = Depends(get_db)):
+    order = db.query(ServiceOrder).get(order_id)
+    if not order or order.status != "pending":
+        raise HTTPException(404, "order not found or not pending")
+    send = provider_add_order(order.service_key, order.link, order.quantity)
+    if not send.get("ok"):
+        raise HTTPException(502, send.get("error", "provider error"))
+    order.status = "processing"
+    order.provider_order_id = send["orderId"]
+    db.add(order)
+    db.add(Notice(title="تم تنفيذ طلبك",
+                  body=f"أُرسل طلبك للمزوّد. رقم المزود: {order.provider_order_id}",
+                  for_owner=False, uid=order.uid))
+    db.commit()
+    return {"ok": True, "order": order}
+
+@r.post("/pending/services/{order_id}/reject", dependencies=[Depends(guard)])
+def reject_service(order_id: int, db: Session = Depends(get_db)):
+    order = db.query(ServiceOrder).get(order_id)
+    if not order or order.status != "pending":
+        raise HTTPException(404, "order not found or not pending")
+    order.status = "rejected"
+    # رد الرصيد
+    u = db.query(User).filter_by(uid=order.uid).first()
+    if u:
+        u.balance = round(u.balance + order.price, 2)
+        db.add(u)
+    db.add(order)
+    db.add(Notice(title="تم رفض الطلب", body="تم رفض طلبك وتم ردّ الرصيد.", for_owner=False, uid=order.uid))
+    db.commit()
+    return {"ok": True}
+
+# رصيد المزود وحالة الطلب
+@r.get("/provider/balance", dependencies=[Depends(guard)])
+def provider_bal():
+    return provider_balance()
+
+@r.get("/provider/order-status/{ext_order_id}", dependencies=[Depends(guard)])
+def provider_order_status(ext_order_id: str):
+    return provider_status(ext_order_id)
+
+# ---------- كارتات أسيا سيل ----------
+@r.get("/pending/cards", dependencies=[Depends(guard)])
+def pending_cards(db: Session = Depends(get_db)):
+    lst = db.query(WalletCard).filter_by(status="pending").order_by(WalletCard.created_at.desc()).all()
+    return {"ok": True, "list": lst}
+
+@r.post("/pending/cards/{card_id}/accept", dependencies=[Depends(guard)])
+def accept_card(card_id: int, amount_usd: float, reviewed_by: str = "owner", db: Session = Depends(get_db)):
+    card = db.query(WalletCard).get(card_id)
+    if not card or card.status != "pending":
+        raise HTTPException(404, "card not found or not pending")
+    card.status = "accepted"
+    card.amount_usd = amount_usd
+    card.reviewed_by = reviewed_by
+    u = db.query(User).filter_by(uid=card.uid).first()
+    if u:
+        u.balance = round(u.balance + amount_usd, 2)
+        db.add(u)
+    db.add(card)
+    db.add(Notice(title="تم شحن رصيدك", body=f"+${amount_usd} عبر بطاقة أسيا سيل", for_owner=False, uid=card.uid))
+    db.commit()
+    return {"ok": True}
+
+@r.post("/pending/cards/{card_id}/reject", dependencies=[Depends(guard)])
+def reject_card(card_id: int, db: Session = Depends(get_db)):
+    card = db.query(WalletCard).get(card_id)
+    if not card or card.status != "pending":
+        raise HTTPException(404, "card not found or not pending")
+    card.status = "rejected"
+    db.add(card)
+    db.add(Notice(title="تم رفض الكارت", body="يرجى التأكد من الرقم والمحاولة مجددًا.", for_owner=False, uid=card.uid))
+    db.commit()
+    return {"ok": True}
+
+# ---------- آيتونز ----------
+@r.get("/pending/itunes", dependencies=[Depends(guard)])
 def pending_itunes(db: Session = Depends(get_db)):
-    q = db.query(Order).filter(Order.type=="manual", Order.title.contains("ايتونز"), Order.status=="REVIEW")\
-        .order_by(Order.created_at.desc()).all()
-    return {"ok": True, "items": [serialize_order(o) for o in q]}
+    lst = db.query(ItunesOrder).filter_by(status="pending").order_by(ItunesOrder.created_at.desc()).all()
+    return {"ok": True, "list": lst}
 
-@router.get("/pending/topups", dependencies=[Depends(require_admin)])
-def pending_topups(db: Session = Depends(get_db)):
-    q = db.query(AsiacellCard).filter(AsiacellCard.status=="REVIEW").order_by(AsiacellCard.created_at.desc()).all()
-    return {"ok": True, "items": [{"id": c.id, "user_id": c.user_id, "card_number": c.card_number, "created_at": c.created_at} for c in q]}
+@r.post("/pending/itunes/{oid}/deliver", dependencies=[Depends(guard)])
+def deliver_itunes(oid: int, gift_code: str, db: Session = Depends(get_db)):
+    o = db.query(ItunesOrder).get(oid)
+    if not o or o.status != "pending":
+        raise HTTPException(404, "not found or not pending")
+    o.status = "delivered"; o.gift_code = gift_code
+    db.add(o)
+    db.add(Notice(title="كود آيتونز", body=f"الكود: {gift_code}", for_owner=False, uid=o.uid))
+    db.commit()
+    return {"ok": True}
 
-@router.get("/pending/pubg", dependencies=[Depends(require_admin)])
+@r.post("/pending/itunes/{oid}/reject", dependencies=[Depends(guard)])
+def reject_itunes(oid: int, db: Session = Depends(get_db)):
+    o = db.query(ItunesOrder).get(oid)
+    if not o or o.status != "pending":
+        raise HTTPException(404, "not found or not pending")
+    o.status = "rejected"
+    db.add(o); db.add(Notice(title="رفض آيتونز", body="تم رفض طلبك.", for_owner=False, uid=o.uid))
+    db.commit(); return {"ok": True}
+
+# ---------- أرصدة الهاتف ----------
+@r.get("/pending/phone", dependencies=[Depends(guard)])
+def pending_phone(db: Session = Depends(get_db)):
+    lst = db.query(PhoneTopup).filter_by(status="pending").order_by(PhoneTopup.created_at.desc()).all()
+    return {"ok": True, "list": lst}
+
+@r.post("/pending/phone/{oid}/deliver", dependencies=[Depends(guard)])
+def deliver_phone(oid: int, code: str, db: Session = Depends(get_db)):
+    o = db.query(PhoneTopup).get(oid)
+    if not o or o.status != "pending":
+        raise HTTPException(404, "not found or not pending")
+    o.status = "delivered"; o.code = code
+    db.add(o); db.add(Notice(title="كارت الهاتف", body=f"الكود: {code}", for_owner=False, uid=o.uid))
+    db.commit(); return {"ok": True}
+
+@r.post("/pending/phone/{oid}/reject", dependencies=[Depends(guard)])
+def reject_phone(oid: int, db: Session = Depends(get_db)):
+    o = db.query(PhoneTopup).get(oid)
+    if not o or o.status != "pending":
+        raise HTTPException(404, "not found or not pending")
+    o.status = "rejected"
+    db.add(o); db.add(Notice(title="رفض رصيد الهاتف", body="تم رفض الطلب.", for_owner=False, uid=o.uid))
+    db.commit(); return {"ok": True}
+
+# ---------- PUBG ----------
+@r.get("/pending/pubg", dependencies=[Depends(guard)])
 def pending_pubg(db: Session = Depends(get_db)):
-    q = db.query(Order).filter(Order.type=="manual", Order.title.contains("ببجي"), Order.status=="REVIEW")\
-        .order_by(Order.created_at.desc()).all()
-    return {"ok": True, "items": [serialize_order(o) for o in q]}
+    lst = db.query(PubgOrder).filter_by(status="pending").order_by(PubgOrder.created_at.desc()).all()
+    return {"ok": True, "list": lst}
 
-@router.get("/pending/ludo", dependencies=[Depends(require_admin)])
+@r.post("/pending/pubg/{oid}/deliver", dependencies=[Depends(guard)])
+def deliver_pubg(oid: int, db: Session = Depends(get_db)):
+    o = db.query(PubgOrder).get(oid)
+    if not o or o.status != "pending":
+        raise HTTPException(404, "not found or not pending")
+    o.status = "delivered"
+    db.add(o); db.add(Notice(title="تم شحن شداتك", body=f"حزمة {o.pkg} UC", for_owner=False, uid=o.uid))
+    db.commit(); return {"ok": True}
+
+@r.post("/pending/pubg/{oid}/reject", dependencies=[Depends(guard)])
+def reject_pubg(oid: int, db: Session = Depends(get_db)):
+    o = db.query(PubgOrder).get(oid)
+    if not o or o.status != "pending":
+        raise HTTPException(404, "not found or not pending")
+    o.status = "rejected"
+    db.add(o); db.add(Notice(title="رفض شدات ببجي", body="تم رفض طلبك.", for_owner=False, uid=o.uid))
+    db.commit(); return {"ok": True}
+
+# ---------- لودو ----------
+@r.get("/pending/ludo", dependencies=[Depends(guard)])
 def pending_ludo(db: Session = Depends(get_db)):
-    q = db.query(Order).filter(Order.type=="manual", Order.title.contains("لودو"), Order.status=="REVIEW")\
-        .order_by(Order.created_at.desc()).all()
-    return {"ok": True, "items": [serialize_order(o) for o in q]}
+    lst = db.query(LudoOrder).filter_by(status="pending").order_by(LudoOrder.created_at.desc()).all()
+    return {"ok": True, "list": lst}
 
-@router.post("/orders/approve", dependencies=[Depends(require_admin)])
-def approve_order(body: ApproveIn, db: Session = Depends(get_db)):
-    o = db.query(Order).filter(Order.id == body.order_id).first()
-    if not o:
-        raise HTTPException(status_code=404, detail="ORDER_NOT_FOUND")
-    o.status = "DONE"
-    db.add(Notification(user_id=o.user_id, title="تم تنفيذ طلبك", body=f"({o.title}) أُنجز.", is_for_owner=False))
-    db.commit()
-    return {"ok": True}
+@r.post("/pending/ludo/{oid}/deliver", dependencies=[Depends(guard)])
+def deliver_ludo(oid: int, db: Session = Depends(get_db)):
+    o = db.query(LudoOrder).get(oid)
+    if not o or o.status != "pending":
+        raise HTTPException(404, "not found or not pending")
+    o.status = "delivered"
+    db.add(o); db.add(Notice(title="تم تنفيذ لودو", body=f"{o.kind} {o.pack}", for_owner=False, uid=o.uid))
+    db.commit(); return {"ok": True}
 
-@router.post("/orders/reject", dependencies=[Depends(require_admin)])
-def reject_order(body: RejectIn, db: Session = Depends(get_db)):
-    o = db.query(Order).filter(Order.id == body.order_id).first()
-    if not o:
-        raise HTTPException(status_code=404, detail="ORDER_NOT_FOUND")
-    # رد الرصيد إن لم يكن DONE
-    if o.status != "DONE":
-        w = db.query(Wallet).filter(Wallet.user_id == o.user_id).first()
-        w.balance = float(w.balance) + float(o.price)
-        db.add(WalletLedger(user_id=o.user_id, delta=float(o.price), reason="order_reject_refund", ref=o.id))
-    o.status = "REJECTED"
-    db.add(Notification(user_id=o.user_id, title="تم رفض طلبك", body=(body.reason or "تم رفض الطلب وسيُعاد الرصيد."), is_for_owner=False))
-    db.commit()
-    return {"ok": True}
+@r.post("/pending/ludo/{oid}/reject", dependencies=[Depends(guard)])
+def reject_ludo(oid: int, db: Session = Depends(get_db)):
+    o = db.query(LudoOrder).get(oid)
+    if not o or o.status != "pending":
+        raise HTTPException(404, "not found or not pending")
+    o.status = "rejected"
+    db.add(o); db.add(Notice(title="رفض طلب لودو", body="تم رفض طلبك.", for_owner=False, uid=o.uid))
+    db.commit(); return {"ok": True}
 
-@router.post("/orders/refund", dependencies=[Depends(require_admin)])
-def refund_order(body: RefundIn, db: Session = Depends(get_db)):
-    o = db.query(Order).filter(Order.id == body.order_id).first()
-    if not o:
-        raise HTTPException(status_code=404, detail="ORDER_NOT_FOUND")
-    w = db.query(Wallet).filter(Wallet.user_id == o.user_id).first()
-    w.balance = float(w.balance) + float(o.price)
-    o.status = "REFUNDED"
-    db.add(WalletLedger(user_id=o.user_id, delta=float(o.price), reason="manual_refund", ref=o.id))
-    db.add(Notification(user_id=o.user_id, title="تم رد المبلغ", body=f"تم رد {float(o.price):.2f}$ للطلب ({o.title}).", is_for_owner=False))
-    db.commit()
-    return {"ok": True}
-
-@router.post("/wallet/topup", dependencies=[Depends(require_admin)])
-def wallet_topup(body: WalletChangeIn, db: Session = Depends(get_db)):
-    u = db.query(User).filter(User.uid == body.uid).first()
-    if not u:
-        u = User(uid=body.uid); db.add(u); db.flush(); db.add(Wallet(user_id=u.id, balance=0)); db.flush()
-    w = db.query(Wallet).filter(Wallet.user_id == u.id).first()
-    w.balance = float(w.balance) + float(body.amount)
-    db.add(WalletLedger(user_id=u.id, delta=float(body.amount), reason="admin_topup", ref=body.note))
-    db.add(Notification(user_id=u.id, title="تم شحن رصيدك", body=f"المبلغ: {float(body.amount):.2f}$"))
-    db.commit()
-    return {"ok": True, "balance": float(w.balance)}
-
-@router.post("/wallet/deduct", dependencies=[Depends(require_admin)])
-def wallet_deduct(body: WalletChangeIn, db: Session = Depends(get_db)):
-    u = db.query(User).filter(User.uid == body.uid).first()
-    if not u:
-        raise HTTPException(status_code=404, detail="USER_NOT_FOUND")
-    w = db.query(Wallet).filter(Wallet.user_id == u.id).first()
-    w.balance = max(0.0, float(w.balance) - float(body.amount))
-    db.add(WalletLedger(user_id=u.id, delta=-float(body.amount), reason="admin_deduct", ref=body.note))
-    db.commit()
-    return {"ok": True, "balance": float(w.balance)}
-
-@router.get("/stats/users-count", dependencies=[Depends(require_admin)])
+# ---------- إدارة المستخدمين ----------
+@r.get("/users/count", dependencies=[Depends(guard)])
 def users_count(db: Session = Depends(get_db)):
-    cnt = db.query(User).count()
-    return {"ok": True, "count": cnt}
+    return {"ok": True, "count": db.query(User).count()}
 
-@router.get("/stats/users-balances", dependencies=[Depends(require_admin)])
+@r.get("/users/balances", dependencies=[Depends(guard)])
 def users_balances(db: Session = Depends(get_db)):
-    total = db.query(Wallet).with_entities(func.coalesce(func.sum(Wallet.balance), 0)).scalar()  # type: ignore
-    return {"ok": True, "total_balance": float(total or 0)}
+    lst = db.query(User).order_by(User.balance.desc()).limit(500).all()
+    return {"ok": True, "list": [{"uid": u.uid, "balance": u.balance, "is_banned": u.is_banned} for u in lst]}
 
-@router.get("/provider/balance", dependencies=[Depends(require_admin)])
-async def provider_bal():
-    try:
-        info = await provider_balance()
-    except Exception:
-        info = {"balance": 0}
-    return {"ok": True, "provider": info}
+@r.post("/users/{uid}/topup", dependencies=[Depends(guard)])
+def user_topup(uid: str, amount: float, db: Session = Depends(get_db)):
+    u = db.query(User).filter_by(uid=uid).first()
+    if not u: raise HTTPException(404, "not found")
+    u.balance = round(u.balance + amount, 2); db.add(u)
+    db.add(Notice(title="تم إضافة رصيد", body=f"+${amount}", for_owner=False, uid=uid))
+    db.commit(); return {"ok": True, "balance": u.balance}
 
-# (اختياري) إرسال إشعار دفع عبر FCM لكل أجهزة المالك أو لمستخدم معيّن
-@router.post("/notify/push", dependencies=[Depends(require_admin)])
-async def push_notify(title: str, body: str, uid: str | None = None, to_owner: bool = False, db: Session = Depends(get_db)):
-    if not FCM_SERVER_KEY:
-        raise HTTPException(status_code=400, detail="FCM_NOT_CONFIGURED")
+@r.post("/users/{uid}/deduct", dependencies=[Depends(guard)])
+def user_deduct(uid: str, amount: float, db: Session = Depends(get_db)):
+    u = db.query(User).filter_by(uid=uid).first()
+    if not u: raise HTTPException(404, "not found")
+    u.balance = max(0.0, round(u.balance - amount, 2)); db.add(u)
+    db.add(Notice(title="تم خصم رصيد", body=f"-${amount}", for_owner=False, uid=uid))
+    db.commit(); return {"ok": True, "balance": u.balance}
 
-    q = db.query(DeviceToken)
-    if uid:
-        user = db.query(User).filter(User.uid == uid).first()
-        if not user: return {"ok": True, "sent": 0}
-        q = q.filter(DeviceToken.user_id == user.id)
-    if to_owner:
-        q = q.filter(DeviceToken.is_owner == True)
-    tokens = [t.token for t in q.all()]
-    if not tokens:
-        return {"ok": True, "sent": 0}
+@r.post("/users/{uid}/ban", dependencies=[Depends(guard)])
+def ban(uid: str, db: Session = Depends(get_db)):
+    u = db.query(User).filter_by(uid=uid).first()
+    if not u: raise HTTPException(404, "not found")
+    u.is_banned = True; db.add(u); db.commit(); return {"ok": True}
 
-    headers = {"Authorization": f"key={FCM_SERVER_KEY}", "Content-Type": "application/json"}
-    payload = {"registration_ids": tokens, "notification": {"title": title, "body": body}}
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post("https://fcm.googleapis.com/fcm/send", headers=headers, json=payload)
-        r.raise_for_status()
-    return {"ok": True, "sent": len(tokens)}
+@r.post("/users/{uid}/unban", dependencies=[Depends(guard)])
+def unban(uid: str, db: Session = Depends(get_db)):
+    u = db.query(User).filter_by(uid=uid).first()
+    if not u: raise HTTPException(404, "not found")
+    u.is_banned = False; db.add(u); db.commit(); return {"ok": True}
 
-# ====== Helpers ======
-from sqlalchemy import func  # used above
-
-def serialize_order(o: Order):
-    return {
-        "id": o.id, "user_id": o.user_id, "type": o.type, "service_id": o.service_id,
-        "title": o.title, "quantity": o.quantity, "price": float(o.price),
-        "payload": o.payload, "status": o.status, "created_at": o.created_at
-    }
+# ---------- إشعارات (إرسال يدوي) ----------
+import httpx
+@r.post("/notify/push", dependencies=[Depends(guard)])
+def push_notify(title: str = "تنبيه", body: str = "رسالة", target: str = "allUsers", db: Session = Depends(get_db)):
+    key = settings.FCM_SERVER_KEY
+    if not key: raise HTTPException(400, "FCM_SERVER_KEY not set")
+    if target == "owners":
+        tokens = [t.token for t in db.query(Token).filter_by(for_owner=True).all()]
+    elif target.startswith("uid:"):
+        uid = target.split(":",1)[1]
+        tokens = [t.token for t in db.query(Token).filter_by(uid=uid).all()]
+    else:
+        tokens = [t.token for t in db.query(Token).filter_by(for_owner=False).all()]
+    ok=0; fail=0
+    for tk in tokens:
+        try:
+            httpx.post(
+                "https://fcm.googleapis.com/fcm/send",
+                json={"to": tk, "notification": {"title": title, "body": body}},
+                headers={"Authorization": f"key={key}", "Content-Type":"application/json"},
+                timeout=8.0
+            )
+            ok += 1
+        except Exception:
+            fail += 1
+    return {"ok": True, "sent": ok, "failed": fail}
