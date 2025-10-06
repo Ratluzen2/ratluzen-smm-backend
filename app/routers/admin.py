@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Body
 from sqlalchemy.orm import Session
 from typing import Optional
 from datetime import datetime
+from pydantic import BaseModel
 
 from ..config import settings
 from ..database import get_db
@@ -13,6 +14,20 @@ from ..providers.smm_client import provider_add_order, provider_balance, provide
 import httpx
 
 r = APIRouter(prefix="/admin")
+
+# ---------- Pydantic payloads (للسماح بإرسال JSON أيضاً) ----------
+class AmountReq(BaseModel):
+    amount: float
+
+class AcceptCardReq(BaseModel):
+    amount_usd: float
+    reviewed_by: Optional[str] = None
+
+class GiftCodeReq(BaseModel):
+    gift_code: str
+
+class CodeReq(BaseModel):
+    code: str
 
 # -------- Helpers: JSON-serializable dicts --------
 def _row(obj):
@@ -58,12 +73,15 @@ def approve_service(order_id: int, db: Session = Depends(get_db)):
     order = db.get(ServiceOrder, order_id)
     if not order or order.status != "pending":
         raise HTTPException(404, "order not found or not pending")
+
     send = provider_add_order(order.service_key, order.link, order.quantity)
     if not send.get("ok"):
         raise HTTPException(502, send.get("error", "provider error"))
+
     order.status = "processing"
     order.provider_order_id = send["orderId"]
     db.add(order)
+
     db.add(
         Notice(
             title="تم تنفيذ طلبك",
@@ -80,12 +98,14 @@ def reject_service(order_id: int, db: Session = Depends(get_db)):
     order = db.get(ServiceOrder, order_id)
     if not order or order.status != "pending":
         raise HTTPException(404, "order not found or not pending")
+
     order.status = "rejected"
     # رد الرصيد
     u = db.query(User).filter_by(uid=order.uid).first()
     if u:
         u.balance = round(u.balance + order.price, 2)
         db.add(u)
+
     db.add(order)
     db.add(Notice(title="تم رفض الطلب", body="تم رفض طلبك وتم ردّ الرصيد.", for_owner=False, uid=order.uid))
     db.commit()
@@ -112,17 +132,36 @@ def pending_cards(db: Session = Depends(get_db)):
     return {"ok": True, "list": _rows(lst)}
 
 @r.post("/pending/cards/{card_id}/accept", dependencies=[Depends(guard)])
-def accept_card(card_id: int, amount_usd: float, reviewed_by: str = "owner", db: Session = Depends(get_db)):
+def accept_card(
+    card_id: int,
+    amount_usd: Optional[float] = Query(default=None),
+    reviewed_by: Optional[str] = Query(default="owner"),
+    payload: Optional[AcceptCardReq] = Body(default=None),
+    db: Session = Depends(get_db)
+):
+    # دعم JSON body أو query
+    if payload:
+        amount_usd = payload.amount_usd if payload.amount_usd is not None else amount_usd
+        if payload.reviewed_by:
+            reviewed_by = payload.reviewed_by
+
+    if amount_usd is None:
+        raise HTTPException(400, "amount_usd required")
+
     card = db.get(WalletCard, card_id)
     if not card or card.status != "pending":
         raise HTTPException(404, "card not found or not pending")
+
     card.status = "accepted"
-    card.amount_usd = amount_usd
-    card.reviewed_by = reviewed_by
+    card.amount_usd = float(amount_usd)
+    card.reviewed_by = reviewed_by or "owner"
+
     u = db.query(User).filter_by(uid=card.uid).first()
-    if u:
-        u.balance = round(u.balance + amount_usd, 2)
-        db.add(u)
+    if not u:
+        u = User(uid=card.uid, balance=0.0)
+    u.balance = round(u.balance + float(amount_usd), 2)
+    db.add(u)
+
     db.add(card)
     db.add(Notice(title="تم شحن رصيدك", body=f"+${amount_usd} عبر بطاقة أسيا سيل", for_owner=False, uid=card.uid))
     db.commit()
@@ -151,7 +190,16 @@ def pending_itunes(db: Session = Depends(get_db)):
     return {"ok": True, "list": _rows(lst)}
 
 @r.post("/pending/itunes/{oid}/deliver", dependencies=[Depends(guard)])
-def deliver_itunes(oid: int, gift_code: str, db: Session = Depends(get_db)):
+def deliver_itunes(
+    oid: int,
+    gift_code: Optional[str] = Query(default=None),
+    payload: Optional[GiftCodeReq] = Body(default=None),
+    db: Session = Depends(get_db)
+):
+    gift_code = (payload.gift_code if payload and payload.gift_code else gift_code)
+    if not gift_code:
+        raise HTTPException(400, "gift_code required")
+
     o = db.get(ItunesOrder, oid)
     if not o or o.status != "pending":
         raise HTTPException(404, "not found or not pending")
@@ -185,7 +233,16 @@ def pending_phone(db: Session = Depends(get_db)):
     return {"ok": True, "list": _rows(lst)}
 
 @r.post("/pending/phone/{oid}/deliver", dependencies=[Depends(guard)])
-def deliver_phone(oid: int, code: str, db: Session = Depends(get_db)):
+def deliver_phone(
+    oid: int,
+    code: Optional[str] = Query(default=None),
+    payload: Optional[CodeReq] = Body(default=None),
+    db: Session = Depends(get_db)
+):
+    code = (payload.code if payload and payload.code else code)
+    if not code:
+        raise HTTPException(400, "code required")
+
     o = db.get(PhoneTopup, oid)
     if not o or o.status != "pending":
         raise HTTPException(404, "not found or not pending")
@@ -287,22 +344,44 @@ def users_balances(db: Session = Depends(get_db)):
     }
 
 @r.post("/users/{uid}/topup", dependencies=[Depends(guard)])
-def user_topup(uid: str, amount: float, db: Session = Depends(get_db)):
+def user_topup(
+    uid: str,
+    amount: Optional[float] = Query(default=None),
+    payload: Optional[AmountReq] = Body(default=None),
+    db: Session = Depends(get_db)
+):
+    # دعم Query أو JSON
+    if payload and payload.amount is not None:
+        amount = payload.amount
+    if amount is None:
+        raise HTTPException(400, "amount required")
+
     u = db.query(User).filter_by(uid=uid).first()
     if not u:
-        raise HTTPException(404, "not found")
-    u.balance = round(u.balance + amount, 2)
+        u = User(uid=uid, balance=0.0)
+    u.balance = round(u.balance + float(amount), 2)
     db.add(u)
     db.add(Notice(title="تم إضافة رصيد", body=f"+${amount}", for_owner=False, uid=uid))
     db.commit()
     return {"ok": True, "balance": u.balance}
 
 @r.post("/users/{uid}/deduct", dependencies=[Depends(guard)])
-def user_deduct(uid: str, amount: float, db: Session = Depends(get_db)):
+def user_deduct(
+    uid: str,
+    amount: Optional[float] = Query(default=None),
+    payload: Optional[AmountReq] = Body(default=None),
+    db: Session = Depends(get_db)
+):
+    # دعم Query أو JSON
+    if payload and payload.amount is not None:
+        amount = payload.amount
+    if amount is None:
+        raise HTTPException(400, "amount required")
+
     u = db.query(User).filter_by(uid=uid).first()
     if not u:
-        raise HTTPException(404, "not found")
-    u.balance = max(0.0, round(u.balance - amount, 2))
+        u = User(uid=uid, balance=0.0)
+    u.balance = max(0.0, round(u.balance - float(amount), 2))
     db.add(u)
     db.add(Notice(title="تم خصم رصيد", body=f"-${amount}", for_owner=False, uid=uid))
     db.commit()
@@ -312,7 +391,7 @@ def user_deduct(uid: str, amount: float, db: Session = Depends(get_db)):
 def ban(uid: str, db: Session = Depends(get_db)):
     u = db.query(User).filter_by(uid=uid).first()
     if not u:
-        raise HTTPException(404, "not found")
+        u = User(uid=uid, balance=0.0)
     u.is_banned = True
     db.add(u)
     db.commit()
@@ -322,7 +401,7 @@ def ban(uid: str, db: Session = Depends(get_db)):
 def unban(uid: str, db: Session = Depends(get_db)):
     u = db.query(User).filter_by(uid=uid).first()
     if not u:
-        raise HTTPException(404, "not found")
+        u = User(uid=uid, balance=0.0)
     u.is_banned = False
     db.add(u)
     db.commit()
@@ -330,10 +409,16 @@ def unban(uid: str, db: Session = Depends(get_db)):
 
 # ---------- إشعارات (إرسال يدوي) ----------
 @r.post("/notify/push", dependencies=[Depends(guard)])
-def push_notify(title: str = "تنبيه", body: str = "رسالة", target: str = "allUsers", db: Session = Depends(get_db)):
+def push_notify(
+    title: str = "تنبيه",
+    body: str = "رسالة",
+    target: str = "allUsers",
+    db: Session = Depends(get_db)
+):
     key = settings.FCM_SERVER_KEY
     if not key:
         raise HTTPException(400, "FCM_SERVER_KEY not set")
+
     if target == "owners":
         tokens = [t.token for t in db.query(Token).filter_by(for_owner=True).all()]
     elif target.startswith("uid:"):
@@ -341,6 +426,7 @@ def push_notify(title: str = "تنبيه", body: str = "رسالة", target: str
         tokens = [t.token for t in db.query(Token).filter_by(uid=uid).all()]
     else:
         tokens = [t.token for t in db.query(Token).filter_by(for_owner=False).all()]
+
     ok = 0
     fail = 0
     for tk in tokens:
