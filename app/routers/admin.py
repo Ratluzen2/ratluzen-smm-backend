@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Body
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Body, status
 from sqlalchemy.orm import Session
 from typing import Optional
 from datetime import datetime
@@ -29,7 +29,7 @@ class GiftCodeReq(BaseModel):
 class CodeReq(BaseModel):
     code: str
 
-# -------- Helpers: JSON-serializable dicts --------
+# -------- Helpers --------
 def _row(obj):
     if obj is None:
         return None
@@ -42,6 +42,19 @@ def _row(obj):
 def _rows(lst):
     return [_row(o) for o in lst]
 
+def _normalize_uid(uid: str) -> str:
+    return (uid or "").strip()
+
+def _get_or_create_user(db: Session, uid: str) -> User:
+    uid = _normalize_uid(uid)
+    u = db.query(User).filter_by(uid=uid).first()
+    if u is None:
+        u = User(uid=uid, balance=0.0, is_banned=False, role="user")
+        db.add(u)
+        db.commit()
+        db.refresh(u)
+    return u
+
 # -------- Guard (owner password) --------
 def guard(
     x_admin_pass: Optional[str] = Header(default=None, alias="X-Admin-Pass"),
@@ -50,9 +63,9 @@ def guard(
 ):
     pwd = (x_admin_pass or x_admin_pass_alt or key or "").strip()
     if pwd != settings.ADMIN_PASSWORD:
-        raise HTTPException(401, "unauthorized")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized")
 
-# (اختياري) فحص سريع لكلمة المرور، مفيد لتفعيل وضع المالك من التطبيق
+# فحص سريع لكلمة المرور (لتفعيل وضع المالك من التطبيق)
 @r.get("/check", dependencies=[Depends(guard)])
 def check_ok():
     return {"ok": True}
@@ -103,7 +116,7 @@ def reject_service(order_id: int, db: Session = Depends(get_db)):
     # رد الرصيد
     u = db.query(User).filter_by(uid=order.uid).first()
     if u:
-        u.balance = round(u.balance + order.price, 2)
+        u.balance = round(float(u.balance or 0.0) + float(order.price or 0.0), 2)
         db.add(u)
 
     db.add(order)
@@ -154,12 +167,11 @@ def accept_card(
 
     card.status = "accepted"
     card.amount_usd = float(amount_usd)
-    card.reviewed_by = reviewed_by or "owner"
+    card.reviewed_by = (reviewed_by or "owner")
 
-    u = db.query(User).filter_by(uid=card.uid).first()
-    if not u:
-        u = User(uid=card.uid, balance=0.0)
-    u.balance = round(u.balance + float(amount_usd), 2)
+    u = _get_or_create_user(db, card.uid)
+    old = float(u.balance or 0.0)
+    u.balance = round(old + float(amount_usd), 2)
     db.add(u)
 
     db.add(card)
@@ -344,6 +356,7 @@ def users_balances(db: Session = Depends(get_db)):
     }
 
 @r.post("/users/{uid}/topup", dependencies=[Depends(guard)])
+@r.get("/users/{uid}/topup", dependencies=[Depends(guard)])  # دعم GET أيضًا
 def user_topup(
     uid: str,
     amount: Optional[float] = Query(default=None),
@@ -356,16 +369,17 @@ def user_topup(
     if amount is None:
         raise HTTPException(400, "amount required")
 
-    u = db.query(User).filter_by(uid=uid).first()
-    if not u:
-        u = User(uid=uid, balance=0.0)
-    u.balance = round(u.balance + float(amount), 2)
+    u = _get_or_create_user(db, uid)
+    old = float(u.balance or 0.0)
+    u.balance = round(old + float(amount), 2)
     db.add(u)
-    db.add(Notice(title="تم إضافة رصيد", body=f"+${amount}", for_owner=False, uid=uid))
+    db.add(Notice(title="تم إضافة رصيد", body=f"+${amount}", for_owner=False, uid=u.uid))
     db.commit()
-    return {"ok": True, "balance": u.balance}
+    db.refresh(u)
+    return {"ok": True, "uid": u.uid, "old_balance": old, "balance": u.balance}
 
 @r.post("/users/{uid}/deduct", dependencies=[Depends(guard)])
+@r.get("/users/{uid}/deduct", dependencies=[Depends(guard)])  # دعم GET أيضًا
 def user_deduct(
     uid: str,
     amount: Optional[float] = Query(default=None),
@@ -378,20 +392,20 @@ def user_deduct(
     if amount is None:
         raise HTTPException(400, "amount required")
 
-    u = db.query(User).filter_by(uid=uid).first()
-    if not u:
-        u = User(uid=uid, balance=0.0)
-    u.balance = max(0.0, round(u.balance - float(amount), 2))
+    u = _get_or_create_user(db, uid)
+    old = float(u.balance or 0.0)
+    if old < float(amount):
+        raise HTTPException(status_code=400, detail="Insufficient balance")
+    u.balance = round(old - float(amount), 2)
     db.add(u)
-    db.add(Notice(title="تم خصم رصيد", body=f"-${amount}", for_owner=False, uid=uid))
+    db.add(Notice(title="تم خصم رصيد", body=f"-${amount}", for_owner=False, uid=u.uid))
     db.commit()
-    return {"ok": True, "balance": u.balance}
+    db.refresh(u)
+    return {"ok": True, "uid": u.uid, "old_balance": old, "balance": u.balance}
 
 @r.post("/users/{uid}/ban", dependencies=[Depends(guard)])
 def ban(uid: str, db: Session = Depends(get_db)):
-    u = db.query(User).filter_by(uid=uid).first()
-    if not u:
-        u = User(uid=uid, balance=0.0)
+    u = _get_or_create_user(db, uid)
     u.is_banned = True
     db.add(u)
     db.commit()
@@ -399,9 +413,7 @@ def ban(uid: str, db: Session = Depends(get_db)):
 
 @r.post("/users/{uid}/unban", dependencies=[Depends(guard)])
 def unban(uid: str, db: Session = Depends(get_db)):
-    u = db.query(User).filter_by(uid=uid).first()
-    if not u:
-        u = User(uid=uid, balance=0.0)
+    u = _get_or_create_user(db, uid)
     u.is_banned = False
     db.add(u)
     db.commit()
