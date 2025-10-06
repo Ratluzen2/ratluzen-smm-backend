@@ -1,35 +1,32 @@
 import httpx
-from typing import Any, Dict
-from app.config import PROVIDER_BASE, PROVIDER_KEY
+from typing import Any
+from ..config import get_settings
+from ..provider_map import PROVIDER_SERVICE_IDS
 
-def _check_ready():
-    if not PROVIDER_BASE or not PROVIDER_KEY:
-        raise RuntimeError("Provider base/key not configured")
+_settings = get_settings()
 
-async def provider_balance() -> Dict[str, Any]:
-    _check_ready()
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(PROVIDER_BASE, data={"key": PROVIDER_KEY, "action": "balance"})
-        r.raise_for_status()
-        return r.json()
+def place_order(service_key: str, link: str, quantity: int) -> dict[str, Any]:
+    """
+    ينشئ طلب عند المزوّد ويرجع json كما يرسله المزوّد.
+    يعتمد على خريطة service_key -> service_id.
+    """
+    service_id = PROVIDER_SERVICE_IDS.get(service_key)
+    if not service_id:
+        return {"error": f"Unknown service_key: {service_key}"}
 
-async def create_provider_order(service_id: int, link: str, quantity: int) -> Dict[str, Any]:
-    _check_ready()
     payload = {
-        "key": PROVIDER_KEY,
+        "key": _settings.SMM_API_KEY,
         "action": "add",
         "service": service_id,
         "link": link,
-        "quantity": quantity
+        "quantity": quantity,
     }
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(PROVIDER_BASE, data=payload)
-        r.raise_for_status()
-        return r.json()
+    r = httpx.post(_settings.SMM_API_URL, data=payload, timeout=30.0)
+    r.raise_for_status()
+    return r.json()
 
-async def provider_order_status(order_id: str) -> Dict[str, Any]:
-    _check_ready()
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(PROVIDER_BASE, data={"key": PROVIDER_KEY, "action": "status", "order": order_id})
-        r.raise_for_status()
-        return r.json()
+def check_status(order_id: str) -> dict[str, Any]:
+    payload = {"key": _settings.SMM_API_KEY, "action": "status", "order": order_id}
+    r = httpx.post(_settings.SMM_API_URL, data=payload, timeout=30.0)
+    r.raise_for_status()
+    return r.json()
