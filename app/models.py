@@ -1,45 +1,53 @@
-# app/models.py
-from sqlalchemy import (
-    Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text, func, MetaData
-)
-from sqlalchemy.orm import declarative_base, relationship
-
-# <- مهم: نجعل كل الجداول داخل schema "smm"
-metadata = MetaData(schema="smm")
-Base = declarative_base(metadata=metadata)
+from sqlalchemy import String, Integer, Float, Boolean, Text, DateTime, ForeignKey, func
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.database import Base
 
 class User(Base):
     __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String(64), unique=True, nullable=True)
-    is_admin = Column(Boolean, default=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    uid: Mapped[str] = mapped_column(String(32), primary_key=True)
+    balance: Mapped[float] = mapped_column(Float, default=0.0)
+    is_owner: Mapped[bool] = mapped_column(Boolean, default=False)  # احتياطي
+    created_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    wallet = relationship("Wallet", back_populates="user", uselist=False, cascade="all, delete-orphan")
-    orders = relationship("Order", back_populates="user", cascade="all, delete-orphan")
-
-class Wallet(Base):
-    __tablename__ = "wallets"
-    user_id = Column(Integer, ForeignKey("smm.users.id", ondelete="CASCADE"), primary_key=True)
-    balance = Column(Float, default=0.0)
-    user = relationship("User", back_populates="wallet")
-
-class Service(Base):
-    __tablename__ = "services"
-    id = Column(Integer, primary_key=True, index=True)
-    category = Column(String(50), nullable=False)
-    name = Column(String(100), nullable=False)
-    price = Column(Float, nullable=False)
+    orders: Mapped[list["Order"]] = relationship(back_populates="user", cascade="all, delete")
+    notices: Mapped[list["Notice"]] = relationship(back_populates="user", cascade="all, delete")
 
 class Order(Base):
     __tablename__ = "orders"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("smm.users.id", ondelete="CASCADE"), nullable=False)
-    category = Column(String(50), nullable=False)
-    service_name = Column(String(120), nullable=False)
-    qty = Column(Integer, nullable=False)
-    price = Column(Float, nullable=False)
-    link = Column(Text, nullable=True)
-    status = Column(String(20), default="pending")
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    user = relationship("User", back_populates="orders")
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    uid: Mapped[str] = mapped_column(String(32), ForeignKey("users.uid"))
+    service_key: Mapped[str] = mapped_column(String(100))
+    service_id: Mapped[int] = mapped_column(Integer)
+    link: Mapped[str] = mapped_column(Text)
+    quantity: Mapped[int] = mapped_column(Integer)
+    price: Mapped[float] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending, processing, completed, failed, rejected
+    provider_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user: Mapped[User] = relationship(back_populates="orders")
+
+class TopupCard(Base):
+    __tablename__ = "topup_cards"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    uid: Mapped[str] = mapped_column(String(32), ForeignKey("users.uid"))
+    provider: Mapped[str] = mapped_column(String(32))  # "asiacell"
+    card_number: Mapped[str] = mapped_column(String(32))  # (يمكن لاحقاً تشفيرها)
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending, accepted, rejected
+    amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    user: Mapped[User] = relationship()
+
+class Notice(Base):
+    __tablename__ = "notices"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    uid: Mapped[str | None] = mapped_column(String(32), ForeignKey("users.uid"), nullable=True)  # None للمالك
+    title: Mapped[str] = mapped_column(String(200))
+    body: Mapped[str] = mapped_column(Text)
+    for_owner: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    user: Mapped[User | None] = relationship(back_populates="notices")
