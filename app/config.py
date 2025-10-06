@@ -1,15 +1,18 @@
 import os
 
-def get_db_url() -> str:
-    url = os.getenv("DATABASE_URL", "")
-    # هيروكو تُرجع أحياناً postgres:// — نحولها للصيغة الصحيحة
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
-    elif url and "asyncpg" not in url:
-        url = url.replace("postgresql://", "postgresql+asyncpg://")
-    return url
+# ====== بيئة التشغيل ======
+DATABASE_URL   = os.getenv("DATABASE_URL", "")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "2000")
+JWT_SECRET     = os.getenv("JWT_SECRET", "change_me")
+JWT_EXPIRE_DAYS = int(os.getenv("JWT_EXPIRE_DAYS", "7"))
 
-KD_API_URL = os.getenv("KD_API_URL", "https://kd1s.com/api/v2")
-KD_API_KEY = os.getenv("KD_API_KEY", "")  # ضع المفتاح في Config Vars بهيروكو
-OWNER_PASS = os.getenv("OWNER_PASS", "2000")  # كلمة مرور المالك (كما بالتطبيق)
-APPROVAL_REQUIRED = os.getenv("APPROVAL_REQUIRED", "true").lower() == "true"
+# ====== مزوّد SMM (عام) ======
+# أمثلة شائعة: https://panel.com/api/v2 (POST form-data: key, action, service/link/quantity/order)
+PROVIDER_BASE  = os.getenv("PROVIDER_BASE", "").strip()
+PROVIDER_KEY   = os.getenv("PROVIDER_KEY", "").strip()
+
+# CORS
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+
+# FCM (اختياري تماماً)
+FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "").strip()
