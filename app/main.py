@@ -20,7 +20,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# إنشاء الجداول عند تشغيل التطبيق (وليس أثناء الاستيراد)
+# إنشاء الجداول عند تشغيل التطبيق
 @app.on_event("startup")
 def on_startup() -> None:
     try:
@@ -37,7 +37,7 @@ app.include_router(admin_router, prefix="/api")
 def root():
     return {"ok": True, "name": "ratluzen-smm-backend"}
 
-# Health check بسيط لا يُسقط السيرفر حتى لو DB غير متاحة
+# Health check بسيط
 @app.get("/health")
 def health():
     try:
@@ -48,7 +48,6 @@ def health():
         db_ok = False
     return {"ok": True, "db": db_ok}
 
-# نفس النتيجة تحت /api/health لمن يحتاج نفس المسار داخل التطبيق
 @app.get("/api/health")
 def api_health():
     return health()
