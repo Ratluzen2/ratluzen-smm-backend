@@ -1,38 +1,45 @@
-# app/routers/smm.py
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
-from typing import Any, Dict, List
+import os
+import httpx
 
-from app.providers.smm_client import SmmClient
+# خذ القيم من بيئة هيروكو
+PANEL_URL = (os.getenv("SMM_PANEL_URL") or os.getenv("PROVIDER_BASE_URL") or "").rstrip("/")
+API_KEY   = os.getenv("SMM_API_KEY") or os.getenv("PROVIDER_API_KEY")
 
-router = APIRouter()
+class SMMProvider:
+    def __init__(self, base_url: str | None = None, key: str | None = None):
+        self.base_url = (base_url or PANEL_URL).rstrip("/")
+        self.key = key or API_KEY
 
-class OrderCreate(BaseModel):
-    uid: str = Field(..., description="UID الخاص بالمستخدم")
-    service_id: int = Field(..., description="ID الخدمة في مزود SMM")
-    link: str = Field(..., description="الرابط/المعرف المطلوب")
-    quantity: int = Field(..., ge=1)
+    def _form(self, action: str, **extra):
+        data = {"key": self.key, "action": action}
+        data.update(extra)
+        return data
 
-@router.get("/balance")
-async def smm_balance() -> Dict[str, Any]:
-    c = SmmClient()
-    return await c.get_balance()
+    async def get_balance(self) -> dict:
+        if not self.base_url or not self.key:
+            return {"ok": False, "error": "Missing SMM_PANEL_URL or SMM_API_KEY"}
+        url = f"{self.base_url}/api/v2"
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(url, data=self._form("balance"))
+        try:
+            j = r.json()
+        except Exception:
+            return {"ok": False, "error": f"bad response ({r.status_code})", "text": r.text[:400]}
+        return {
+            "ok": True,
+            "balance": j.get("balance"),
+            "currency": j.get("currency"),
+            "raw": j,
+        }
 
-@router.get("/services")
-async def smm_services() -> List[Dict[str, Any]]:
-    c = SmmClient()
-    return await c.get_services()
-
-@router.post("/order")
-async def smm_order(body: OrderCreate) -> Dict[str, Any]:
-    c = SmmClient()
-    j = await c.add_order(service_id=body.service_id, link=body.link, quantity=body.quantity)
-    # المتوقع: {"order": 123456} أو {"error":"..."}
-    if "order" not in j:
-        raise HTTPException(status_code=400, detail=j)
-    return {"provider_order_id": str(j["order"])}
-
-@router.get("/status/{provider_order_id}")
-async def smm_status(provider_order_id: str) -> Dict[str, Any]:
-    c = SmmClient()
-    return await c.get_status(provider_order_id)
+    async def get_order_status(self, order_id: str) -> dict:
+        if not self.base_url or not self.key:
+            return {"ok": False, "error": "Missing SMM_PANEL_URL or SMM_API_KEY"}
+        url = f"{self.base_url}/api/v2"
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(url, data=self._form("status", order=order_id))
+        try:
+            j = r.json()
+        except Exception:
+            return {"ok": False, "error": f"bad response ({r.status_code})", "text": r.text[:400]}
+        return {"ok": True, "raw": j}
