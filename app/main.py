@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import logging
 
 from .database import engine
-from .models import Base
+from .models import Base  # imported for typing; real registration done on startup
 from .routers.smm import r as public_router
 from .routers.routes_provider import r as provider_router
 from .routers.admin import r as admin_router
@@ -20,15 +20,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# إنشاء الجداول عند تشغيل التطبيق
+# Ensure tables exist on startup
 @app.on_event("startup")
 def on_startup() -> None:
     try:
-        Base.metadata.create_all(bind=engine)
+        # مهم: تأكد من تحميل جميع الموديلات قبل إنشاء الجداول
+        from . import models
+        models.Base.metadata.create_all(bind=engine)
     except Exception:
         logging.exception("Failed to initialize database schema on startup")
 
-# ضمّ الراوترات كما هي
+# Routers
 app.include_router(public_router, prefix="/api")
 app.include_router(provider_router, prefix="/api")
 app.include_router(admin_router, prefix="/api")
@@ -37,7 +39,7 @@ app.include_router(admin_router, prefix="/api")
 def root():
     return {"ok": True, "name": "ratluzen-smm-backend"}
 
-# Health check بسيط
+# Health check
 @app.get("/health")
 def health():
     try:
@@ -51,3 +53,4 @@ def health():
 @app.get("/api/health")
 def api_health():
     return health()
+```0
