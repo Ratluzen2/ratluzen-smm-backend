@@ -1,30 +1,44 @@
 # app/routers/smm.py
-from fastapi import APIRouter, Depends, HTTPException, Query, Body
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from datetime import datetime, timezone
+from pydantic import BaseModel, Field
+from typing import Optional, List
+from datetime import datetime
 
 from ..database import get_db
-from ..models import (
-    User, ServiceOrder, WalletCard, ItunesOrder, PhoneTopup,
-    PubgOrder, LudoOrder, Notice
-)
+from ..models import User, ServiceOrder, WalletCard, Notice
 
-r = APIRouter()
+r = APIRouter(prefix="/api", tags=["app"])
 
-# ---------- نماذج ----------
-class UpsertUserReq(BaseModel):
-    uid: str
+# --------- Helpers ---------
+def _now_ts() -> int:
+    return int(datetime.utcnow().timestamp() * 1000)
+
+def _ensure_user(db: Session, uid: str) -> User:
+    u = db.query(User).filter_by(uid=uid).first()
+    if u is None:
+        u = User(uid=uid, balance=0.0)
+        db.add(u)
+        db.commit()
+        db.refresh(u)
+    return u
+
+# --------- Schemas ---------
+class UpsertReq(BaseModel):
+    uid: str = Field(min_length=1)
+
+class BalanceResp(BaseModel):
+    balance: float
 
 class ProviderOrderReq(BaseModel):
     uid: str
     service_id: int
     service_name: str
-    link: str
-    quantity: int
+    link: Optional[str] = None
+    quantity: Optional[int] = None
     price: float
 
-class ManualReq(BaseModel):
+class ManualOrderReq(BaseModel):
     uid: str
     title: str
 
@@ -32,161 +46,127 @@ class AsiacellReq(BaseModel):
     uid: str
     card: str
 
-# ---------- أدوات ----------
-def _now():
-    return datetime.now(timezone.utc)
+class OrderItemResp(BaseModel):
+    id: str
+    title: str
+    quantity: int
+    price: float
+    payload: str
+    status: str
+    created_at: int
 
-# ---------- المستخدم ----------
+# --------- Endpoints ---------
+
 @r.post("/users/upsert")
-def upsert_user(p: UpsertUserReq, db: Session = Depends(get_db)):
-    u = db.query(User).filter_by(uid=p.uid).first()
-    if not u:
-        u = User(uid=p.uid, balance=0.0)
-        db.add(u)
-    # لو لديك last_seen أضف تحديثه:
-    if hasattr(u, "last_seen"):
-        setattr(u, "last_seen", _now())
-    db.commit()
+def upsert_user(payload: UpsertReq, db: Session = Depends(get_db)):
+    _ensure_user(db, payload.uid)
     return {"ok": True}
 
-# ---------- المحفظة ----------
-@r.get("/wallet/balance")
-def wallet_balance(uid: str = Query(...), db: Session = Depends(get_db)):
-    u = db.query(User).filter_by(uid=uid).first()
-    bal = float(u.balance) if u else 0.0
-    return {"balance": bal}
+@r.get("/wallet/balance", response_model=BalanceResp)
+def wallet_balance(uid: str, db: Session = Depends(get_db)):
+    u = _ensure_user(db, uid)
+    return BalanceResp(balance=round(u.balance or 0.0, 2))
 
-@r.post("/wallet/asiacell/submit")
-def wallet_asiacell_submit(p: AsiacellReq, db: Session = Depends(get_db)):
-    digits = "".join(ch for ch in p.card if ch.isdigit())
-    if len(digits) not in (14,16):
-        raise HTTPException(400, "INVALID_CARD")
-
-    card = WalletCard(
-        uid=p.uid,
-        card_number=digits,
-        status="pending",
-        created_at=_now(),
-    )
-    db.add(card)
-
-    # إشعار للمالك + للمستخدم
-    db.add(Notice(
-        title="كارت أسيا سيل جديد",
-        body=f"UID={p.uid} | CARD={digits}",
-        for_owner=True, uid=None
-    ))
-    db.add(Notice(
-        title="تم استلام كارتك",
-        body="تم إرسال الكارت للمراجعة، سيتم إضافة الرصيد بعد القبول.",
-        for_owner=False, uid=p.uid
-    ))
-    db.commit()
-    return {"ok": True}
-
-# ---------- إنشاء طلب موفّر (مرتبط API) ----------
 @r.post("/orders/create/provider")
-def create_provider_order(p: ProviderOrderReq, db: Session = Depends(get_db)):
-    # تحقق الرصيد
-    u = db.query(User).filter_by(uid=p.uid).first()
-    if not u:
-        u = User(uid=p.uid, balance=0.0)
-        db.add(u)
-        db.flush()
+def create_provider_order(req: ProviderOrderReq, db: Session = Depends(get_db)):
+    u = _ensure_user(db, req.uid)
+    if u.is_banned:
+        raise HTTPException(403, "banned")
+    if (u.balance or 0.0) < req.price:
+        raise HTTPException(400, "insufficient_balance")
 
-    if float(u.balance) < float(p.price):
-        raise HTTPException(400, "INSUFFICIENT_BALANCE")
-
-    # خصم السعر
-    u.balance = round(float(u.balance) - float(p.price), 2)
+    # خصم الرصيد وإنشاء الطلب كـ pending
+    u.balance = round((u.balance or 0.0) - float(req.price), 2)
     db.add(u)
 
-    # خزّن الطلب Pending
-    o = ServiceOrder(
-        uid=p.uid,
-        service_key=p.service_name,     # اسم الخدمة الظاهر
-        service_code=int(p.service_id), # معرف المزود
-        link=p.link,
-        quantity=int(p.quantity),
-        unit_price_per_k=float(p.price) if p.quantity <= 1000 else float(p.price) / (p.quantity / 1000.0),
-        price=float(p.price),
+    order = ServiceOrder(
+        uid=req.uid,
+        service_key=req.service_name,
+        service_code=int(req.service_id),
+        link=req.link or "",
+        quantity=req.quantity or 0,
+        unit_price_per_k=None,   # اختياري
+        price=float(req.price),
         status="pending",
         provider_order_id=None,
-        created_at=_now(),
-        updated_at=_now(),
     )
-    db.add(o)
+    db.add(order)
 
-    # إشعارات
-    db.add(Notice(
-        title="طلب جديد قيد المراجعة",
-        body=f"{p.service_name} | كمية={p.quantity} | UID={p.uid}",
-        for_owner=True, uid=None
-    ))
-    db.add(Notice(
-        title="تم استلام طلبك",
-        body="سيتم تنفيذ طلبك قريبًا، ويمكنك متابعة الحالة من (طلباتي).",
-        for_owner=False, uid=p.uid
-    ))
+    # إشعار للمستخدم + المالك
+    db.add(Notice(title="طلب جديد", body=f"طلب {req.service_name} قيد المراجعة.", for_owner=False, uid=req.uid))
+    db.add(Notice(title="طلب خدمات معلّق", body=f"UID={req.uid} | {req.service_name} | qty={req.quantity}", for_owner=True, uid=None))
+
     db.commit()
-    return {"ok": True, "order_id": o.id}
+    return {"ok": True, "order_id": order.id}
 
-# ---------- إنشاء طلب يدوي عام ----------
 @r.post("/orders/create/manual")
-def create_manual_order(p: ManualReq, db: Session = Depends(get_db)):
-    # لأغراض العرض فقط: نرسل إشعارين (للمالك/المستخدم) من دون إنشاء سجل في جداول خاصة
-    db.add(Notice(
-        title="طلب يدوي جديد",
-        body=f"{p.title} | UID={p.uid}",
-        for_owner=True, uid=None
-    ))
-    db.add(Notice(
-        title="تم استلام طلبك",
-        body=f"لقد أرسلنا طلب ({p.title}) إلى المالك لمراجعته.",
-        for_owner=False, uid=p.uid
-    ))
+def create_manual_order(req: ManualOrderReq, db: Session = Depends(get_db)):
+    u = _ensure_user(db, req.uid)
+    if u.is_banned:
+        raise HTTPException(403, "banned")
+
+    order = ServiceOrder(
+        uid=req.uid,
+        service_key=req.title,     # عنوان الطلب اليدوي
+        service_code=None,
+        link=None,
+        quantity=None,
+        unit_price_per_k=None,
+        price=0.0,
+        status="pending",
+    )
+    db.add(order)
+    db.add(Notice(title="طلب معلّق", body=f"تم استلام طلبك: {req.title}", for_owner=False, uid=req.uid))
+    db.add(Notice(title="طلب يدوي جديد", body=f"UID={req.uid} | {req.title}", for_owner=True, uid=None))
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "order_id": order.id}
 
-# ---------- طلبات المستخدم ----------
-@r.get("/orders/my")
-def my_orders(uid: str = Query(...), db: Session = Depends(get_db)):
-    out = []
-
-    # Service orders
-    serv = (
+@r.get("/orders/my", response_model=List[OrderItemResp])
+def my_orders(uid: str, db: Session = Depends(get_db)):
+    _ensure_user(db, uid)
+    lst = (
         db.query(ServiceOrder)
         .filter_by(uid=uid)
         .order_by(ServiceOrder.created_at.desc())
         .all()
     )
-    for s in serv:
-        out.append({
-            "id": str(s.id),
-            "title": s.service_key,
-            "quantity": int(s.quantity or 0),
-            "price": float(s.price or 0),
-            "payload": s.link,
-            "status": s.status.capitalize() if s.status else "Pending",
-            "created_at": int(s.created_at.timestamp() * 1000) if s.created_at else 0
-        })
 
-    # Wallet cards (تظهر ضمن الطلبات كذلك ليتتبعها المستخدم)
-    cards = (
-        db.query(WalletCard)
-        .filter_by(uid=uid)
-        .order_by(WalletCard.created_at.desc())
-        .all()
-    )
-    for c in cards:
-        out.append({
-            "id": f"card-{c.id}",
-            "title": "كارت أسيا سيل",
-            "quantity": 1,
-            "price": float(c.amount_usd or 0),
-            "payload": c.card_number,
-            "status": c.status.capitalize() if c.status else "Pending",
-            "created_at": int(c.created_at.timestamp() * 1000) if c.created_at else 0
-        })
+    def map_status(s: str) -> str:
+        s = (s or "").lower()
+        if s == "done": return "Done"
+        if s == "rejected": return "Rejected"
+        if s == "refunded": return "Refunded"
+        if s == "processing": return "Processing"
+        return "Pending"
 
+    out: list[OrderItemResp] = []
+    for o in lst:
+        out.append(
+            OrderItemResp(
+                id=str(o.id),
+                title=o.service_key,
+                quantity=int(o.quantity or 0),
+                price=float(o.price or 0.0),
+                payload=o.link or "",
+                status=map_status(o.status),
+                created_at=int(o.created_at.timestamp() * 1000) if o.created_at else _now_ts(),
+            )
+        )
     return out
+
+@r.post("/wallet/asiacell/submit")
+def submit_asiacell(req: AsiacellReq, db: Session = Depends(get_db)):
+    digits = "".join([c for c in req.card if c.isdigit()])
+    if len(digits) not in (14, 16):
+        raise HTTPException(400, "card_must_be_14_or_16_digits")
+
+    _ensure_user(db, req.uid)
+    card = WalletCard(uid=req.uid, card_number=digits, status="pending")
+    db.add(card)
+
+    # إشعار المالك هلدى لوحة التحكم + إشعار المستخدم
+    db.add(Notice(title="كارت أسيا سيل جديد", body=f"UID={req.uid} | CARD={digits}", for_owner=True, uid=None))
+    db.add(Notice(title="تم استلام كارتك", body=f"سيتم مراجعته من المالك: ****{digits[-4:]}", for_owner=False, uid=req.uid))
+    db.commit()
+
+    return {"ok": True, "card_id": card.id}
