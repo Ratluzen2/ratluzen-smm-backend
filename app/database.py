@@ -1,20 +1,12 @@
+import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from .config import settings
+DATABASE_URL = os.getenv("DATABASE_URL")  # Neon URL
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    # هيروكو القديمة تحتاج تحويل
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(
-    settings.DATABASE_URL,
-    pool_pre_ping=True,
-    pool_size=3,
-    max_overflow=5
-)
-
-SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+connect_args = {}
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=connect_args)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
