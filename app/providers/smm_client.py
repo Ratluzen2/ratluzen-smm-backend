@@ -1,44 +1,48 @@
 import httpx
 from ..config import settings
-from ..provider_map import SERVICE_MAP
 
-TIMEOUT = httpx.Timeout(12.0)
+def _err(msg: str):
+    return {"ok": False, "error": msg}
 
-def _base_payload() -> dict:
-    if not settings.SMM_API_URL or not settings.SMM_API_KEY:
-        raise RuntimeError("SMM_API_URL / SMM_API_KEY not set")
-    return {"key": settings.SMM_API_KEY}
-
-def provider_add_order(service_key: str, link: str, quantity: int) -> dict:
-    service = SERVICE_MAP.get(service_key)
-    if not service:
-        return {"ok": False, "error": "unknown service key"}
-    payload = _base_payload() | {
-        "action": "add",
-        "service": service,
-        "link": link,
-        "quantity": quantity,
-    }
+def provider_balance():
+    if not settings.PROVIDER_BASE_URL or not settings.PROVIDER_KEY:
+        return _err("provider not configured")
     try:
-        r = httpx.post(settings.SMM_API_URL, data=payload, timeout=TIMEOUT)
-        data = r.json()
-        if "order" in data:
-            return {"ok": True, "orderId": str(data["order"])}
-        return {"ok": False, "error": data.get("error") or "provider error"}
+        r = httpx.get(
+            f"{settings.PROVIDER_BASE_URL}/balance",
+            params={"key": settings.PROVIDER_KEY},
+            timeout=10.0,
+        )
+        return {"ok": True, "raw": r.json()}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return _err(str(e))
 
-def provider_balance() -> dict:
+def provider_status(order_id: str):
+    if not settings.PROVIDER_BASE_URL or not settings.PROVIDER_KEY:
+        return _err("provider not configured")
     try:
-        r = httpx.post(settings.SMM_API_URL, data=_base_payload() | {"action": "balance"}, timeout=TIMEOUT)
-        data = r.json()
-        return {"ok": True, "balance": data.get("balance"), "currency": data.get("currency")}
+        r = httpx.get(
+            f"{settings.PROVIDER_BASE_URL}/status",
+            params={"key": settings.PROVIDER_KEY, "order": order_id},
+            timeout=10.0,
+        )
+        return {"ok": True, "raw": r.json()}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return _err(str(e))
 
-def provider_status(order_id: str) -> dict:
+def provider_add_order(service_key: str, link: str, qty: int):
+    if not settings.PROVIDER_BASE_URL or not settings.PROVIDER_KEY:
+        return _err("provider not configured")
     try:
-        r = httpx.post(settings.SMM_API_URL, data=_base_payload() | {"action": "status", "order": order_id}, timeout=TIMEOUT)
-        return {"ok": True, "data": r.json()}
+        r = httpx.post(
+            f"{settings.PROVIDER_BASE_URL}/order",
+            json={"key": settings.PROVIDER_KEY, "service": service_key, "link": link, "quantity": qty},
+            timeout=15.0,
+        )
+        j = r.json()
+        if r.status_code >= 400:
+            return _err(j.get("error", "provider error"))
+        # عدل حسب هيكل مزودك
+        return {"ok": True, "orderId": str(j.get("order") or j.get("order_id") or j.get("id"))}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return _err(str(e))
