@@ -1,215 +1,385 @@
-# app/routers/smm.py
-from fastapi import APIRouter, HTTPException, Body, Query, Depends
-from pydantic import BaseModel, Field, validator
-from sqlalchemy.orm import Session
-from datetime import datetime
-from typing import Optional, List, Dict, Any
+# app/main.py
+from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import Optional
+import os, json, re
 
-from ..database import get_db
-from ..models import User, ServiceOrder, WalletCard, Notice
-from ..providers.smm_client import provider_add_order  # موجود مسبقًا في مشروعك
+from .db import get_conn, put_conn
 
-r = APIRouter()
+ADMIN_PASS = os.getenv("ADMIN_PASS", "2000")
 
-# ---------------------------
-# Helpers
-# ---------------------------
-def now_ms() -> int:
-    return int(datetime.utcnow().timestamp() * 1000)
+app = FastAPI(title="Ratluzen SMM Backend", version="1.0.0")
 
-def _status_str(s: str) -> str:
-    s = (s or "").lower()
-    if s in ("pending", ""):
-        return "Pending"
-    if s in ("processing", "inprogress", "in_progress"):
-        return "Processing"
-    if s in ("done", "completed", "success"):
-        return "Done"
-    if s in ("rejected", "cancelled", "canceled", "failed"):
-        return "Rejected"
-    if s in ("refunded",):
-        return "Refunded"
-    return "Pending"
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def _safe_json(o: Any) -> Any:
-    # تحويل datetime -> iso
-    if isinstance(o, datetime):
-        return o.isoformat()
-    return o
+# -------- تهيئة الجداول تلقائياً عند الإقلاع --------
+DDL_SQL = """
+CREATE TABLE IF NOT EXISTS public.users (
+    id         SERIAL PRIMARY KEY,
+    uid        TEXT UNIQUE NOT NULL,
+    balance    NUMERIC(14,2) NOT NULL DEFAULT 0.00,
+    is_banned  BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
-def _order_to_dict(o: ServiceOrder) -> Dict[str, Any]:
-    return {
-        "id": getattr(o, "id"),
-        "title": getattr(o, "title"),
-        "quantity": getattr(o, "quantity") or 0,
-        "price": float(getattr(o, "price") or 0.0),
-        "payload": getattr(o, "payload") or "",
-        "status": _status_str(getattr(o, "status")),
-        "created_at": int((getattr(o, "created_at") or datetime.utcnow()).timestamp() * 1000),
-    }
+CREATE TABLE IF NOT EXISTS public.wallet_txns (
+    id         SERIAL PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    amount     NUMERIC(14,2) NOT NULL,
+    reason     TEXT NOT NULL,
+    meta       JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
-# ---------------------------
-# Schemas (requests)
-# ---------------------------
-class UpsertUserReq(BaseModel):
-    uid: str = Field(..., min_length=2, max_length=40)
+CREATE TABLE IF NOT EXISTS public.orders (
+    id         SERIAL PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    title      TEXT NOT NULL,
+    service_id BIGINT,
+    link       TEXT,
+    quantity   INTEGER NOT NULL DEFAULT 0,
+    price      NUMERIC(14,2) NOT NULL DEFAULT 0.00,
+    payload    JSONB NOT NULL DEFAULT '{}',
+    status     TEXT NOT NULL DEFAULT 'Pending',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
-class ProviderOrderReq(BaseModel):
+CREATE TABLE IF NOT EXISTS public.asiacell_cards (
+    id          SERIAL PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    card_number TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'Pending',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+@app.on_event("startup")
+def ensure_schema():
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(DDL_SQL)
+    finally:
+        put_conn(conn)
+
+# -------- Health --------
+@app.get("/health")
+def health():
+    # اختبار سريع لاتصال قاعدة البيانات
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+# ========================
+# Users / Wallet
+# ========================
+class UpsertUserIn(BaseModel):
+    uid: str
+
+@app.post("/api/users/upsert")
+def upsert_user(body: UpsertUserIn):
+    uid = body.uid.strip()
+    if not uid:
+        raise HTTPException(422, "uid required")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            row = cur.fetchone()
+            if row:
+                return {"ok": True, "uid": uid}
+            cur.execute("INSERT INTO public.users(uid) VALUES(%s) RETURNING id", (uid,))
+            cur.fetchone()
+        return {"ok": True, "uid": uid}
+    finally:
+        put_conn(conn)
+
+@app.get("/api/wallet/balance")
+def wallet_balance(uid: str):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT balance FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            bal = r[0] if r else 0.0
+        return {"ok": True, "balance": float(bal)}
+    finally:
+        put_conn(conn)
+
+# ========================
+# Orders (Provider + Manual)
+# ========================
+class ProviderOrderIn(BaseModel):
     uid: str
     service_id: int
     service_name: str
     link: str
-    quantity: int = Field(..., ge=1)
-    price: float = Field(..., ge=0)
+    quantity: int = Field(ge=1)
+    price: float = Field(ge=0)
 
-class ManualOrderReq(BaseModel):
+def _get_user_id_and_balance(cur, uid: str):
+    cur.execute("SELECT id, balance FROM public.users WHERE uid=%s", (uid,))
+    row = cur.fetchone()
+    if not row:
+        # في حال لم يُسجل التطبيق الـ UID لأي سبب، ننشئه تلقائيًا
+        cur.execute("INSERT INTO public.users(uid) VALUES(%s) RETURNING id, balance", (uid,))
+        row = cur.fetchone()
+    return int(row[0]), float(row[1])
+
+# المسار الأساسي الذي يستدعيه التطبيق
+@app.post("/api/orders/create/provider")
+def create_provider_order(body: ProviderOrderIn):
+    """
+    يُرجع دائمًا JSON يحتوي ok=true عند النجاح (التطبيق يبحث عن وجود 'ok' بنجاح).
+    """
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            user_id, balance = _get_user_id_and_balance(cur, body.uid)
+            # التحقق من الرصيد
+            if balance < float(body.price):
+                raise HTTPException(400, detail="insufficient balance")
+
+            # خصم المبلغ
+            cur.execute(
+                "UPDATE public.users SET balance = balance - %s WHERE id=%s",
+                (body.price, user_id)
+            )
+            # تسجيل حركة محفظة
+            cur.execute(
+                """
+                INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                VALUES(%s, %s, %s, %s)
+                """,
+                (user_id, -float(body.price), "order_charge",
+                 json.dumps({"service_id": body.service_id,
+                             "service_name": body.service_name,
+                             "qty": body.quantity}))
+            )
+            # إنشاء الطلب
+            cur.execute(
+                """
+                INSERT INTO public.orders(user_id, title, service_id, link, quantity, price, payload, status)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,'Pending')
+                RETURNING id
+                """,
+                (user_id, body.service_name, body.service_id, body.link, body.quantity, body.price, json.dumps({}))
+            )
+            oid = cur.fetchone()[0]
+
+        # (اختياري) استدعاء مزوّد خارجي هنا ثم تحديث الحالة لاحقًا
+        return {"ok": True, "order_id": int(oid)}
+    finally:
+        put_conn(conn)
+
+# مسار بديل احتياطي إن كان التطبيق لديك يضرب هذا المسار القديم
+@app.post("/api/orders/create")
+def create_provider_order_alias(body: ProviderOrderIn):
+    return create_provider_order(body)
+
+class ManualOrderIn(BaseModel):
     uid: str
     title: str
 
-class AsiacellCardReq(BaseModel):
+@app.post("/api/orders/create/manual")
+def create_manual_order(body: ManualOrderIn):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (body.uid,))
+            r = cur.fetchone()
+            if not r:
+                # إنشاء المستخدم تلقائياً
+                cur.execute("INSERT INTO public.users(uid) VALUES(%s) RETURNING id", (body.uid,))
+                r = cur.fetchone()
+            user_id = r[0]
+            cur.execute("""
+                INSERT INTO public.orders(user_id, title, quantity, price, status)
+                VALUES(%s,%s,0,0,'Pending') RETURNING id
+            """, (user_id, body.title))
+            oid = cur.fetchone()[0]
+        return {"ok": True, "order_id": int(oid)}
+    finally:
+        put_conn(conn)
+
+@app.get("/api/orders/my")
+def my_orders(uid: str):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                return []
+            user_id = r[0]
+            cur.execute("""
+                SELECT id, title, quantity, price, status, EXTRACT(EPOCH FROM created_at)*1000
+                FROM public.orders WHERE user_id=%s ORDER BY id DESC
+            """, (user_id,))
+            rows = cur.fetchall()
+            return [
+                {
+                    "id": row[0],
+                    "title": row[1],
+                    "quantity": row[2],
+                    "price": float(row[3]),
+                    "status": row[4],
+                    "created_at": int(row[5])
+                }
+                for row in rows
+            ]
+    finally:
+        put_conn(conn)
+
+# ========================
+# Asiacell cards
+# ========================
+class AsiacellCardIn(BaseModel):
     uid: str
     card: str
 
-    @validator("card")
-    def digits14_16(cls, v: str) -> str:
-        d = "".join(ch for ch in v if ch.isdigit())
-        if len(d) not in (14, 16):
-            raise ValueError("card must be 14 or 16 digits")
-        return d
+_card_re = re.compile(r"^\d{14}$|^\d{16}$")
 
-# ---------------------------
-# Public API
-# ---------------------------
-
-@r.post("/users/upsert")
-def users_upsert(body: UpsertUserReq, db: Session = Depends(get_db)):
-    u = db.query(User).filter_by(uid=body.uid).first()
-    if not u:
-        u = User(uid=body.uid, balance=0.0, is_banned=False)
-        db.add(u)
-        # إشعار ترحيبي للمستخدم
-        db.add(Notice(title="تم إنشاء حسابك", body="مرحبًا بك 👋", for_owner=False, uid=body.uid))
-    db.commit()
-    return {"ok": True, "uid": body.uid}
-
-@r.get("/wallet/balance")
-def wallet_balance(uid: str = Query(...), db: Session = Depends(get_db)):
-    u = db.query(User).filter_by(uid=uid).first()
-    return {"ok": True, "balance": float(u.balance) if u else 0.0}
-
-@r.post("/orders/create/provider")
-def orders_create_provider(body: ProviderOrderReq, db: Session = Depends(get_db)):
-    # جلب/إنشاء المستخدم
-    u = db.query(User).filter_by(uid=body.uid).first()
-    if not u:
-        u = User(uid=body.uid, balance=0.0, is_banned=False)
-        db.add(u)
-        db.flush()
-
-    # التحقق من الرصيد
-    if (u.balance or 0.0) < body.price:
-        raise HTTPException(400, detail="insufficient balance")
-
-    # إنشاء سجل الطلب مبدئيًا
-    payload_obj = {
-        "service_id": body.service_id,
-        "link": body.link,
-        "quantity": body.quantity,
-    }
-    ord_db = ServiceOrder(
-        uid=body.uid,
-        title=body.service_name,
-        quantity=body.quantity,
-        price=float(body.price),
-        payload=str(payload_obj),
-        status="Processing",  # سيصبح Done لاحقًا بعد التتبع
-        created_at=datetime.utcnow(),
-    )
-    # خصم الرصيد
-    u.balance = round(float(u.balance or 0.0) - float(body.price), 2)
-    db.add(ord_db)
-    db.add(u)
-    # إشعار للمستخدم + للمالك
-    db.add(Notice(title="تم استلام طلبك", body=f"{body.service_name}", for_owner=False, uid=body.uid))
-    db.add(Notice(title="طلب خدمات معلّق", body=f"UID={body.uid} | {body.service_name}", for_owner=True))
-    db.commit()
-
-    # محاولة إرسال الطلب للمزوّد
-    ext_order_id = None
+@app.post("/api/wallet/asiacell/submit")
+def submit_asiacell_card(body: AsiacellCardIn):
+    card = body.card.strip()
+    if not _card_re.fullmatch(card):
+        raise HTTPException(422, "invalid card")
+    conn = get_conn()
     try:
-        res = provider_add_order(service_id=body.service_id, link=body.link, quantity=body.quantity)
-        # نتقبّل أكثر من شكل للنتيجة
-        ext_order_id = str(res.get("order") or res.get("order_id") or res.get("id") or "")
-    except Exception:
-        ext_order_id = None
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (body.uid,))
+            r = cur.fetchone()
+            if not r:
+                cur.execute("INSERT INTO public.users(uid) VALUES(%s) RETURNING id", (body.uid,))
+                r = cur.fetchone()
+            user_id = r[0]
+            cur.execute("""
+                INSERT INTO public.asiacell_cards(user_id, card_number, status)
+                VALUES(%s,%s,'Pending') RETURNING id
+            """, (user_id, card))
+            cid = cur.fetchone()[0]
+        return {"ok": True, "card_id": int(cid)}
+    finally:
+        put_conn(conn)
 
-    # تحديث الطلب إذا توفر رقم خارجي
-    if ext_order_id:
-        setattr(ord_db, "ext_order_id", ext_order_id)
-        db.add(ord_db)
-        db.commit()
-    else:
-        # لو فشل الإرسال للمزوّد: نعيد الرصيد ونرفض الطلب
-        u = db.query(User).filter_by(uid=body.uid).first()
-        u.balance = round(float(u.balance or 0.0) + float(body.price), 2)
-        ord_db.status = "Rejected"
-        db.add(u); db.add(ord_db)
-        db.add(Notice(title="فشل إنشاء الطلب", body=body.service_name, for_owner=False, uid=body.uid))
-        db.commit()
-        raise HTTPException(502, detail="provider error")
+# ========================
+# Admin (ترويسة X-Admin-Pass)
+# ========================
+def _admin_token(header: Optional[str] = Header(default=None, alias="X-Admin-Pass"),
+                 low_header: Optional[str] = Header(default=None, alias="x-admin-pass")) -> str:
+    return (header or low_header or "")
 
-    return {"ok": True, "order_id": ord_db.id, "ext_order_id": ext_order_id}
+def _require_admin(tok: str):
+    if tok != ADMIN_PASS:
+        raise HTTPException(401, "unauthorized")
 
-@r.post("/orders/create/manual")
-def orders_create_manual(body: ManualOrderReq, db: Session = Depends(get_db)):
-    u = db.query(User).filter_by(uid=body.uid).first()
-    if not u:
-        u = User(uid=body.uid, balance=0.0, is_banned=False)
-        db.add(u); db.flush()
+class WalletOpIn(BaseModel):
+    uid: str
+    amount: float
 
-    ord_db = ServiceOrder(
-        uid=body.uid,
-        title=body.title,
-        quantity=0,
-        price=0.0,
-        payload="{}",
-        status="Pending",
-        created_at=datetime.utcnow(),
-    )
-    db.add(ord_db)
-    db.add(Notice(title="طلب معلّق", body=body.title, for_owner=False, uid=body.uid))
-    db.add(Notice(title="طلب يدوي جديد", body=f"UID={body.uid} | {body.title}", for_owner=True))
-    db.commit()
-    return {"ok": True, "order_id": ord_db.id}
+@app.post("/api/admin/wallet/topup")
+def admin_topup(body: WalletOpIn, x_admin: str = Depends(_admin_token)):
+    _require_admin(x_admin)
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (body.uid,))
+            r = cur.fetchone()
+            if not r:
+                cur.execute("INSERT INTO public.users(uid) VALUES(%s) RETURNING id", (body.uid,))
+                r = cur.fetchone()
+            user_id = r[0]
+            cur.execute("UPDATE public.users SET balance = balance + %s WHERE id=%s", (body.amount, user_id))
+            cur.execute("""
+                INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                VALUES(%s, %s, %s, %s)
+            """, (user_id, float(body.amount), "admin_topup", json.dumps({})))
+            cur.execute("SELECT balance FROM public.users WHERE id=%s", (user_id,))
+            bal = float(cur.fetchone()[0])
+        return {"ok": True, "balance": bal}
+    finally:
+        put_conn(conn)
 
-@r.get("/orders/my")
-def orders_my(uid: str = Query(...), db: Session = Depends(get_db)):
-    lst: List[ServiceOrder] = (
-        db.query(ServiceOrder)
-        .filter_by(uid=uid)
-        .order_by(ServiceOrder.created_at.desc())
-        .limit(100)
-        .all()
-    )
-    return [_order_to_dict(x) for x in lst]
+@app.post("/api/admin/wallet/deduct")
+def admin_deduct(body: WalletOpIn, x_admin: str = Depends(_admin_token)):
+    _require_admin(x_admin)
+    if body.amount <= 0:
+        raise HTTPException(400, "amount must be positive")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id, balance FROM public.users WHERE uid=%s", (body.uid,))
+            r = cur.fetchone()
+            if not r:
+                raise HTTPException(404, "user not found")
+            user_id, bal = r[0], float(r[1])
+            if bal < body.amount:
+                raise HTTPException(400, "insufficient balance")
+            cur.execute("UPDATE public.users SET balance = balance - %s WHERE id=%s", (body.amount, user_id))
+            cur.execute("""
+                INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                VALUES(%s, %s, %s, %s)
+            """, (user_id, -float(body.amount), "admin_deduct", json.dumps({})))
+            cur.execute("SELECT balance FROM public.users WHERE id=%s", (user_id,))
+            nb = float(cur.fetchone()[0])
+        return {"ok": True, "balance": nb}
+    finally:
+        put_conn(conn)
 
-@r.post("/wallet/asiacell/submit")
-def wallet_asiacell_submit(body: AsiacellCardReq, db: Session = Depends(get_db)):
-    # تأكد من وجود المستخدم
-    u = db.query(User).filter_by(uid=body.uid).first()
-    if not u:
-        u = User(uid=body.uid, balance=0.0, is_banned=False)
-        db.add(u); db.flush()
+@app.get("/api/admin/pending/services")
+def pending_services(x_admin: str = Depends(_admin_token)):
+    _require_admin(x_admin)
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT o.id, u.uid, o.title, o.quantity, o.price, o.status, EXTRACT(EPOCH FROM o.created_at)*1000
+                FROM public.orders o JOIN public.users u ON u.id=o.user_id
+                WHERE o.service_id IS NOT NULL AND o.status='Pending'
+                ORDER BY o.id DESC
+            """)
+            rows = cur.fetchall()
+            return [
+                {"id": r[0], "title": r[2], "quantity": r[3], "price": float(r[4]),
+                 "payload": f"UID={r[1]}", "status": r[5], "created_at": int(r[6])}
+                for r in rows
+            ]
+    finally:
+        put_conn(conn)
 
-    # إنشاء بطاقة معلّقة للمراجعة
-    wc = WalletCard(
-        uid=body.uid,
-        card=body.card,          # اسم العمود في مخططك: card (إن كان card_number غيّر هنا)
-        status="pending",
-        created_at=datetime.utcnow(),
-    )
-    db.add(wc)
-    db.add(Notice(title="تم استلام كارتك", body="قيد المراجعة", for_owner=False, uid=body.uid))
-    db.add(Notice(title="كارت أسيا سيل جديد", body=f"UID={body.uid} | CARD={body.card}", for_owner=True))
-    db.commit()
-    return {"ok": True, "card_id": wc.id}
+@app.get("/api/admin/pending/topups")
+def pending_topups(x_admin: str = Depends(_admin_token)):
+    _require_admin(x_admin)
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.id, u.uid, c.card_number, EXTRACT(EPOCH FROM c.created_at)*1000
+                FROM public.asiacell_cards c JOIN public.users u ON u.id=c.user_id
+                WHERE c.status='Pending'
+                ORDER BY c.id DESC
+            """)
+            rows = cur.fetchall()
+            return [
+                {"id": r[0], "title": "كارت أسيا سيل", "quantity": 0, "price": 0.0,
+                 "payload": f"UID={r[1]} CARD={r[2]}", "status": "Pending", "created_at": int(r[3])}
+                for r in rows
+            ]
+    finally:
+        put_conn(conn)
