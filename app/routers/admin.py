@@ -1,226 +1,304 @@
 # app/routers/admin.py
 import os
-from uuid import UUID
-from datetime import datetime, timezone, timedelta
-
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Body, Query
 from pydantic import BaseModel
-from sqlalchemy import select, func
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
-from ..database import SessionLocal
-from ..models import User, Order
+from ..database import get_db
+from ..models import (
+    User, ServiceOrder, WalletCard, ItunesOrder, PhoneTopup,
+    PubgOrder, LudoOrder, Notice
+)
 
-r = APIRouter(tags=["admin"])
+# (اختياري) لو عندك عميل مزوّد
+try:
+    from ..providers.smm_client import provider_add_order, provider_balance
+except Exception:
+    provider_add_order = None
+    provider_balance = None
 
-# كلمة مرور المالك (يجب أن تساوي ما تدخّله داخل التطبيق: افتراضياً 2000)
+r = APIRouter()
+
 ADMIN_PASS = os.getenv("ADMIN_PASS", "2000")
 
-# ----------------- أدوات جلسة DB -----------------
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-def check_admin(x_admin_pass: str | None):
+# -------------- حراسة الدخول --------------
+def guard(x_admin_pass: str | None):
     if not x_admin_pass or x_admin_pass.strip() != ADMIN_PASS:
         raise HTTPException(401, "UNAUTHORIZED")
 
-def _404_if(obj, msg="NOT_FOUND"):
-    if not obj:
-        raise HTTPException(404, msg)
-
-def _400(msg="BAD_REQUEST"):
-    raise HTTPException(400, msg)
-
-# ----------------- نماذج الطلبات -----------------
+# -------------- نماذج --------------
 class OrderIdReq(BaseModel):
-    order_id: str
+    order_id: int
 
 class WalletReq(BaseModel):
     uid: str
     amount: float
 
-class GiftIn(BaseModel):
-    gift_code: str
+# -------------- تحويل صفوف لقوائم يقرأها التطبيق --------------
+def _row_service(o: ServiceOrder):
+    return {
+        "id": str(o.id),
+        "uid": o.uid,
+        "title": o.service_key,
+        "quantity": int(o.quantity or 0),
+        "price": float(o.price or 0),
+        "link": o.link,
+        "payload": o.link,  # التطبيق يقرأ payload
+        "status": o.status or "pending",
+        "created_at": int(o.created_at.timestamp() * 1000) if o.created_at else 0
+    }
 
-class AmountIn(BaseModel):
-    amount_usd: float
+def _row_card(o: WalletCard):
+    return {
+        "id": str(o.id),
+        "uid": o.uid,
+        "title": "كارت أسيا سيل",
+        "quantity": 1,
+        "price": float(o.amount_usd or 0),
+        "link": "",
+        "payload": o.card_number,   # يظهر رقم الكارت
+        "status": o.status or "pending",
+        "created_at": int(o.created_at.timestamp() * 1000) if o.created_at else 0
+    }
 
-# ----------------- مُخرجات موحَّدة -----------------
-def _pending_rows(db: Session, typ: str):
-    """يُرجع مصفوفة JSON (وليس كائن) كما يتوقع التطبيق."""
-    rows = (
-        db.execute(
-            select(Order)
-            .where(Order.type == typ, Order.status == "Pending")
-            .order_by(Order.created_at.desc())
-        )
-        .scalars()
+# -------------- قوائم المعلّق --------------
+@r.get("/admin/pending/services")
+def pending_services(x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
+    guard(x_admin_pass)
+    lst = (
+        db.query(ServiceOrder)
+        .filter_by(status="pending")
+        .order_by(ServiceOrder.created_at.desc())
         .all()
     )
+    return [_row_service(o) for o in lst]
+
+@r.get("/admin/pending/topups")
+def pending_topups(x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
+    guard(x_admin_pass)
+    lst = (
+        db.query(WalletCard)
+        .filter_by(status="pending")
+        .order_by(WalletCard.created_at.desc())
+        .all()
+    )
+    return [_row_card(o) for o in lst]
+
+@r.get("/admin/pending/itunes")
+def pending_itunes(x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
+    guard(x_admin_pass)
+    # إن لم تكن تستخدم جدول iTunes يمكن تركها فارغة
+    lst = (
+        db.query(ItunesOrder)
+        .filter_by(status="pending")
+        .order_by(ItunesOrder.created_at.desc())
+        .all()
+    )
+    # عرض بسيط:
     out = []
-    for o in rows:
+    for o in lst:
         out.append({
-            "id": str(o.id),
-            "uid": o.uid,
-            "title": o.title,
-            "quantity": o.quantity,
-            "price": float(o.price or 0),
-            "link": o.link,
-            "payload": o.payload,                    # حقل موحَّد يقرأه التطبيق
-            "status": o.status,
-            "created_at": int(o.created_at.timestamp() * 1000),
+            "id": str(o.id), "uid": o.uid, "title": "آيتونز",
+            "quantity": 1, "price": float(o.amount or 0),
+            "link": "", "payload": o.gift_code or "",
+            "status": o.status or "pending",
+            "created_at": int(o.created_at.timestamp() * 1000) if o.created_at else 0
         })
     return out
 
-# ----------------- قوائم المعلّق (مطابقة للتطبيق) -----------------
-@r.get("/admin/pending/services")
-def admin_pending_services(x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
-    check_admin(x_admin_pass)
-    return _pending_rows(db, "provider")
-
-@r.get("/admin/pending/topups")  # اسم المسار الذي يستخدمه التطبيق للكروت
-def admin_pending_topups_alias(x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
-    check_admin(x_admin_pass)
-    return _pending_rows(db, "card")
-
-@r.get("/admin/pending/cards")   # احتفظنا بالمسار القديم أيضًا
-def admin_pending_cards(x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
-    check_admin(x_admin_pass)
-    return _pending_rows(db, "card")
-
-@r.get("/admin/pending/itunes")
-def admin_pending_itunes(x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
-    check_admin(x_admin_pass)
-    return _pending_rows(db, "itunes")
-
 @r.get("/admin/pending/pubg")
-def admin_pending_pubg(x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
-    check_admin(x_admin_pass)
-    return _pending_rows(db, "pubg")
+def pending_pubg(x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
+    guard(x_admin_pass)
+    lst = (
+        db.query(PubgOrder)
+        .filter_by(status="pending")
+        .order_by(PubgOrder.created_at.desc())
+        .all()
+    )
+    out = []
+    for o in lst:
+        out.append({
+            "id": str(o.id), "uid": o.uid, "title": f"PUBG {o.pkg}",
+            "quantity": 1, "price": 0.0,
+            "link": "", "payload": o.pubg_id,
+            "status": o.status or "pending",
+            "created_at": int(o.created_at.timestamp() * 1000) if o.created_at else 0
+        })
+    return out
 
 @r.get("/admin/pending/ludo")
-def admin_pending_ludo(x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
-    check_admin(x_admin_pass)
-    return _pending_rows(db, "ludo")
+def pending_ludo(x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
+    guard(x_admin_pass)
+    lst = (
+        db.query(LudoOrder)
+        .filter_by(status="pending")
+        .order_by(LudoOrder.created_at.desc())
+        .all()
+    )
+    out = []
+    for o in lst:
+        out.append({
+            "id": str(o.id), "uid": o.uid, "title": f"Ludo {o.kind} {o.pack}",
+            "quantity": 1, "price": 0.0,
+            "link": "", "payload": o.ludo_id,
+            "status": o.status or "pending",
+            "created_at": int(o.created_at.timestamp() * 1000) if o.created_at else 0
+        })
+    return out
 
-# ----------------- إجراءات عامة للطلبات (مطابقة للتطبيق) -----------------
+# -------------- إجراءات (تنفيذ/رفض/رد رصيد) --------------
 @r.post("/admin/orders/approve")
-def admin_orders_approve(p: OrderIdReq, x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
-    """يستدعيه التطبيق عند الضغط على (تنفيذ)"""
-    check_admin(x_admin_pass)
-    oid = UUID(p.order_id)
-    o = db.get(Order, oid)
-    _404_if(o, "ORDER_NOT_FOUND")
-    if o.status != "Pending":
-        _400("INVALID_STATE")
+def admin_approve(p: OrderIdReq, x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
+    guard(x_admin_pass)
 
-    # من الممكن لاحقاً تنفيذ استدعاء مزوّد فعلي هنا إذا كان o.type == "provider"
-    o.status = "Done"
-    db.commit()
-    return {"ok": True}
+    # 1) خدمات المزوّد
+    o = db.get(ServiceOrder, p.order_id)
+    if o and o.status == "pending":
+        # حاول إرسال الطلب للمزوّد إن توفّر العميل
+        if provider_add_order:
+            try:
+                res = provider_add_order(o.service_key, o.link, o.quantity)
+                if res.get("ok"):
+                    o.status = "processing"
+                    o.provider_order_id = res.get("orderId")
+                else:
+                    raise Exception(res.get("error", "provider error"))
+            except Exception:
+                # لو فشل مزوّد، نبقيها processing على الأقل لكي لا تتعطل الأزرار
+                o.status = "processing"
+        else:
+            o.status = "processing"
+
+        db.add(o)
+        db.add(Notice(
+            title="تم تنفيذ طلبك",
+            body=f"تم دفع طلبك للمزوّد. الخدمة: {o.service_key}",
+            for_owner=False, uid=o.uid
+        ))
+        db.commit()
+        return {"ok": True}
+
+    # 2) كروت أسيا سيل: نجعلها accepted فقط (المبلغ أضفه من شاشة إضافة الرصيد)
+    c = db.get(WalletCard, p.order_id)
+    if c and c.status == "pending":
+        c.status = "accepted"
+        db.add(c)
+        db.add(Notice(
+            title="تم قبول الكارت",
+            body="سيتم إضافة الرصيد إلى محفظتك بعد المعالجة.",
+            for_owner=False, uid=c.uid
+        ))
+        db.commit()
+        return {"ok": True}
+
+    # 3) إن لم توجد
+    raise HTTPException(404, "ORDER_NOT_FOUND_OR_STATE")
 
 @r.post("/admin/orders/reject")
-def admin_orders_reject(p: OrderIdReq, x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
-    """يستدعيه التطبيق عند الضغط على (رفض)"""
-    check_admin(x_admin_pass)
-    oid = UUID(p.order_id)
-    o = db.get(Order, oid)
-    _404_if(o, "ORDER_NOT_FOUND")
-    if o.status != "Pending":
-        _400("INVALID_STATE")
+def admin_reject(p: OrderIdReq, x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
+    guard(x_admin_pass)
 
-    # إذا كان طلب موفّر وقد تم خصم السعر من المستخدم سابقاً، نرجّع المبلغ
-    if o.type == "provider" and o.price:
-        u = db.get(User, o.uid)
-        if u:
-            u.balance = float(u.balance or 0) + float(o.price or 0)
+    o = db.get(ServiceOrder, p.order_id)
+    if o and o.status == "pending":
+        # ردّ الرصيد إلى المستخدم إن كان مخصومًا
+        if o.price:
+            u = db.query(User).filter_by(uid=o.uid).first()
+            if u:
+                u.balance = round(float(u.balance or 0) + float(o.price or 0), 2)
+                db.add(u)
+        o.status = "rejected"
+        db.add(o)
+        db.add(Notice(title="تم رفض الطلب", body="تم ردّ رصيدك.", for_owner=False, uid=o.uid))
+        db.commit()
+        return {"ok": True}
 
-    o.status = "Rejected"
-    db.commit()
-    return {"ok": True}
+    c = db.get(WalletCard, p.order_id)
+    if c and c.status == "pending":
+        c.status = "rejected"
+        db.add(c)
+        db.add(Notice(title="رفض كارت أسيا سيل", body="يرجى التأكد من الرقم والمحاولة مجددًا.", for_owner=False, uid=c.uid))
+        db.commit()
+        return {"ok": True}
+
+    raise HTTPException(404, "ORDER_NOT_FOUND_OR_STATE")
 
 @r.post("/admin/orders/refund")
-def admin_orders_refund(p: OrderIdReq, x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
-    """يستدعيه التطبيق عند الضغط على (رد رصيد)"""
-    check_admin(x_admin_pass)
-    oid = UUID(p.order_id)
-    o = db.get(Order, oid)
-    _404_if(o, "ORDER_NOT_FOUND")
+def admin_refund(p: OrderIdReq, x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
+    guard(x_admin_pass)
 
-    # رد المبلغ إن لم يكن قد رُدّ
-    if o.price and o.status != "Refunded":
-        u = db.get(User, o.uid)
+    o = db.get(ServiceOrder, p.order_id)
+    if not o:
+        raise HTTPException(404, "ORDER_NOT_FOUND")
+    if o.price:
+        u = db.query(User).filter_by(uid=o.uid).first()
         if u:
-            u.balance = float(u.balance or 0) + float(o.price or 0)
-
-    o.status = "Refunded"
+            u.balance = round(float(u.balance or 0) + float(o.price or 0), 2)
+            db.add(u)
+    o.status = "refunded"
+    db.add(o)
+    db.add(Notice(title="ردّ رصيد", body="تم ردّ المبلغ لطلبك.", for_owner=False, uid=o.uid))
     db.commit()
     return {"ok": True}
 
-# ----------------- عمليات المحفظة (مطابقة للتطبيق) -----------------
+# -------------- رصيد/خصم رصيد --------------
 @r.post("/admin/wallet/topup")
-def admin_wallet_topup(p: WalletReq, x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
-    """التطبيق يرسل {uid, amount} هنا"""
-    check_admin(x_admin_pass)
-    u = db.get(User, p.uid)
+def admin_topup(p: WalletReq, x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
+    guard(x_admin_pass)
+    u = db.query(User).filter_by(uid=p.uid).first()
     if not u:
-        u = User(uid=p.uid, balance=0)
+        u = User(uid=p.uid, balance=0.0)
         db.add(u)
         db.flush()
-    u.balance = float(u.balance or 0) + float(p.amount)
+    u.balance = round(float(u.balance or 0) + float(p.amount), 2)
+    db.add(u)
+    db.add(Notice(title="إضافة رصيد", body=f"+${p.amount}", for_owner=False, uid=p.uid))
     db.commit()
     return {"ok": True, "balance": float(u.balance)}
 
 @r.post("/admin/wallet/deduct")
-def admin_wallet_deduct(p: WalletReq, x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
-    """التطبيق يرسل {uid, amount} هنا"""
-    check_admin(x_admin_pass)
-    u = db.get(User, p.uid)
-    _404_if(u, "USER_NOT_FOUND")
-    bal = float(u.balance or 0)
-    if bal < p.amount:
-        _400("INSUFFICIENT_BALANCE")
-    u.balance = bal - float(p.amount)
+def admin_deduct(p: WalletReq, x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
+    guard(x_admin_pass)
+    u = db.query(User).filter_by(uid=p.uid).first()
+    if not u:
+        raise HTTPException(404, "USER_NOT_FOUND")
+    newb = round(max(0.0, float(u.balance or 0) - float(p.amount)), 2)
+    u.balance = newb
+    db.add(u)
+    db.add(Notice(title="خصم رصيد", body=f"-${p.amount}", for_owner=False, uid=p.uid))
     db.commit()
     return {"ok": True, "balance": float(u.balance)}
 
-# ----------------- إحصائيات (مطابقة للتطبيق) -----------------
+# -------------- إحصائيات --------------
 @r.get("/admin/stats/users-count")
-def admin_stats_users_count(x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
-    check_admin(x_admin_pass)
-    total = db.execute(select(func.count(User.uid))).scalar() or 0
-    active = db.execute(
-        select(func.count(User.uid)).where(User.last_seen >= datetime.now(timezone.utc) - timedelta(hours=1))
-    ).scalar() or 0
-    return {"count": int(total), "active_hour": int(active)}
+def users_count(x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
+    guard(x_admin_pass)
+    total = db.query(func.count(User.id)).scalar() or 0
+    return {"count": int(total)}
 
 @r.get("/admin/stats/users-balances")
-def admin_stats_users_balances(x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
-    check_admin(x_admin_pass)
-    rows = db.execute(select(User).order_by(User.created_at.desc())).scalars().all()
-    total = sum(float(r.balance or 0) for r in rows)
+def users_balances(x_admin_pass: str | None = Header(default=None), db: Session = Depends(get_db)):
+    guard(x_admin_pass)
+    users = db.query(User).order_by(User.balance.desc()).all()
+    total = sum(float(u.balance or 0) for u in users)
     return {
         "total": float(total),
-        "list": [{"uid": r.uid, "balance": float(r.balance or 0), "is_banned": bool(r.is_banned)} for r in rows]
+        "list": [{"uid": u.uid, "balance": float(u.balance or 0), "is_banned": bool(u.is_banned)} for u in users]
     }
 
-# ----------------- مزوّد (اختياري) -----------------
+# -------------- رصيد المزوّد --------------
 @r.get("/admin/provider/balance")
-def admin_provider_balance(x_admin_pass: str | None = Header(default=None)):
-    check_admin(x_admin_pass)
-    # Stub — اربطه لاحقًا بمزوّدك الحقيقي
+def provider_bal(x_admin_pass: str | None = Header(default=None)):
+    guard(x_admin_pass)
+    if provider_balance:
+        try:
+            res = provider_balance()
+            # توقع {"balance": ...} أو {"ok": True, "balance": ...}
+            if isinstance(res, dict):
+                if "balance" in res:
+                    return {"balance": float(res["balance"])}
+                if res.get("ok") and "balance" in res:
+                    return {"balance": float(res["balance"])}
+        except Exception:
+            pass
     return {"balance": 0.0}
-
-# ----------------- تسجيل المالك (اختياري) -----------------
-class LoginIn(BaseModel):
-    password: str
-
-@r.post("/admin/login")
-def admin_login(p: LoginIn):
-    if p.password.strip() == ADMIN_PASS:
-        return {"token": p.password.strip()}
-    raise HTTPException(401, "INVALID_CREDENTIALS")
