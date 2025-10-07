@@ -1,12 +1,32 @@
-import os
+# app/database.py
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+import os
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # Neon URL
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    # هيروكو القديمة تحتاج تحويل
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# خذ عنوان قاعدة البيانات من متغيرات البيئة (Neon / Heroku)
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DB_URL") or "sqlite:///./local.db"
 
+# معاملات خاصة بالـ SQLite فقط
 connect_args = {}
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=connect_args)
+if DATABASE_URL.startswith("sqlite"):
+    connect_args = {"check_same_thread": False}
+
+# محرك SQLAlchemy
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=10,
+    connect_args=connect_args,
+)
+
+# جلسات قاعدة البيانات
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# دالة الحقن مع FastAPI
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
