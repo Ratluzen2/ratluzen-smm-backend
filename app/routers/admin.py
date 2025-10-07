@@ -1,5 +1,5 @@
 # app/routers/admin.py
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Body
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Body, Form
 from sqlalchemy.orm import Session
 from typing import Optional
 from datetime import datetime
@@ -30,7 +30,7 @@ class GiftCodeReq(BaseModel):
 class CodeReq(BaseModel):
     code: str
 
-# -------- Helpers: JSON-serializable dicts --------
+# -------- Helpers --------
 def _row(obj):
     if obj is None:
         return None
@@ -53,7 +53,6 @@ def guard(
     if pwd != settings.ADMIN_PASSWORD:
         raise HTTPException(401, "unauthorized")
 
-# (اختياري) فحص سريع لكلمة المرور، مفيد لتفعيل وضع المالك من التطبيق
 @r.get("/check", dependencies=[Depends(guard)])
 def check_ok():
     return {"ok": True}
@@ -101,11 +100,9 @@ def reject_service(order_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404, "order not found or not pending")
 
     order.status = "rejected"
-    # رد الرصيد
     u = db.query(User).filter_by(uid=order.uid).first()
     if u:
-        curr = float(u.balance or 0.0)
-        u.balance = round(curr + float(order.price or 0.0), 2)
+        u.balance = round((u.balance or 0.0) + order.price, 2)
         db.add(u)
 
     db.add(order)
@@ -113,7 +110,7 @@ def reject_service(order_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True}
 
-# رصيد المزود وحالة الطلب
+# ---------- مزوّد ----------
 @r.get("/provider/balance", dependencies=[Depends(guard)])
 def provider_bal():
     return provider_balance()
@@ -136,16 +133,26 @@ def pending_cards(db: Session = Depends(get_db)):
 @r.post("/pending/cards/{card_id}/accept", dependencies=[Depends(guard)])
 def accept_card(
     card_id: int,
-    amount_usd: Optional[float] = Query(default=None),
-    reviewed_by: Optional[str] = Query(default="owner"),
+    # Query
+    amount_usd_q: Optional[float] = Query(default=None, alias="amount_usd"),
+    reviewed_by_q: Optional[str] = Query(default="owner", alias="reviewed_by"),
+    # JSON
     payload: Optional[AcceptCardReq] = Body(default=None),
+    # Form
+    amount_usd_f: Optional[float] = Form(default=None),
+    reviewed_by_f: Optional[str] = Form(default=None),
     db: Session = Depends(get_db)
 ):
-    # دعم JSON body أو query
+    # دمج المصادر
+    amount_usd = amount_usd_q
+    reviewed_by = reviewed_by_q
     if payload:
         amount_usd = payload.amount_usd if payload.amount_usd is not None else amount_usd
-        if payload.reviewed_by:
-            reviewed_by = payload.reviewed_by
+        if payload.reviewed_by: reviewed_by = payload.reviewed_by
+    if amount_usd_f is not None:
+        amount_usd = amount_usd_f
+    if reviewed_by_f:
+        reviewed_by = reviewed_by_f
 
     if amount_usd is None:
         raise HTTPException(400, "amount_usd required")
@@ -161,8 +168,7 @@ def accept_card(
     u = db.query(User).filter_by(uid=card.uid).first()
     if not u:
         u = User(uid=card.uid, balance=0.0)
-    curr = float(u.balance or 0.0)
-    u.balance = round(curr + float(amount_usd), 2)
+    u.balance = round((u.balance or 0.0) + float(amount_usd), 2)
     db.add(u)
 
     db.add(card)
@@ -195,11 +201,12 @@ def pending_itunes(db: Session = Depends(get_db)):
 @r.post("/pending/itunes/{oid}/deliver", dependencies=[Depends(guard)])
 def deliver_itunes(
     oid: int,
-    gift_code: Optional[str] = Query(default=None),
+    gift_code_q: Optional[str] = Query(default=None, alias="gift_code"),
     payload: Optional[GiftCodeReq] = Body(default=None),
+    gift_code_f: Optional[str] = Form(default=None),
     db: Session = Depends(get_db)
 ):
-    gift_code = (payload.gift_code if payload and payload.gift_code else gift_code)
+    gift_code = gift_code_q or (payload.gift_code if payload else None) or gift_code_f
     if not gift_code:
         raise HTTPException(400, "gift_code required")
 
@@ -238,11 +245,12 @@ def pending_phone(db: Session = Depends(get_db)):
 @r.post("/pending/phone/{oid}/deliver", dependencies=[Depends(guard)])
 def deliver_phone(
     oid: int,
-    code: Optional[str] = Query(default=None),
+    code_q: Optional[str] = Query(default=None, alias="code"),
     payload: Optional[CodeReq] = Body(default=None),
+    code_f: Optional[str] = Form(default=None),
     db: Session = Depends(get_db)
 ):
-    code = (payload.code if payload and payload.code else code)
+    code = code_q or (payload.code if payload else None) or code_f
     if not code:
         raise HTTPException(400, "code required")
 
@@ -349,23 +357,23 @@ def users_balances(db: Session = Depends(get_db)):
 @r.post("/users/{uid}/topup", dependencies=[Depends(guard)])
 def user_topup(
     uid: str,
-    amount: Optional[float] = Query(default=None),
+    amount_q: Optional[float] = Query(default=None, alias="amount"),
     payload: Optional[AmountReq] = Body(default=None),
+    amount_f: Optional[float] = Form(default=None),
     db: Session = Depends(get_db)
 ):
-    # دعم Query أو JSON
+    amount = amount_q
     if payload and payload.amount is not None:
         amount = payload.amount
+    if amount_f is not None:
+        amount = amount_f
     if amount is None:
         raise HTTPException(400, "amount required")
-    if float(amount) <= 0:
-        raise HTTPException(400, "amount must be > 0")
 
     u = db.query(User).filter_by(uid=uid).first()
     if not u:
         u = User(uid=uid, balance=0.0)
-    curr = float(u.balance or 0.0)  # ← إصلاح: نتعامل مع NULL كـ 0.0
-    u.balance = round(curr + float(amount), 2)
+    u.balance = round((u.balance or 0.0) + float(amount), 2)
     db.add(u)
     db.add(Notice(title="تم إضافة رصيد", body=f"+${amount}", for_owner=False, uid=uid))
     db.commit()
@@ -374,23 +382,23 @@ def user_topup(
 @r.post("/users/{uid}/deduct", dependencies=[Depends(guard)])
 def user_deduct(
     uid: str,
-    amount: Optional[float] = Query(default=None),
+    amount_q: Optional[float] = Query(default=None, alias="amount"),
     payload: Optional[AmountReq] = Body(default=None),
+    amount_f: Optional[float] = Form(default=None),
     db: Session = Depends(get_db)
 ):
-    # دعم Query أو JSON
+    amount = amount_q
     if payload and payload.amount is not None:
         amount = payload.amount
+    if amount_f is not None:
+        amount = amount_f
     if amount is None:
         raise HTTPException(400, "amount required")
-    if float(amount) <= 0:
-        raise HTTPException(400, "amount must be > 0")
 
     u = db.query(User).filter_by(uid=uid).first()
     if not u:
         u = User(uid=uid, balance=0.0)
-    curr = float(u.balance or 0.0)  # ← إصلاح: نتعامل مع NULL كـ 0.0
-    u.balance = max(0.0, round(curr - float(amount), 2))
+    u.balance = max(0.0, round((u.balance or 0.0) - float(amount), 2))
     db.add(u)
     db.add(Notice(title="تم خصم رصيد", body=f"-${amount}", for_owner=False, uid=uid))
     db.commit()
@@ -416,7 +424,7 @@ def unban(uid: str, db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True}
 
-# ---------- إشعارات (إرسال يدوي) ----------
+# ---------- إشعار يدوي ----------
 @r.post("/notify/push", dependencies=[Depends(guard)])
 def push_notify(
     title: str = "تنبيه",
@@ -431,8 +439,8 @@ def push_notify(
     if target == "owners":
         tokens = [t.token for t in db.query(Token).filter_by(for_owner=True).all()]
     elif target.startswith("uid:"):
-        uid = target.split(":", 1)[1]
-        tokens = [t.token for t in db.query(Token).filter_by(uid=uid).all()]
+        target_uid = target.split(":", 1)[1]
+        tokens = [t.token for t in db.query(Token).filter_by(uid=target_uid).all()]
     else:
         tokens = [t.token for t in db.query(Token).filter_by(for_owner=False).all()]
 
