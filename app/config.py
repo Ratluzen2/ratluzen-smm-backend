@@ -1,10 +1,17 @@
-import os
+from pydantic_settings import BaseSettings
+from pydantic import Field
 
-class Settings:
-    SMM_API_URL: str = os.getenv("SMM_API_URL", "").strip()
-    SMM_API_KEY: str = os.getenv("SMM_API_KEY", "").strip()
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "").strip()
-    ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "2000").strip()
-    FCM_SERVER_KEY: str = os.getenv("FCM_SERVER_KEY", "").strip()
+class Settings(BaseSettings):
+    DATABASE_URL: str = Field(..., description="Postgres URL, e.g. postgresql://...")
+    ADMIN_PASSWORD: str = Field(default="2000")
+    FCM_SERVER_KEY: str | None = None
+
+    # مزود الخدمات (اختياري)
+    PROVIDER_BASE_URL: str | None = None
+    PROVIDER_KEY: str | None = None
+
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
 
 settings = Settings()
