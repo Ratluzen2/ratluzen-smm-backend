@@ -1,106 +1,39 @@
-from sqlalchemy.orm import declarative_base, Mapped, mapped_column
-from sqlalchemy import String, Integer, Float, Boolean, DateTime, Text
-from sqlalchemy.sql import func
-from datetime import datetime
+from sqlalchemy.orm import declarative_base, relationship, Mapped, mapped_column
+from sqlalchemy import String, Text, Integer, Numeric, Boolean, ForeignKey, Index
+from sqlalchemy.dialects.postgresql import UUID, TIMESTAMP
+import uuid
+from datetime import datetime, timezone
 
 Base = declarative_base()
 
-# ---- Users ----
+def now_utc():
+    return datetime.now(timezone.utc)
+
 class User(Base):
     __tablename__ = "users"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    uid: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    balance: Mapped[float] = mapped_column(Float, default=0.0)
+    uid: Mapped[str] = mapped_column(String(32), primary_key=True)
+    balance: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
-    role: Mapped[str] = mapped_column(String(16), default="user")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=now_utc)
+    last_seen: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=now_utc)
 
-# ---- Notifications ----
-class Notice(Base):
-    __tablename__ = "notices"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    title: Mapped[str] = mapped_column(String(120))
-    body: Mapped[str] = mapped_column(Text)
-    for_owner: Mapped[bool] = mapped_column(Boolean, default=False)
-    uid: Mapped[str | None] = mapped_column(String(64), nullable=True)  # None = للجميع/المالك
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    orders: Mapped[list["Order"]] = relationship("Order", back_populates="user")
 
-# ---- Tokens (FCM) ----
-class Token(Base):
-    __tablename__ = "tokens"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    uid: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    token: Mapped[str] = mapped_column(Text, unique=True)
-    for_owner: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+class Order(Base):
+    __tablename__ = "orders"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    uid: Mapped[str] = mapped_column(String(32), ForeignKey("users.uid", ondelete="CASCADE"), index=True)
+    type: Mapped[str] = mapped_column(String(24))  # provider/manual/card/itunes/pubg/ludo/phone
+    title: Mapped[str] = mapped_column(String(255))
+    service_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    service_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    link: Mapped[str | None] = mapped_column(Text, nullable=True)
+    quantity: Mapped[int] = mapped_column(Integer, default=0)
+    price: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    payload: Mapped[str | None] = mapped_column(Text, nullable=True)  # card number, gift_code, etc
+    status: Mapped[str] = mapped_column(String(16), default="Pending")  # Pending/Processing/Done/Rejected/Refunded
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=now_utc)
 
-# ---- Service Orders (اختياري للمزوّد) ----
-class ServiceOrder(Base):
-    __tablename__ = "service_orders"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    uid: Mapped[str] = mapped_column(String(64), index=True)
-    service_key: Mapped[str] = mapped_column(String(120), index=True)
-    service_code: Mapped[int] = mapped_column(Integer)
-    link: Mapped[str] = mapped_column(Text)
-    quantity: Mapped[int] = mapped_column(Integer)
-    unit_price_per_k: Mapped[float] = mapped_column(Float)
-    price: Mapped[float] = mapped_column(Float)
-    status: Mapped[str] = mapped_column(String(16), index=True, default="pending")
-    provider_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    user: Mapped[User] = relationship("User", back_populates="orders")
 
-# ---- Wallet Cards (Asiacell) ----
-class WalletCard(Base):
-    __tablename__ = "wallet_cards"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    uid: Mapped[str] = mapped_column(String(64), index=True)
-    card_number: Mapped[str] = mapped_column(String(32))
-    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/accepted/rejected
-    amount_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
-    reviewed_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-# ---- iTunes Orders ----
-class ItunesOrder(Base):
-    __tablename__ = "itunes_orders"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    uid: Mapped[str] = mapped_column(String(64), index=True)
-    amount: Mapped[int] = mapped_column(Integer)
-    status: Mapped[str] = mapped_column(String(16), default="pending")
-    gift_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-# ---- Phone Topups ----
-class PhoneTopup(Base):
-    __tablename__ = "phone_topups"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    uid: Mapped[str] = mapped_column(String(64), index=True)
-    operator: Mapped[str] = mapped_column(String(16))  # atheir/asiacell/korek
-    amount: Mapped[int] = mapped_column(Integer)
-    status: Mapped[str] = mapped_column(String(16), default="pending")
-    code: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-# ---- PUBG Orders ----
-class PubgOrder(Base):
-    __tablename__ = "pubg_orders"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    uid: Mapped[str] = mapped_column(String(64), index=True)
-    pkg: Mapped[int] = mapped_column(Integer)
-    pubg_id: Mapped[str] = mapped_column(String(64))
-    status: Mapped[str] = mapped_column(String(16), default="pending")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-# ---- Ludo Orders ----
-class LudoOrder(Base):
-    __tablename__ = "ludo_orders"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    uid: Mapped[str] = mapped_column(String(64), index=True)
-    kind: Mapped[str] = mapped_column(String(16))  # diamonds/gold
-    pack: Mapped[int] = mapped_column(Integer)
-    ludo_id: Mapped[str] = mapped_column(String(64))
-    status: Mapped[str] = mapped_column(String(16), default="pending")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+Index("ix_orders_status_type", Order.status, Order.type)
