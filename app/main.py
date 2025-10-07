@@ -10,6 +10,7 @@ from .routers.admin import r as admin_router
 
 app = FastAPI(title="ratluzen-smm-backend", version="1.0.0")
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,6 +19,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# إنشاء الجداول عند تشغيل التطبيق
 @app.on_event("startup")
 def on_startup() -> None:
     try:
@@ -25,6 +27,7 @@ def on_startup() -> None:
     except Exception:
         logging.exception("Failed to initialize database schema on startup")
 
+# ضمّ الراوترات
 app.include_router(public_router, prefix="/api")
 app.include_router(admin_router, prefix="/api")
 
@@ -32,6 +35,7 @@ app.include_router(admin_router, prefix="/api")
 def root():
     return {"ok": True, "name": "ratluzen-smm-backend"}
 
+# Health
 @app.get("/health")
 def health():
     try:
