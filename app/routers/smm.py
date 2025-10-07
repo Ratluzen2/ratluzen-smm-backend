@@ -1,44 +1,22 @@
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+# app/routers/smm.py
+from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import select, func
-from ..database import SessionLocal
-from ..models import User, Order
 from datetime import datetime, timezone
 
-r = APIRouter(tags=["public"])
+from ..database import get_db
+from ..models import (
+    User, ServiceOrder, WalletCard, ItunesOrder, PhoneTopup,
+    PubgOrder, LudoOrder, Notice
+)
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+r = APIRouter()
 
-class UpsertUserIn(BaseModel):
-    uid: str = Field(min_length=1, max_length=32)
+# ---------- نماذج ----------
+class UpsertUserReq(BaseModel):
+    uid: str
 
-@r.post("/users/upsert")
-def upsert_user(p: UpsertUserIn, db: Session = Depends(get_db)):
-    u = db.get(User, p.uid)
-    if not u:
-        u = User(uid=p.uid, balance=0)
-        db.add(u)
-    u.last_seen = datetime.now(timezone.utc)
-    db.commit()
-    return {"ok": True}
-
-@r.get("/wallet/balance")
-def wallet_balance(uid: str, db: Session = Depends(get_db)):
-    u = db.get(User, uid)
-    if not u:
-        u = User(uid=uid, balance=0)
-        db.add(u)
-        db.commit()
-        db.refresh(u)
-    return {"balance": float(u.balance or 0)}
-
-class ProviderOrderIn(BaseModel):
+class ProviderOrderReq(BaseModel):
     uid: str
     service_id: int
     service_name: str
@@ -46,75 +24,169 @@ class ProviderOrderIn(BaseModel):
     quantity: int
     price: float
 
-@r.post("/orders/create/provider")
-def create_provider_order(p: ProviderOrderIn, db: Session = Depends(get_db)):
-    u = db.get(User, p.uid)
-    if not u:
-        u = User(uid=p.uid, balance=0)
-        db.add(u)
-        db.flush()
-    # التحقق والخصم الذري
-    bal = float(u.balance or 0)
-    if bal < p.price:
-        raise HTTPException(400, "INSUFFICIENT_BALANCE")
-    u.balance = bal - float(p.price)
-    o = Order(
-        uid=p.uid,
-        type="provider",
-        title=p.service_name,
-        service_id=p.service_id,
-        service_name=p.service_name,
-        link=p.link,
-        quantity=p.quantity,
-        price=p.price,
-        status="Pending",
-    )
-    db.add(o)
-    db.commit()
-    return {"ok": True, "id": str(o.id)}
-
-class ManualOrderIn(BaseModel):
+class ManualReq(BaseModel):
     uid: str
     title: str
 
-@r.post("/orders/create/manual")
-def create_manual_order(p: ManualOrderIn, db: Session = Depends(get_db)):
-    if not db.get(User, p.uid):
-        db.add(User(uid=p.uid, balance=0))
-        db.flush()
-    o = Order(uid=p.uid, type="manual", title=p.title, price=0, status="Pending")
-    db.add(o)
-    db.commit()
-    return {"ok": True, "id": str(o.id)}
-
-class AsiacellCardIn(BaseModel):
+class AsiacellReq(BaseModel):
     uid: str
     card: str
 
-@r.post("/wallet/asiacell/submit")
-def submit_asiacell_card(p: AsiacellCardIn, db: Session = Depends(get_db)):
-    if len("".join([c for c in p.card if c.isdigit()])) not in (14, 16):
-        raise HTTPException(400, "INVALID_CARD")
-    if not db.get(User, p.uid):
-        db.add(User(uid=p.uid, balance=0))
-        db.flush()
-    o = Order(uid=p.uid, type="card", title="كارت أسيا سيل", payload=p.card, price=0, status="Pending")
-    db.add(o)
-    db.commit()
-    return {"ok": True, "id": str(o.id)}
+# ---------- أدوات ----------
+def _now():
+    return datetime.now(timezone.utc)
 
+# ---------- المستخدم ----------
+@r.post("/users/upsert")
+def upsert_user(p: UpsertUserReq, db: Session = Depends(get_db)):
+    u = db.query(User).filter_by(uid=p.uid).first()
+    if not u:
+        u = User(uid=p.uid, balance=0.0)
+        db.add(u)
+    # لو لديك last_seen أضف تحديثه:
+    if hasattr(u, "last_seen"):
+        setattr(u, "last_seen", _now())
+    db.commit()
+    return {"ok": True}
+
+# ---------- المحفظة ----------
+@r.get("/wallet/balance")
+def wallet_balance(uid: str = Query(...), db: Session = Depends(get_db)):
+    u = db.query(User).filter_by(uid=uid).first()
+    bal = float(u.balance) if u else 0.0
+    return {"balance": bal}
+
+@r.post("/wallet/asiacell/submit")
+def wallet_asiacell_submit(p: AsiacellReq, db: Session = Depends(get_db)):
+    digits = "".join(ch for ch in p.card if ch.isdigit())
+    if len(digits) not in (14,16):
+        raise HTTPException(400, "INVALID_CARD")
+
+    card = WalletCard(
+        uid=p.uid,
+        card_number=digits,
+        status="pending",
+        created_at=_now(),
+    )
+    db.add(card)
+
+    # إشعار للمالك + للمستخدم
+    db.add(Notice(
+        title="كارت أسيا سيل جديد",
+        body=f"UID={p.uid} | CARD={digits}",
+        for_owner=True, uid=None
+    ))
+    db.add(Notice(
+        title="تم استلام كارتك",
+        body="تم إرسال الكارت للمراجعة، سيتم إضافة الرصيد بعد القبول.",
+        for_owner=False, uid=p.uid
+    ))
+    db.commit()
+    return {"ok": True}
+
+# ---------- إنشاء طلب موفّر (مرتبط API) ----------
+@r.post("/orders/create/provider")
+def create_provider_order(p: ProviderOrderReq, db: Session = Depends(get_db)):
+    # تحقق الرصيد
+    u = db.query(User).filter_by(uid=p.uid).first()
+    if not u:
+        u = User(uid=p.uid, balance=0.0)
+        db.add(u)
+        db.flush()
+
+    if float(u.balance) < float(p.price):
+        raise HTTPException(400, "INSUFFICIENT_BALANCE")
+
+    # خصم السعر
+    u.balance = round(float(u.balance) - float(p.price), 2)
+    db.add(u)
+
+    # خزّن الطلب Pending
+    o = ServiceOrder(
+        uid=p.uid,
+        service_key=p.service_name,     # اسم الخدمة الظاهر
+        service_code=int(p.service_id), # معرف المزود
+        link=p.link,
+        quantity=int(p.quantity),
+        unit_price_per_k=float(p.price) if p.quantity <= 1000 else float(p.price) / (p.quantity / 1000.0),
+        price=float(p.price),
+        status="pending",
+        provider_order_id=None,
+        created_at=_now(),
+        updated_at=_now(),
+    )
+    db.add(o)
+
+    # إشعارات
+    db.add(Notice(
+        title="طلب جديد قيد المراجعة",
+        body=f"{p.service_name} | كمية={p.quantity} | UID={p.uid}",
+        for_owner=True, uid=None
+    ))
+    db.add(Notice(
+        title="تم استلام طلبك",
+        body="سيتم تنفيذ طلبك قريبًا، ويمكنك متابعة الحالة من (طلباتي).",
+        for_owner=False, uid=p.uid
+    ))
+    db.commit()
+    return {"ok": True, "order_id": o.id}
+
+# ---------- إنشاء طلب يدوي عام ----------
+@r.post("/orders/create/manual")
+def create_manual_order(p: ManualReq, db: Session = Depends(get_db)):
+    # لأغراض العرض فقط: نرسل إشعارين (للمالك/المستخدم) من دون إنشاء سجل في جداول خاصة
+    db.add(Notice(
+        title="طلب يدوي جديد",
+        body=f"{p.title} | UID={p.uid}",
+        for_owner=True, uid=None
+    ))
+    db.add(Notice(
+        title="تم استلام طلبك",
+        body=f"لقد أرسلنا طلب ({p.title}) إلى المالك لمراجعته.",
+        for_owner=False, uid=p.uid
+    ))
+    db.commit()
+    return {"ok": True}
+
+# ---------- طلبات المستخدم ----------
 @r.get("/orders/my")
-def my_orders(uid: str, db: Session = Depends(get_db)):
-    q = db.execute(select(Order).where(Order.uid == uid).order_by(Order.created_at.desc())).scalars().all()
-    res = []
-    for o in q:
-        res.append({
-            "id": str(o.id),
-            "title": o.title,
-            "quantity": o.quantity,
-            "price": float(o.price or 0),
-            "payload": o.payload or (o.link or ""),
-            "status": o.status,
-            "created_at": int(o.created_at.timestamp() * 1000),
+def my_orders(uid: str = Query(...), db: Session = Depends(get_db)):
+    out = []
+
+    # Service orders
+    serv = (
+        db.query(ServiceOrder)
+        .filter_by(uid=uid)
+        .order_by(ServiceOrder.created_at.desc())
+        .all()
+    )
+    for s in serv:
+        out.append({
+            "id": str(s.id),
+            "title": s.service_key,
+            "quantity": int(s.quantity or 0),
+            "price": float(s.price or 0),
+            "payload": s.link,
+            "status": s.status.capitalize() if s.status else "Pending",
+            "created_at": int(s.created_at.timestamp() * 1000) if s.created_at else 0
         })
-    return res
+
+    # Wallet cards (تظهر ضمن الطلبات كذلك ليتتبعها المستخدم)
+    cards = (
+        db.query(WalletCard)
+        .filter_by(uid=uid)
+        .order_by(WalletCard.created_at.desc())
+        .all()
+    )
+    for c in cards:
+        out.append({
+            "id": f"card-{c.id}",
+            "title": "كارت أسيا سيل",
+            "quantity": 1,
+            "price": float(c.amount_usd or 0),
+            "payload": c.card_number,
+            "status": c.status.capitalize() if c.status else "Pending",
+            "created_at": int(c.created_at.timestamp() * 1000) if c.created_at else 0
+        })
+
+    return out
