@@ -1,3 +1,4 @@
+# app/routers/admin.py
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Body
 from sqlalchemy.orm import Session
 from typing import Optional
@@ -14,6 +15,7 @@ from ..providers.smm_client import provider_add_order, provider_balance, provide
 
 r = APIRouter()
 
+# ---------- helpers ----------
 def _row(obj):
     if obj is None:
         return None
@@ -24,14 +26,16 @@ def _row(obj):
     return out
 
 def guard(
-    x_admin_pass: Optional[str] = Header(default=None, alias="X-Admin-Pass"),
-    x_admin_pass_alt: Optional[str] = Header(default=None, alias="x-admin-pass"),
-    key: Optional[str] = Query(default=None)
+    x_admin_pass_hdr: Optional[str] = Header(default=None, alias="X-Admin-Pass"),
+    x_admin_pass_hdr_low: Optional[str] = Header(default=None, alias="x-admin-pass"),
+    key: Optional[str] = Query(default=None),
+    x_admin_pass_q: Optional[str] = Query(default=None, alias="X-Admin-Pass"),
 ):
-    pwd = (x_admin_pass or x_admin_pass_alt or key or "").strip()
+    pwd = (x_admin_pass_hdr or x_admin_pass_hdr_low or key or x_admin_pass_q or "").strip()
     if pwd != settings.ADMIN_PASSWORD:
         raise HTTPException(401, "unauthorized")
 
+# ---------- admin misc ----------
 @r.get("/admin/check", dependencies=[Depends(guard)])
 def check_ok():
     return {"ok": True}
@@ -45,11 +49,17 @@ def users_balances(db: Session = Depends(get_db)):
     lst = db.query(User).order_by(User.balance.desc()).limit(500).all()
     return {"ok": True, "list": [{"uid": u.uid, "balance": u.balance, "is_banned": u.is_banned} for u in lst]}
 
+# ---------- balance operations ----------
 class AmountReq(BaseModel):
     amount: float
 
 @r.post("/admin/users/{uid}/topup", dependencies=[Depends(guard)])
-def user_topup(uid: str, amount: Optional[float] = Query(default=None), payload: Optional[AmountReq] = Body(default=None), db: Session = Depends(get_db)):
+def user_topup(
+    uid: str,
+    amount: Optional[float] = Query(default=None),
+    payload: Optional[AmountReq] = Body(default=None),
+    db: Session = Depends(get_db),
+):
     if payload and payload.amount is not None:
         amount = payload.amount
     if amount is None:
@@ -64,7 +74,12 @@ def user_topup(uid: str, amount: Optional[float] = Query(default=None), payload:
     return {"ok": True, "balance": u.balance}
 
 @r.post("/admin/users/{uid}/deduct", dependencies=[Depends(guard)])
-def user_deduct(uid: str, amount: Optional[float] = Query(default=None), payload: Optional[AmountReq] = Body(default=None), db: Session = Depends(get_db)):
+def user_deduct(
+    uid: str,
+    amount: Optional[float] = Query(default=None),
+    payload: Optional[AmountReq] = Body(default=None),
+    db: Session = Depends(get_db),
+):
     if payload and payload.amount is not None:
         amount = payload.amount
     if amount is None:
@@ -78,7 +93,20 @@ def user_deduct(uid: str, amount: Optional[float] = Query(default=None), payload
     db.commit()
     return {"ok": True, "balance": u.balance}
 
-# ---- أسيا سيل: قائمة / قبول / رفض ----
+# ---- compatibility aliases for the Android app ----
+class WalletBody(BaseModel):
+    uid: str
+    amount: float
+
+@r.post("/admin/wallet/topup", dependencies=[Depends(guard)])
+def wallet_topup(body: WalletBody, db: Session = Depends(get_db)):
+    return user_topup(uid=body.uid, payload=AmountReq(amount=body.amount), db=db)
+
+@r.post("/admin/wallet/deduct", dependencies=[Depends(guard)])
+def wallet_deduct(body: WalletBody, db: Session = Depends(get_db)):
+    return user_deduct(uid=body.uid, payload=AmountReq(amount=body.amount), db=db)
+
+# ---------- Asiacell cards ----------
 class AcceptCardReq(BaseModel):
     amount_usd: float
     reviewed_by: Optional[str] = None
@@ -88,8 +116,19 @@ def pending_cards(db: Session = Depends(get_db)):
     lst = db.query(WalletCard).filter_by(status="pending").order_by(WalletCard.created_at.desc()).all()
     return {"ok": True, "list": [_row(x) for x in lst]}
 
+# alias to match app label "topups"
+@r.get("/admin/pending/topups", dependencies=[Depends(guard)])
+def pending_topups(db: Session = Depends(get_db)):
+    return pending_cards(db)
+
 @r.post("/admin/pending/cards/{card_id}/accept", dependencies=[Depends(guard)])
-def accept_card(card_id: int, amount_usd: Optional[float] = Query(default=None), reviewed_by: Optional[str] = Query(default="owner"), payload: Optional[AcceptCardReq] = Body(default=None), db: Session = Depends(get_db)):
+def accept_card(
+    card_id: int,
+    amount_usd: Optional[float] = Query(default=None),
+    reviewed_by: Optional[str] = Query(default="owner"),
+    payload: Optional[AcceptCardReq] = Body(default=None),
+    db: Session = Depends(get_db),
+):
     if payload:
         amount_usd = payload.amount_usd if payload.amount_usd is not None else amount_usd
         if payload.reviewed_by:
@@ -125,7 +164,7 @@ def reject_card(card_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True}
 
-# ---- مزود الخدمات (اختياري) ----
+# ---------- provider (optional) ----------
 @r.get("/admin/provider/balance", dependencies=[Depends(guard)])
 def provider_bal():
     return provider_balance()
