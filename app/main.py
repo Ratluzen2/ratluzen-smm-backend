@@ -1,12 +1,10 @@
-# app/main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 
 from .database import engine
 from .models import Base
-from .routers.smm import r as public_router
-from .routers.admin import r as admin_router
+from .routers import smm, admin
 
 app = FastAPI(title="ratluzen-smm-backend", version="1.0.0")
 
@@ -19,7 +17,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# إنشاء الجداول عند تشغيل التطبيق
+# إنشاء الجداول عند التشغيل
 @app.on_event("startup")
 def on_startup() -> None:
     try:
@@ -27,9 +25,9 @@ def on_startup() -> None:
     except Exception:
         logging.exception("Failed to initialize database schema on startup")
 
-# ضمّ الراوترات
-app.include_router(public_router, prefix="/api")
-app.include_router(admin_router, prefix="/api")
+# راوترات
+app.include_router(smm.r, prefix="/api")
+app.include_router(admin.r, prefix="/api")
 
 @app.get("/")
 def root():
@@ -39,8 +37,9 @@ def root():
 @app.get("/health")
 def health():
     try:
-        with engine.connect() as conn:
-            conn.exec_driver_sql("SELECT 1")
+        from .database import SessionLocal
+        with SessionLocal() as db:
+            db.execute("SELECT 1")
         db_ok = True
     except Exception:
         db_ok = False
