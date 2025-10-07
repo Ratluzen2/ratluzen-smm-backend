@@ -1,8 +1,8 @@
 # app/routers/admin.py
 from fastapi import APIRouter, Depends, Header, HTTPException, Body, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_
-from typing import Optional, Dict, Any, List
+from sqlalchemy import func
+from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
 
 from ..config import settings
@@ -12,7 +12,7 @@ from ..models import (
     PubgOrder, LudoOrder, Notice
 )
 
-# اختياري: إن كان لديك موفر خارجي
+# عميل المزوّد
 try:
     from ..providers.smm_client import provider_balance, provider_add_order, provider_status
 except Exception:
@@ -25,7 +25,7 @@ except Exception:
 
 r = APIRouter(prefix="/admin")
 
-# ---------- حارس (كلمة مرور المالك) ----------
+# ---------- الحارس ----------
 def guard(
     x_admin_pass: Optional[str] = Header(default=None, alias="X-Admin-Pass"),
     x_admin_pass_alt: Optional[str] = Header(default=None, alias="x-admin-pass"),
@@ -35,12 +35,11 @@ def guard(
     if pwd != settings.ADMIN_PASSWORD:
         raise HTTPException(401, "unauthorized")
 
-# فحص بسيط
 @r.get("/check", dependencies=[Depends(guard)])
 def admin_check():
     return {"ok": True}
 
-# -------- Helpers ----------
+# ---------- Helpers ----------
 def _row_common(id_: int, title: str, qty: int, price: float, payload: str, ts: datetime) -> dict:
     return {
         "id": str(id_),
@@ -48,99 +47,62 @@ def _row_common(id_: int, title: str, qty: int, price: float, payload: str, ts: 
         "quantity": int(qty),
         "price": float(price),
         "payload": payload or "",
-        "created_at": int(ts.timestamp() * 1000)
+        "created_at": int(ts.timestamp() * 1000),
     }
 
-# ---------- القوائم المعلّقة (تُعيد Array مباشرةً كما يتوقع التطبيق) ----------
+# ---------- المعلّقات (ترجع Array لتتوافق مع الواجهة) ----------
 @r.get("/pending/services", dependencies=[Depends(guard)])
 def pending_services(db: Session = Depends(get_db)):
-    lst = (db.query(ServiceOrder)
-           .filter_by(status="pending")
-           .order_by(ServiceOrder.created_at.desc())
-           .all())
-    return [
-        _row_common(o.id, o.service_key, o.quantity, o.price, o.link, o.created_at)
-        for o in lst
-    ]
+    lst = db.query(ServiceOrder).filter_by(status="pending").order_by(ServiceOrder.created_at.desc()).all()
+    return [_row_common(o.id, o.service_key, o.quantity, o.price, o.link, o.created_at) for o in lst]
 
 @r.get("/pending/itunes", dependencies=[Depends(guard)])
 def pending_itunes(db: Session = Depends(get_db)):
-    lst = (db.query(ItunesOrder)
-           .filter_by(status="pending")
-           .order_by(ItunesOrder.created_at.desc())
-           .all())
-    return [
-        _row_common(o.id, "طلب آيتونز", o.amount or 0, 0.0, "", o.created_at)
-        for o in lst
-    ]
+    lst = db.query(ItunesOrder).filter_by(status="pending").order_by(ItunesOrder.created_at.desc()).all()
+    return [_row_common(o.id, "طلب آيتونز", o.amount or 0, 0.0, "", o.created_at) for o in lst]
 
-@r.get("/pending/topups", dependencies=[Depends(guard)])  # يتوافق مع OwnerApiFixes
+@r.get("/pending/topups", dependencies=[Depends(guard)])
 def pending_topups(db: Session = Depends(get_db)):
-    lst = (db.query(WalletCard)
-           .filter_by(status="pending")
-           .order_by(WalletCard.created_at.desc())
-           .all())
-    # payload يعرض رقم الكارت ليظهر للمالك ويقدر ينسخه
-    return [
-        _row_common(o.id, "كارت أسيا سيل", 1, float(o.amount_usd or 0.0), o.card_number, o.created_at)
-        for o in lst
-    ]
+    lst = db.query(WalletCard).filter_by(status="pending").order_by(WalletCard.created_at.desc()).all()
+    return [_row_common(o.id, "كارت أسيا سيل", 1, float(o.amount_usd or 0.0), o.card_number, o.created_at) for o in lst]
 
 @r.get("/pending/pubg", dependencies=[Depends(guard)])
 def pending_pubg(db: Session = Depends(get_db)):
-    lst = (db.query(PubgOrder)
-           .filter_by(status="pending")
-           .order_by(PubgOrder.created_at.desc())
-           .all())
-    return [
-        _row_common(o.id, f"ببجي {o.pkg}UC", 1, 0.0, o.pubg_id, o.created_at)
-        for o in lst
-    ]
+    lst = db.query(PubgOrder).filter_by(status="pending").order_by(PubgOrder.created_at.desc()).all()
+    return [_row_common(o.id, f"ببجي {o.pkg}UC", 1, 0.0, o.pubg_id, o.created_at) for o in lst]
 
 @r.get("/pending/ludo", dependencies=[Depends(guard)])
 def pending_ludo(db: Session = Depends(get_db)):
-    lst = (db.query(LudoOrder)
-           .filter_by(status="pending")
-           .order_by(LudoOrder.created_at.desc())
-           .all())
-    return [
-        _row_common(o.id, f"لودو {o.kind} {o.pack}", 1, 0.0, o.ludo_id, o.created_at)
-        for o in lst
-    ]
+    lst = db.query(LudoOrder).filter_by(status="pending").order_by(LudoOrder.created_at.desc()).all()
+    return [_row_common(o.id, f"لودو {o.kind} {o.pack}", 1, 0.0, o.ludo_id, o.created_at) for o in lst]
 
-# ---------- تنفيذ / رفض / رد رصيد (نقطة موحّدة) ----------
+# ---------- تنفيذ / رفض / رد رصيد ----------
 @r.post("/orders/approve", dependencies=[Depends(guard)])
-def orders_approve(
-    payload: dict = Body(...),
-    db: Session = Depends(get_db)
-):
+def orders_approve(payload: dict = Body(...), db: Session = Depends(get_db)):
     """
-    body: { "order_id": int, "amount_usd": float? } 
-    - ServiceOrder: يتحول إلى processing ويُرسل للمزوّد (إن تم إعداد المزود).
-    - WalletCard: يجب تمرير amount_usd، يتم شحن رصيد المستخدم ويصبح Accepted.
-    - Itunes/PhoneTopup/Pubg/Ludo: تُحوَّل إلى delivered (تنفيذ يدوي خارجياً).
+    body: { "order_id": int, "amount_usd": float? }
+    - ServiceOrder: يرسل للمزوّد باستخدام service_code + link + quantity.
+    - WalletCard: يتطلب amount_usd لشحن رصيد المستخدم.
+    - باقي الأنواع: يُعتبر تنفيذ يدوي (delivered).
     """
     order_id = int(payload.get("order_id") or 0)
     amount_usd = payload.get("amount_usd")
-
     if not order_id:
         raise HTTPException(400, "order_id required")
 
-    # ServiceOrder
+    # ServiceOrder => call provider with service_code (INT), not service_key
     so = db.get(ServiceOrder, order_id)
     if so and so.status == "pending":
-        resp = provider_add_order(so.service_key, so.link, so.quantity)
+        resp = provider_add_order(service_id=so.service_code, link=so.link, quantity=so.quantity)
         if not resp.get("ok"):
-            # في حال لا يوجد مزود، اعتبرها "processing" يدوياً
-            so.status = "processing"
-            so.provider_order_id = None
-        else:
-            so.status = "processing"
-            so.provider_order_id = str(resp.get("orderId"))
+            err = resp.get("error") or "provider error"
+            raise HTTPException(502, f"provider_add_order failed: {err}")
+        so.status = "processing"
+        so.provider_order_id = str(resp.get("orderId") or resp.get("order_id") or resp.get("id") or "")
         db.add(so)
         db.add(Notice(title="تم تنفيذ طلبك", body=f"{so.service_key} | QTY={so.quantity}", for_owner=False, uid=so.uid))
         db.commit()
-        return {"ok": True}
+        return {"ok": True, "provider_order_id": so.provider_order_id}
 
     # WalletCard
     wc = db.get(WalletCard, order_id)
@@ -159,38 +121,30 @@ def orders_approve(
     # Itunes
     it = db.get(ItunesOrder, order_id)
     if it and it.status == "pending":
-        it.status = "delivered"
-        db.add(it)
-        db.add(Notice(title="طلب آيتونز", body=f"تم التنفيذ", for_owner=False, uid=it.uid))
-        db.commit()
-        return {"ok": True}
+        it.status = "delivered"; db.add(it)
+        db.add(Notice(title="طلب آيتونز", body="تم التنفيذ", for_owner=False, uid=it.uid))
+        db.commit(); return {"ok": True}
 
     # PhoneTopup
     pt = db.get(PhoneTopup, order_id)
     if pt and pt.status == "pending":
-        pt.status = "delivered"
-        db.add(pt)
+        pt.status = "delivered"; db.add(pt)
         db.add(Notice(title="طلب كارت هاتف", body="تم التنفيذ", for_owner=False, uid=pt.uid))
-        db.commit()
-        return {"ok": True}
+        db.commit(); return {"ok": True}
 
     # Pubg
     pb = db.get(PubgOrder, order_id)
     if pb and pb.status == "pending":
-        pb.status = "delivered"
-        db.add(pb)
+        pb.status = "delivered"; db.add(pb)
         db.add(Notice(title="تم تنفيذ شدات ببجي", body=f"حزمة {pb.pkg}", for_owner=False, uid=pb.uid))
-        db.commit()
-        return {"ok": True}
+        db.commit(); return {"ok": True}
 
     # Ludo
     ld = db.get(LudoOrder, order_id)
     if ld and ld.status == "pending":
-        ld.status = "delivered"
-        db.add(ld)
+        ld.status = "delivered"; db.add(ld)
         db.add(Notice(title="تم تنفيذ طلب لودو", body=f"{ld.kind} {ld.pack}", for_owner=False, uid=ld.uid))
-        db.commit()
-        return {"ok": True}
+        db.commit(); return {"ok": True}
 
     raise HTTPException(404, "order not found or not pending")
 
@@ -209,36 +163,29 @@ def orders_reject(payload: dict = Body(...), db: Session = Depends(get_db)):
             db.add(u)
         db.add(so)
         db.add(Notice(title="تم رفض الطلب", body="تم ردّ الرصيد", for_owner=False, uid=so.uid))
-        db.commit()
-        return {"ok": True}
+        db.commit(); return {"ok": True}
 
     wc = db.get(WalletCard, order_id)
     if wc and wc.status == "pending":
-        wc.status = "rejected"
-        db.add(wc)
+        wc.status = "rejected"; db.add(wc)
         db.add(Notice(title="رفض كارت أسيا سيل", body="يرجى التأكد من الرقم", for_owner=False, uid=wc.uid))
-        db.commit()
-        return {"ok": True}
+        db.commit(); return {"ok": True}
 
     it = db.get(ItunesOrder, order_id)
     if it and it.status == "pending":
-        it.status = "rejected"; db.add(it); db.commit()
-        return {"ok": True}
+        it.status = "rejected"; db.add(it); db.commit(); return {"ok": True}
 
     pt = db.get(PhoneTopup, order_id)
     if pt and pt.status == "pending":
-        pt.status = "rejected"; db.add(pt); db.commit()
-        return {"ok": True}
+        pt.status = "rejected"; db.add(pt); db.commit(); return {"ok": True}
 
     pb = db.get(PubgOrder, order_id)
     if pb and pb.status == "pending":
-        pb.status = "rejected"; db.add(pb); db.commit()
-        return {"ok": True}
+        pb.status = "rejected"; db.add(pb); db.commit(); return {"ok": True}
 
     ld = db.get(LudoOrder, order_id)
     if ld and ld.status == "pending":
-        ld.status = "rejected"; db.add(ld); db.commit()
-        return {"ok": True}
+        ld.status = "rejected"; db.add(ld); db.commit(); return {"ok": True}
 
     raise HTTPException(404, "order not found or not pending")
 
@@ -257,19 +204,16 @@ def orders_refund(payload: dict = Body(...), db: Session = Depends(get_db)):
             db.add(u)
         db.add(so)
         db.add(Notice(title="ردّ رصيد", body=f"+${so.price}", for_owner=False, uid=so.uid))
-        db.commit()
-        return {"ok": True}
+        db.commit(); return {"ok": True}
 
     raise HTTPException(404, "order not refundable")
 
-# ---------- إحصاءات وإدارة ----------
+# ---------- إحصاءات ----------
 @r.get("/provider/balance", dependencies=[Depends(guard)])
 def provider_bal():
     data = provider_balance()
-    # نحاول قراءة balance من أكثر من شكل
     if isinstance(data, dict):
-        if "balance" in data:
-            return {"ok": True, "balance": float(data["balance"])}
+        if "balance" in data: return {"ok": True, "balance": float(data["balance"])}
         if "data" in data and isinstance(data["data"], dict) and "balance" in data["data"]:
             return {"ok": True, "balance": float(data["data"]["balance"])}
     return {"ok": False, "balance": 0.0}
@@ -278,7 +222,6 @@ def provider_bal():
 def users_count(db: Session = Depends(get_db)):
     total = db.query(func.count(User.id)).scalar() or 0
     since = datetime.utcnow() - timedelta(hours=1)
-    # الناشطون آخر ساعة = من قام بأي حدث: طلب/كارت/الخ.. في آخر ساعة (distinct uids)
     active_uids = set()
     for model in (ServiceOrder, WalletCard, ItunesOrder, PhoneTopup, PubgOrder, LudoOrder):
         q = db.query(model.uid).filter(model.created_at >= since).all()
