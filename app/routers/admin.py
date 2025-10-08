@@ -1,14 +1,14 @@
 from fastapi import APIRouter, Depends, Header, Query, HTTPException, Request
 from typing import Optional, Dict, Any, List
 from psycopg2.extras import Json
-import base64
+import base64, os, requests
 
-from ..config import ADMIN_PASS
+from ..config import ADMIN_PASS, KD1S_API_URL, KD1S_API_KEY
 from ..db import get_conn, put_conn
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
-# --------- Auth ---------
+# ================= Auth helpers =================
 def _extract_bearer(auth: Optional[str]) -> Optional[str]:
     if not auth: return None
     auth = auth.strip()
@@ -42,13 +42,16 @@ def _require_admin(token: str):
 
 @router.get("/check")
 def check(token: str = Depends(_token)):
-    _require_admin(token); return {"ok": True}
+    _require_admin(token)
+    return {"ok": True}
 
-# --------- Helpers ---------
+# ================= Utils =================
 async def _read_payload(request: Request) -> Dict[str, Any]:
+    # يقبل JSON أو x-www-form-urlencoded
     try:
         data = await request.json()
-        if isinstance(data, dict): return data
+        if isinstance(data, dict): 
+            return data
     except Exception:
         pass
     try:
@@ -84,82 +87,54 @@ def _fetch_pending_where(where_sql: str, params: tuple) -> List[Dict[str, Any]]:
     finally:
         put_conn(conn)
 
-# --------- Pending (aliases المطلوبة من التطبيق) ---------
+# ================= Pending Aliases (لمنع "تعذّر جلب البيانات") =================
+def _wrap_orders_list(items: List[Dict[str, Any]]):
+    # بعض الشاشات تريد مصفوفة مباشرة، وبعضها يريد {"orders": []}
+    return items, {"orders": items}
+
 @router.get("/pending/cards")
 def pending_cards(token: str = Depends(_token)):
     _require_admin(token)
-    # بطاقات/كروت (نستخدم title LIKE إذا لم توجد جداول متخصصة)
-    return _fetch_pending_where("LOWER(title) LIKE %s", ("%card%",))
+    items = _fetch_pending_where("LOWER(title) LIKE %s", ("%card%",))
+    arr, obj = _wrap_orders_list(items)
+    return obj  # نرجّع شكل object
+
+@router.get("/pending/cards/list")
+def pending_cards_list(token: str = Depends(_token)):
+    _require_admin(token)
+    return {"orders": _fetch_pending_where("LOWER(title) LIKE %s", ("%card%",))}
 
 @router.get("/pending/itunes")
 def pending_itunes(token: str = Depends(_token)):
     _require_admin(token)
-    return _fetch_pending_where("LOWER(title) LIKE %s", ("%itunes%",))
+    return {"orders": _fetch_pending_where("LOWER(title) LIKE %s", ("%itunes%",))}
 
 @router.get("/pending/pubg")
 def pending_pubg(token: str = Depends(_token)):
     _require_admin(token)
-    return _fetch_pending_where("LOWER(title) LIKE %s", ("%pubg%",))
+    return {"orders": _fetch_pending_where("LOWER(title) LIKE %s", ("%pubg%",))}
 
 @router.get("/pending/ludo")
 def pending_ludo(token: str = Depends(_token)):
     _require_admin(token)
-    return _fetch_pending_where("LOWER(title) LIKE %s", ("%ludo%",))
+    return {"orders": _fetch_pending_where("LOWER(title) LIKE %s", ("%ludo%",))}
 
-# نسخة أوسع تُعيد كل الخدمات المعلّقة (للواجهات الجديدة)
 @router.get("/pending/services")
 def pending_services(token: str = Depends(_token)):
     _require_admin(token)
-    return _fetch_pending_where("service_id IS NOT NULL", tuple())
+    return {"orders": _fetch_pending_where("service_id IS NOT NULL", tuple())}
 
-# --------- Topups (مثال قبول/رفض كارت) ---------
-@router.post("/pending/topups/accept")
-async def topup_accept(request: Request, token: str = Depends(_token)):
-    _require_admin(token)
-    p = await _read_payload(request)
-    card_id = int(p.get("card_id") or p.get("id"))
-    amount_usd = float(p.get("amount_usd") or p.get("amount") or 0)
-
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT user_id FROM public.asiacell_cards WHERE id=%s AND status='Pending'", (card_id,))
-            r = cur.fetchone()
-            if not r: raise HTTPException(404, "card not found or not pending")
-            user_id = r[0]
-            cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (amount_usd, user_id))
-            cur.execute("""
-                INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
-                VALUES(%s,%s,%s,%s)
-            """, (user_id, amount_usd, "admin_topup_card", Json({"card_id": card_id})))
-            cur.execute("UPDATE public.asiacell_cards SET status='Accepted' WHERE id=%s", (card_id,))
-        return {"ok": True}
-    finally:
-        put_conn(conn)
-
-@router.post("/pending/topups/reject")
-async def topup_reject(request: Request, token: str = Depends(_token)):
-    _require_admin(token)
-    p = await _read_payload(request)
-    card_id = int(p.get("card_id") or p.get("id"))
-
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("UPDATE public.asiacell_cards SET status='Rejected' WHERE id=%s AND status='Pending'", (card_id,))
-            if cur.rowcount == 0: raise HTTPException(404, "card not found or not pending")
-        return {"ok": True}
-    finally:
-        put_conn(conn)
-
-# --------- Wallet ops (إضافة/خصم) ---------
+# ================= Wallet: إضافة/خصم =================
 @router.post("/wallet/add")
 async def admin_topup(request: Request, token: str = Depends(_token),
                       uid: Optional[str] = Query(None), amount: Optional[float] = Query(None)):
     _require_admin(token)
     if uid is None or amount is None:
         p = await _read_payload(request)
-        uid = uid or p.get("uid"); amount = amount or float(p.get("amount"))
+        uid = uid or p.get("uid")
+        amount = amount or float(p.get("amount") or 0)
+    if not uid:
+        raise HTTPException(422, "uid required")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -181,7 +156,10 @@ async def admin_deduct(request: Request, token: str = Depends(_token),
     _require_admin(token)
     if uid is None or amount is None:
         p = await _read_payload(request)
-        uid = uid or p.get("uid"); amount = amount or float(p.get("amount"))
+        uid = uid or p.get("uid")
+        amount = amount or float(p.get("amount") or 0)
+    if not uid:
+        raise HTTPException(422, "uid required")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -198,19 +176,7 @@ async def admin_deduct(request: Request, token: str = Depends(_token),
     finally:
         put_conn(conn)
 
-# --------- Stats ---------
-@router.get("/users/count")
-def users_count(token: str = Depends(_token)):
-    _require_admin(token)
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT COUNT(1) FROM public.users")
-            c = cur.fetchone()[0]
-        return {"count": int(c)}
-    finally:
-        put_conn(conn)
-
+# ================= Stats / Users =================
 @router.get("/users/balances")
 def users_balances(token: str = Depends(_token)):
     _require_admin(token)
@@ -219,6 +185,64 @@ def users_balances(token: str = Depends(_token)):
         with conn, conn.cursor() as cur:
             cur.execute("SELECT uid, balance FROM public.users ORDER BY uid ASC")
             rows = cur.fetchall()
-        return [{"uid": r[0], "balance": float(r[1] or 0.0)} for r in rows]
+        items = [{"uid": r[0], "balance": float(r[1] or 0.0)} for r in rows]
+        # شكلان للتماشي مع أكثر من شاشة
+        return {"users": items, "count": len(items)}
     finally:
         put_conn(conn)
+
+@router.get("/users/balances/list")
+def users_balances_list(token: str = Depends(_token)):
+    _require_admin(token)
+    # بعض الشاشات تتوقع فقط {"users": []}
+    return users_balances(token)
+
+@router.get("/users/count")
+def users_count(token: str = Depends(_token)):
+    _require_admin(token)
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(1) FROM public.users")
+            c = cur.fetchone()[0]
+        # نرجّع value و count معًا لتغطية كل الاحتمالات
+        return {"value": int(c), "count": int(c)}
+    finally:
+        put_conn(conn)
+
+# ================= Provider (رصيد المزود API) =================
+def _kd1s_balance() -> Optional[float]:
+    url = KD1S_API_URL or os.getenv("KD1S_API_URL")
+    key = KD1S_API_KEY or os.getenv("KD1S_API_KEY")
+    if not url or not key:
+        return None
+    try:
+        # أغلب مزودي SMM يدعمون endpoint balance بنفس الشكل
+        r = requests.post(url, data={"key": key, "action": "balance"}, timeout=20)
+        r.raise_for_status()
+        js = r.json()
+        # نحاول قراءة الحقول الشائعة
+        for k in ("balance", "funds", "data", "result"):
+            if k in js and isinstance(js[k], (int, float, str)):
+                try:
+                    return float(js[k])
+                except Exception:
+                    pass
+        # fallback: أرقام داخل نص
+        txt = r.text
+        import re
+        m = re.search(r"(\d+(?:\.\d+)?)", txt)
+        return float(m.group(1)) if m else None
+    except Exception:
+        return None
+
+@router.get("/provider/balance")
+def provider_balance(token: str = Depends(_token)):
+    _require_admin(token)
+    bal = _kd1s_balance()
+    return {"balance": bal}
+
+# بعض الشاشات قد تستعمل اسمًا آخر:
+@router.get("/smm/balance")
+def smm_balance_alias(token: str = Depends(_token)):
+    return provider_balance(token)
