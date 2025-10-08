@@ -1,59 +1,104 @@
-from sqlalchemy import Column, String, DateTime, Integer, ForeignKey, Float, Text, Boolean
-from sqlalchemy.sql import func
-from .database import Base
+from sqlalchemy.orm import declarative_base, Mapped, mapped_column
+from sqlalchemy import String, Integer, Float, Boolean, DateTime, func, Text
 
+Base = declarative_base()
+
+# ---- Users ----
 class User(Base):
     __tablename__ = "users"
-    uid = Column(String, primary_key=True, index=True)
-    balance = Column(Float, default=0.0)
-    is_banned = Column(Boolean, default=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    uid: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    balance: Mapped[float] = mapped_column(Float, default=0.0)
+    is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
+    role: Mapped[str] = mapped_column(String(16), default="user")  # user/admin
+    created_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-class Order(Base):
-    __tablename__ = "orders"
-    id = Column(String, primary_key=True, index=True)  # uuid4
-    uid = Column(String, ForeignKey("users.uid"), index=True, nullable=False)
-    title = Column(String, nullable=False)        # اسم الخدمة/العنصر للعرض
-    quantity = Column(Integer, default=0)
-    price = Column(Float, default=0.0)
-    payload = Column(Text, default="")            # رابط/ID إضافي
-    status = Column(String, default="Pending")    # Pending/Processing/Done/Rejected/Refunded
-    kind = Column(String, default="manual")       # provider/manual/itunes/pubg/ludo
-    panel_order_id = Column(Integer, nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+# ---- Notifications ----
+class Notice(Base):
+    __tablename__ = "notices"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    body: Mapped[str] = mapped_column(Text)
+    for_owner: Mapped[bool] = mapped_column(Boolean, default=False)
+    uid: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-class CardSubmission(Base):
-    __tablename__ = "cards"
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    uid = Column(String, index=True, nullable=False)
-    card_number = Column(String, nullable=False)
-    status = Column(String, default="Pending")    # Pending/Accepted/Rejected
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+# ---- Tokens (FCM) ----
+class Token(Base):
+    __tablename__ = "tokens"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    uid: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    token: Mapped[str] = mapped_column(Text, unique=True)
+    for_owner: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+# ---- Service Orders (KD1S provider) ----
+class ServiceOrder(Base):
+    __tablename__ = "service_orders"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    uid: Mapped[str] = mapped_column(String(64), index=True)
+    service_key: Mapped[str] = mapped_column(String(160), index=True)  # display name
+    service_code: Mapped[int] = mapped_column(Integer)                 # KD1S service id
+    link: Mapped[str] = mapped_column(Text)
+    quantity: Mapped[int] = mapped_column(Integer)
+    unit_price_per_k: Mapped[float] = mapped_column(Float, default=0.0)  # usd / 1000
+    price: Mapped[float] = mapped_column(Float)                           # final usd
+    status: Mapped[str] = mapped_column(String(16), index=True, default="pending")  # pending/processing/done/rejected
+    provider_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+# ---- Wallet Cards (Asiacell) ----
+class WalletCard(Base):
+    __tablename__ = "wallet_cards"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    uid: Mapped[str] = mapped_column(String(64), index=True)
+    card_number: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending/accepted/rejected
+    amount_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+# ---- iTunes Orders ----
 class ItunesOrder(Base):
     __tablename__ = "itunes_orders"
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    uid = Column(String, index=True, nullable=False)
-    amount = Column(Integer, default=0)
-    gift_code = Column(String, nullable=True)
-    status = Column(String, default="Pending")
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    uid: Mapped[str] = mapped_column(String(64), index=True)
+    amount: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    gift_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    delivered_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+# ---- Phone Topups ----
+class PhoneTopup(Base):
+    __tablename__ = "phone_topups"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    uid: Mapped[str] = mapped_column(String(64), index=True)
+    operator: Mapped[str] = mapped_column(String(16))  # atheir/asiacell/korek
+    amount: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    delivered_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+# ---- PUBG Orders ----
 class PubgOrder(Base):
     __tablename__ = "pubg_orders"
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    uid = Column(String, index=True, nullable=False)
-    pkg = Column(Integer, default=0)
-    pubg_id = Column(String, default="")
-    status = Column(String, default="Pending")
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    uid: Mapped[str] = mapped_column(String(64), index=True)
+    pkg: Mapped[int] = mapped_column(Integer)  # 60,120,325,660,1800,3850,8100
+    pubg_id: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    created_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+# ---- Ludo Orders ----
 class LudoOrder(Base):
     __tablename__ = "ludo_orders"
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    uid = Column(String, index=True, nullable=False)
-    kind = Column(String, default="")   # الماسات/الذهب
-    pack = Column(Integer, default=0)
-    ludo_id = Column(String, default="")
-    status = Column(String, default="Pending")
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    uid: Mapped[str] = mapped_column(String(64), index=True)
+    kind: Mapped[str] = mapped_column(String(16))  # diamonds/gold
+    pack: Mapped[int] = mapped_column(Integer)
+    ludo_id: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    created_at: Mapped = mapped_column(DateTime(timezone=True), server_default=func.now())
