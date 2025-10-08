@@ -1,17 +1,20 @@
-from pydantic_settings import BaseSettings
-from pydantic import Field
+import os
 
-class Settings(BaseSettings):
-    DATABASE_URL: str = Field(..., description="Postgres URL, e.g. postgresql://...")
-    ADMIN_PASSWORD: str = Field(default="2000")
-    FCM_SERVER_KEY: str | None = None
+class Settings:
+    # قاعدة البيانات (Neon / Heroku Postgres)
+    DATABASE_URL: str = os.getenv(
+        "DATABASE_URL",
+        "postgresql+psycopg://neondb_owner:password@host/neondb?sslmode=require"
+    )
 
-    # مزود الخدمات (اختياري)
-    PROVIDER_BASE_URL: str | None = None
-    PROVIDER_KEY: str | None = None
+    # كلمة مرور المالك (ترويسة x-admin-pass)
+    ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "2000")
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    # إعدادات مزوّد الخدمات SMM
+    PROVIDER_URL: str = os.getenv("PROVIDER_URL", "").strip()  # مثال: https://provider.example.com
+    PROVIDER_KEY: str = os.getenv("PROVIDER_KEY", "").strip()
+
+    # FCM (اختياري)
+    FCM_SERVER_KEY: str = os.getenv("FCM_SERVER_KEY", "").strip()
 
 settings = Settings()
