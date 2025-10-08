@@ -1,383 +1,398 @@
 # app/routers/admin.py
-from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
-from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy import text
-from ..database import engine
-import os, requests, decimal
+from fastapi import APIRouter, Depends, Header, HTTPException, Body, Query
+from sqlalchemy.orm import Session
+from typing import Optional, List, Dict, Any, Tuple
+from datetime import datetime
 
-r = APIRouter(prefix="/api/admin", tags=["admin"])
+from ..config import settings
+from ..database import get_db
+from ..models import (
+    User, ServiceOrder, WalletCard, ItunesOrder, PhoneTopup,
+    PubgOrder, LudoOrder, Notice, Token
+)
+from ..providers.smm_client import provider_add_order, provider_balance, provider_status
 
-# ========= إعدادات =========
-ADMIN_PASS = os.getenv("ADMIN_PASS", "2000")
-KD1S_API_URL = os.getenv("KD1S_API_URL", "https://kd1s.com/api/v2")
-KD1S_API_KEY = os.getenv("KD1S_API_KEY", "")
+r = APIRouter(prefix="/api/admin")
 
-SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+# ---------- Guard ----------
+def guard(
+    x_admin_pass: Optional[str] = Header(default=None, alias="X-Admin-Pass"),
+    x_admin_pass_alt: Optional[str] = Header(default=None, alias="x-admin-pass"),
+    key: Optional[str] = Query(default=None),
+):
+    pwd = (x_admin_pass or x_admin_pass_alt or key or "").strip()
+    if pwd != settings.ADMIN_PASSWORD:
+        raise HTTPException(401, "unauthorized")
 
-def get_db():
-    db = SessionLocal()
+# ---------- helpers ----------
+def _ts(dt: Optional[datetime]) -> int:
+    return int(dt.timestamp()) if dt else 0
+
+def _order_row(
+    id_str: str,
+    title: str,
+    qty: int,
+    price: float,
+    payload: str,
+    status: str,
+    created_at: Optional[datetime],
+) -> Dict[str, Any]:
+    return {
+        "id": id_str,
+        "title": title,
+        "quantity": qty,
+        "price": float(price),
+        "payload": payload,
+        "status": status,
+        "created_at": _ts(created_at),
+    }
+
+def _parse_compound_id(comp: str) -> Tuple[str, int]:
+    """
+    comp مثال: svc:12  / card:5 / itunes:9 / phone:7 / pubg:4 / ludo:3
+    """
     try:
-        yield db
-    finally:
-        db.close()
+        kind, sid = comp.split(":", 1)
+        return kind, int(sid)
+    except Exception:
+        raise HTTPException(400, "bad order_id")
 
-def require_admin(req: Request):
-    token = req.headers.get("x-admin-pass")
-    if token != ADMIN_PASS:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    return True
+# ---------- Pending lists (arrays, not wrapped) ----------
+@r.get("/pending/services", dependencies=[Depends(guard)])
+def pending_services(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
+    rows = (
+        db.query(ServiceOrder)
+        .filter(ServiceOrder.status == "pending")
+        .order_by(ServiceOrder.created_at.desc())
+        .all()
+    )
+    return [
+        _order_row(
+            id_str=f"svc:{o.id}",
+            title=f"{o.service_key or 'خدمة'} (#{o.service_code})",
+            qty=o.quantity,
+            price=o.price,
+            payload=o.link,
+            status=o.status,
+            created_at=o.created_at,
+        )
+        for o in rows
+    ]
 
-def to_float(x):
-    if isinstance(x, decimal.Decimal):
-        return float(x)
-    return x
+@r.get("/pending/itunes", dependencies=[Depends(guard)])
+def pending_itunes(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
+    rows = (
+        db.query(ItunesOrder)
+        .filter(ItunesOrder.status == "pending")
+        .order_by(ItunesOrder.created_at.desc())
+        .all()
+    )
+    return [
+        _order_row(
+            id_str=f"itunes:{o.id}",
+            title=f"iTunes ${o.amount}",
+            qty=o.amount,
+            price=float(o.amount),
+            payload="-",
+            status=o.status,
+            created_at=o.created_at,
+        )
+        for o in rows
+    ]
 
-# ========= نماذج طلب =========
-class AmountIn(BaseModel):
+@r.get("/pending/topups", dependencies=[Depends(guard)])
+def pending_topups(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
+    rows = (
+        db.query(WalletCard)
+        .filter(WalletCard.status == "pending")
+        .order_by(WalletCard.created_at.desc())
+        .all()
+    )
+    out: List[Dict[str, Any]] = []
+    for c in rows:
+        title = f"Asiacell Card from {c.uid}"
+        payload = c.card_number or ""
+        out.append(
+            _order_row(
+                id_str=f"card:{c.id}",
+                title=title,
+                qty=1,
+                price=0.0,
+                payload=payload,  # يظهر الرقم للمالك وقابل للنسخ في الواجهة
+                status=c.status,
+                created_at=c.created_at,
+            )
+        )
+    return out
+
+@r.get("/pending/pubg", dependencies=[Depends(guard)])
+def pending_pubg(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
+    rows = (
+        db.query(PubgOrder)
+        .filter(PubgOrder.status == "pending")
+        .order_by(PubgOrder.created_at.desc())
+        .all()
+    )
+    return [
+        _order_row(
+            id_str=f"pubg:{o.id}",
+            title=f"PUBG {o.pkg} UC | {o.pubg_id}",
+            qty=o.pkg,
+            price=0.0,
+            payload=o.pubg_id,
+            status=o.status,
+            created_at=o.created_at,
+        )
+        for o in rows
+    ]
+
+@r.get("/pending/ludo", dependencies=[Depends(guard)])
+def pending_ludo(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
+    rows = (
+        db.query(LudoOrder)
+        .filter(LudoOrder.status == "pending")
+        .order_by(LudoOrder.created_at.desc())
+        .all()
+    )
+    return [
+        _order_row(
+            id_str=f"ludo:{o.id}",
+            title=f"Ludo {o.kind} x{o.pack} | {o.ludo_id}",
+            qty=o.pack,
+            price=0.0,
+            payload=o.ludo_id,
+            status=o.status,
+            created_at=o.created_at,
+        )
+        for o in rows
+    ]
+
+# ---------- Actions (approve/reject/refund) ----------
+class ApproveReq(BaseModel):
+    order_id: str
+    amount: Optional[float] = None  # يستخدم لقبول كارت أسيا سيل
+
+class RejectReq(BaseModel):
+    order_id: str
+    reason: Optional[str] = None
+
+class RefundReq(BaseModel):
+    order_id: str
+
+from pydantic import BaseModel
+
+@r.post("/orders/approve", dependencies=[Depends(guard)])
+def orders_approve(payload: ApproveReq, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    kind, oid = _parse_compound_id(payload.order_id)
+
+    if kind == "svc":
+        o = db.get(ServiceOrder, oid)
+        if not o or o.status != "pending":
+            raise HTTPException(404, "order not found or not pending")
+
+        # إرسال فعلي إلى المزود KD1S
+        sent = provider_add_order(o.service_key, o.link, o.quantity)
+        if not sent.get("ok"):
+            raise HTTPException(502, sent.get("error", "provider error"))
+
+        o.status = "processing"
+        o.provider_order_id = sent["orderId"]
+        db.add(o)
+
+        db.add(Notice(
+            title="تم تنفيذ طلبك",
+            body=f"تم إرسال الطلب للمزود. رقم المزود: {o.provider_order_id}",
+            for_owner=False, uid=o.uid
+        ))
+        db.commit()
+        return {"ok": True}
+
+    if kind == "card":
+        c = db.get(WalletCard, oid)
+        if not c or c.status != "pending":
+            raise HTTPException(404, "card not found or not pending")
+        amount = payload.amount
+        if amount is None:
+            raise HTTPException(400, "amount required for card approve")
+
+        c.status = "accepted"
+        c.amount_usd = float(amount)
+        c.reviewed_by = "owner"
+
+        u = db.query(User).filter_by(uid=c.uid).first()
+        if not u:
+            u = User(uid=c.uid, balance=0.0)
+        u.balance = round((u.balance or 0.0) + float(amount), 2)
+        db.add(u)
+        db.add(c)
+        db.add(Notice(
+            title="تم شحن رصيدك",
+            body=f"+${amount} عبر بطاقة أسيا سيل",
+            for_owner=False, uid=c.uid
+        ))
+        db.commit()
+        return {"ok": True}
+
+    if kind == "itunes":
+        o = db.get(ItunesOrder, oid)
+        if not o or o.status != "pending":
+            raise HTTPException(404, "itunes not found or not pending")
+        # هنا تستطيع تسليم كود إن رغبت، أو إبقاؤه manual
+        o.status = "delivered"
+        db.add(o)
+        db.add(Notice(title="iTunes", body=f"تمت معالجة طلب iTunes ${o.amount}", for_owner=False, uid=o.uid))
+        db.commit()
+        return {"ok": True}
+
+    if kind == "pubg":
+        o = db.get(PubgOrder, oid)
+        if not o or o.status != "pending":
+            raise HTTPException(404, "pubg not found or not pending")
+        o.status = "delivered"
+        db.add(o)
+        db.add(Notice(title="PUBG", body=f"تم تنفيذ شداتك {o.pkg} UC", for_owner=False, uid=o.uid))
+        db.commit()
+        return {"ok": True}
+
+    if kind == "ludo":
+        o = db.get(LudoOrder, oid)
+        if not o or o.status != "pending":
+            raise HTTPException(404, "ludo not found or not pending")
+        o.status = "delivered"
+        db.add(o)
+        db.add(Notice(title="Ludo", body=f"تم تنفيذ {o.kind} {o.pack}", for_owner=False, uid=o.uid))
+        db.commit()
+        return {"ok": True}
+
+    raise HTTPException(400, "unsupported kind")
+
+@r.post("/orders/reject", dependencies=[Depends(guard)])
+def orders_reject(payload: RejectReq, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    kind, oid = _parse_compound_id(payload.order_id)
+
+    if kind == "svc":
+        o = db.get(ServiceOrder, oid)
+        if not o or o.status != "pending":
+            raise HTTPException(404, "order not found or not pending")
+        o.status = "rejected"
+        # رد الرصيد
+        u = db.query(User).filter_by(uid=o.uid).first()
+        if u:
+            u.balance = round((u.balance or 0.0) + float(o.price or 0.0), 2)
+            db.add(u)
+        db.add(o)
+        db.add(Notice(title="تم رفض الطلب", body="تم رفض طلبك وتم ردّ الرصيد.", for_owner=False, uid=o.uid))
+        db.commit()
+        return {"ok": True}
+
+    if kind == "card":
+        c = db.get(WalletCard, oid)
+        if not c or c.status != "pending":
+            raise HTTPException(404, "card not found or not pending")
+        c.status = "rejected"
+        db.add(c)
+        db.add(Notice(title="رفض الكارت", body="تم رفض كارت أسيا سيل.", for_owner=False, uid=c.uid))
+        db.commit()
+        return {"ok": True}
+
+    if kind == "itunes":
+        o = db.get(ItunesOrder, oid)
+        if not o or o.status != "pending":
+            raise HTTPException(404, "itunes not found or not pending")
+        o.status = "rejected"
+        db.add(o)
+        db.add(Notice(title="رفض iTunes", body="تم رفض طلبك.", for_owner=False, uid=o.uid))
+        db.commit()
+        return {"ok": True}
+
+    if kind == "pubg":
+        o = db.get(PubgOrder, oid)
+        if not o or o.status != "pending":
+            raise HTTPException(404, "pubg not found or not pending")
+        o.status = "rejected"
+        db.add(o)
+        db.add(Notice(title="رفض PUBG", body="تم رفض طلبك.", for_owner=False, uid=o.uid))
+        db.commit()
+        return {"ok": True}
+
+    if kind == "ludo":
+        o = db.get(LudoOrder, oid)
+        if not o or o.status != "pending":
+            raise HTTPException(404, "ludo not found or not pending")
+        o.status = "rejected"
+        db.add(o)
+        db.add(Notice(title="رفض Ludo", body="تم رفض طلبك.", for_owner=False, uid=o.uid))
+        db.commit()
+        return {"ok": True}
+
+    raise HTTPException(400, "unsupported kind")
+
+@r.post("/orders/refund", dependencies=[Depends(guard)])
+def orders_refund(payload: RefundReq, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    kind, oid = _parse_compound_id(payload.order_id)
+    if kind != "svc":
+        raise HTTPException(400, "refund is supported only for services orders")
+
+    o = db.get(ServiceOrder, oid)
+    if not o or o.status not in ("pending", "processing"):
+        raise HTTPException(404, "order not found or not refundable")
+    # اجعلها مرفوض ثم رد الرصيد
+    o.status = "rejected"
+    u = db.query(User).filter_by(uid=o.uid).first()
+    if u:
+        u.balance = round((u.balance or 0.0) + float(o.price or 0.0), 2)
+        db.add(u)
+    db.add(o)
+    db.add(Notice(title="رد رصيد", body=f"تم رد رصيد طلبك: {o.price}$", for_owner=False, uid=o.uid))
+    db.commit()
+    return {"ok": True}
+
+# ---------- Wallet ops ----------
+class WalletReq(BaseModel):
+    uid: str
     amount: float
 
-class CardAcceptIn(BaseModel):
-    amount_usd: float
-    reviewed_by: Optional[str] = "owner"
-
-class ItunesDeliverIn(BaseModel):
-    gift_code: str
-
-# ========= تكامل KD1S =========
-def kd1s_add_order(service_code: int, link: str, quantity: int) -> Dict[str, Any]:
-    """
-    يرجع {'ok': True, 'order': <id>} أو {'ok': False, 'error': '...'}
-    """
-    if not KD1S_API_KEY:
-        return {"ok": False, "error": "KD1S_API_KEY not configured"}
-
-    data = {
-        "key": KD1S_API_KEY,
-        "action": "add",
-        "service": service_code,
-        "link": link,
-        "quantity": quantity
-    }
-    try:
-        res = requests.post(KD1S_API_URL, data=data, timeout=30)
-        j = res.json()
-        # صيغ شائعة: {"order":123456} أو {"error":"..."}
-        if "order" in j:
-            return {"ok": True, "order": j["order"]}
-        return {"ok": False, "error": j.get("error", "unknown error")}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-def kd1s_balance() -> Dict[str, Any]:
-    if not KD1S_API_KEY:
-        return {"ok": False, "error": "KD1S_API_KEY not configured"}
-    data = {"key": KD1S_API_KEY, "action": "balance"}
-    try:
-        res = requests.post(KD1S_API_URL, data=data, timeout=20)
-        j = res.json()
-        # صيغ شائعة: {"balance":"123.45"} أو {"remains":...}
-        bal = j.get("balance") or j.get("funds") or j.get("remains")
-        if bal is None:
-            return {"ok": False, "error": "no balance field", "raw": j}
-        try:
-            return {"ok": True, "balance": float(bal)}
-        except:
-            return {"ok": True, "balance": bal}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-# ========= المعلّقات: خدمات (orders.status='pending') =========
-@r.get("/pending/services")
-def get_pending_services(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    q = text("""
-        SELECT id, uid, service_key, service_code, link, quantity, price
-        FROM orders
-        WHERE status = 'pending'
-        ORDER BY id DESC
-        LIMIT 200
-    """)
-    rows = db.execute(q).mappings().all()
-    lst = []
-    for row in rows:
-        lst.append({
-            "id": str(row["id"]),
-            "uid": row["uid"],
-            "service_key": row["service_key"],
-            "service_code": int(row["service_code"]) if row["service_code"] is not None else None,
-            "link": row["link"],
-            "quantity": int(row["quantity"]) if row["quantity"] is not None else 0,
-            "price": to_float(row["price"]) if row["price"] is not None else 0.0,
-        })
-    return {"ok": True, "list": lst}
-
-@r.post("/pending/services/{order_id}/approve")
-def approve_service(order_id: int, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    # اجلب الطلب
-    row = db.execute(text("SELECT * FROM orders WHERE id=:id"), {"id": order_id}).mappings().first()
-    if not row:
-        raise HTTPException(404, "order not found")
-    if row["status"] != "pending":
-        raise HTTPException(400, "invalid status")
-
-    # تحقق رصيد المستخدم (خصم عند الموافقة)
-    user = db.execute(text("SELECT * FROM users WHERE uid=:u FOR UPDATE"), {"u": row["uid"]}).mappings().first()
-    if not user:
-        raise HTTPException(400, "user not found")
-    price = float(row["price"] or 0)
-    if (user["balance"] or 0) < price:
-        raise HTTPException(400, "insufficient balance")
-
-    # استدعِ KD1S
-    svc = int(row["service_code"] or 0)
-    if svc <= 0:
-        raise HTTPException(400, "invalid service_code")
-    kd = kd1s_add_order(svc, row["link"], int(row["quantity"] or 0))
-    if not kd.get("ok"):
-        raise HTTPException(502, f"kd1s error: {kd.get('error')}")
-
-    provider_order_id = str(kd["order"])
-
-    # حدّث الرصيد وحالة الطلب
-    with db.begin():
-        db.execute(
-            text("UPDATE users SET balance = balance - :p WHERE uid=:u"),
-            {"p": price, "u": row["uid"]}
-        )
-        db.execute(
-            text("UPDATE orders SET status='processing', payload=:pl WHERE id=:id"),
-            {"pl": provider_order_id, "id": order_id}
-        )
-    return {"ok": True, "provider_order": provider_order_id}
-
-@r.post("/pending/services/{order_id}/reject")
-def reject_service(order_id: int, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    exists = db.execute(text("SELECT 1 FROM orders WHERE id=:id"), {"id": order_id}).first()
-    if not exists:
-        raise HTTPException(404, "order not found")
-    db.execute(text("UPDATE orders SET status='rejected' WHERE id=:id"), {"id": order_id})
+@r.post("/wallet/topup", dependencies=[Depends(guard)])
+def wallet_topup(body: WalletReq, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    u = db.query(User).filter_by(uid=body.uid).first()
+    if not u:
+        u = User(uid=body.uid, balance=0.0)
+    u.balance = round((u.balance or 0.0) + float(body.amount), 2)
+    db.add(u)
+    db.add(Notice(title="تم إضافة رصيد", body=f"+${body.amount}", for_owner=False, uid=body.uid))
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "balance": u.balance}
 
-# ========= الكارتات المعلّقة =========
-@r.get("/pending/cards")
-def pending_cards(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    q = text("""
-        SELECT id, uid, card_number, status, created_at
-        FROM topup_cards
-        WHERE status='pending'
-        ORDER BY id DESC
-        LIMIT 200
-    """)
-    rows = db.execute(q).mappings().all()
-    lst = []
-    for row in rows:
-        lst.append({
-            "id": row["id"],
-            "uid": row["uid"],
-            "card_number": row["card_number"],
-            "status": row["status"],
-            "created_at": row["created_at"].isoformat() if row["created_at"] else None
-        })
-    return {"ok": True, "list": lst}
-
-@r.post("/pending/cards/{card_id}/accept")
-def accept_card(card_id: int, body: CardAcceptIn, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    card = db.execute(text("SELECT * FROM topup_cards WHERE id=:id FOR UPDATE"), {"id": card_id}).mappings().first()
-    if not card:
-        raise HTTPException(404, "card not found")
-    if card["status"] != "pending":
-        raise HTTPException(400, "invalid status")
-
-    uid = card["uid"]
-    amount = float(body.amount_usd)
-
-    with db.begin():
-        # أضف الرصيد للعميل
-        db.execute(text("""
-            INSERT INTO users (uid, balance) VALUES (:u, :a)
-            ON CONFLICT (uid) DO UPDATE SET balance = users.balance + EXCLUDED.balance
-        """), {"u": uid, "a": amount})
-        # حدّث حالة الكارت
-        db.execute(text("""
-            UPDATE topup_cards SET status='accepted', reviewed_by=:rv
-            WHERE id=:id
-        """), {"rv": body.reviewed_by or "owner", "id": card_id})
-
-        # اختياري: سجل عملية في orders (كإشعار)
-        db.execute(text("""
-            INSERT INTO orders(uid, service_key, service_code, link, quantity, price, status, payload)
-            VALUES (:u, 'شحن رصيد (أسيا سيل)', NULL, NULL, 0, :a, 'done', :p)
-        """), {"u": uid, "a": amount, "p": f"topup_card:{card_id}"})
-
-    return {"ok": True}
-
-@r.post("/pending/cards/{card_id}/reject")
-def reject_card(card_id: int, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    exists = db.execute(text("SELECT 1 FROM topup_cards WHERE id=:id"), {"id": card_id}).first()
-    if not exists:
-        raise HTTPException(404, "card not found")
-    db.execute(text("UPDATE topup_cards SET status='rejected' WHERE id=:id"), {"id": card_id})
+@r.post("/wallet/deduct", dependencies=[Depends(guard)])
+def wallet_deduct(body: WalletReq, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    u = db.query(User).filter_by(uid=body.uid).first()
+    if not u:
+        u = User(uid=body.uid, balance=0.0)
+    u.balance = max(0.0, round((u.balance or 0.0) - float(body.amount), 2))
+    db.add(u)
+    db.add(Notice(title="تم خصم رصيد", body=f"-${body.amount}", for_owner=False, uid=body.uid))
     db.commit()
-    return {"ok": True}
+    return {"ok": True, "balance": u.balance}
 
-# ========= ايتونز =========
-@r.get("/pending/itunes")
-def pending_itunes(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    q = text("""
-        SELECT id, uid, amount, status, created_at
-        FROM itunes_requests
-        WHERE status='pending'
-        ORDER BY id DESC
-        LIMIT 200
-    """)
-    rows = db.execute(q).mappings().all()
-    lst = []
-    for row in rows:
-        lst.append({
-            "id": row["id"],
-            "uid": row["uid"],
-            "amount": to_float(row["amount"]),
-            "status": row["status"],
-            "created_at": row["created_at"].isoformat() if row["created_at"] else None
-        })
-    return {"ok": True, "list": lst}
+# ---------- Stats ----------
+@r.get("/stats/users-count", dependencies=[Depends(guard)])
+def users_count(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    return {"count": db.query(User).count()}
 
-@r.post("/pending/itunes/{req_id}/deliver")
-def itunes_deliver(req_id: int, body: ItunesDeliverIn, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    req = db.execute(text("SELECT * FROM itunes_requests WHERE id=:id"), {"id": req_id}).mappings().first()
-    if not req:
-        raise HTTPException(404, "request not found")
-    if req["status"] != "pending":
-        raise HTTPException(400, "invalid status")
+@r.get("/stats/users-balances", dependencies=[Depends(guard)])
+def users_balances(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    total = sum(float(u.balance or 0.0) for u in db.query(User).all())
+    return {"total": round(total, 2)}
 
-    with db.begin():
-        db.execute(text("""
-            UPDATE itunes_requests SET status='done', gift_code=:c WHERE id=:id
-        """), {"c": body.gift_code, "id": req_id})
-        # إشعار في orders (اختياري)
-        db.execute(text("""
-            INSERT INTO orders(uid, service_key, service_code, link, quantity, price, status, payload)
-            VALUES (:u, 'شحن ايتونز', NULL, NULL, 1, :a, 'done', :p)
-        """), {"u": req["uid"], "a": float(req["amount"] or 0), "p": f"itunes:{req_id}"})
-    return {"ok": True}
+# ---------- Provider ----------
+@r.get("/provider/balance", dependencies=[Depends(guard)])
+def provider_bal():
+    b = provider_balance()
+    # توقع أن تُرجع provider_balance() dict يشمل balance أو ok/err
+    if isinstance(b, dict) and "balance" in b:
+        return {"balance": b["balance"]}
+    return {"balance": 0.0}
 
-@r.post("/pending/itunes/{req_id}/reject")
-def itunes_reject(req_id: int, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    db.execute(text("UPDATE itunes_requests SET status='rejected' WHERE id=:id"), {"id": req_id})
-    db.commit()
-    return {"ok": True}
-
-# ========= ببجي =========
-@r.get("/pending/pubg")
-def pending_pubg(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    q = text("""
-        SELECT id, uid, amount, status, created_at, payload
-        FROM pubg_requests
-        WHERE status='pending'
-        ORDER BY id DESC
-        LIMIT 200
-    """)
-    rows = db.execute(q).mappings().all()
-    lst = []
-    for row in rows:
-        lst.append({
-            "id": row["id"],
-            "uid": row["uid"],
-            "amount": int(row["amount"] or 0),
-            "status": row["status"],
-            "payload": row["payload"],
-            "created_at": row["created_at"].isoformat() if row["created_at"] else None
-        })
-    return {"ok": True, "list": lst}
-
-@r.post("/pending/pubg/{req_id}/deliver")
-def pubg_deliver(req_id: int, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    db.execute(text("UPDATE pubg_requests SET status='done' WHERE id=:id"), {"id": req_id})
-    db.commit()
-    return {"ok": True}
-
-@r.post("/pending/pubg/{req_id}/reject")
-def pubg_reject(req_id: int, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    db.execute(text("UPDATE pubg_requests SET status='rejected' WHERE id=:id"), {"id": req_id})
-    db.commit()
-    return {"ok": True}
-
-# ========= لودو =========
-@r.get("/pending/ludo")
-def pending_ludo(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    q = text("""
-        SELECT id, uid, amount, status, created_at, payload
-        FROM ludo_requests
-        WHERE status='pending'
-        ORDER BY id DESC
-        LIMIT 200
-    """)
-    rows = db.execute(q).mappings().all()
-    lst = []
-    for row in rows:
-        lst.append({
-            "id": row["id"],
-            "uid": row["uid"],
-            "amount": int(row["amount"] or 0),
-            "status": row["status"],
-            "payload": row["payload"],
-            "created_at": row["created_at"].isoformat() if row["created_at"] else None
-        })
-    return {"ok": True, "list": lst}
-
-@r.post("/pending/ludo/{req_id}/deliver")
-def ludo_deliver(req_id: int, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    db.execute(text("UPDATE ludo_requests SET status='done' WHERE id=:id"), {"id": req_id})
-    db.commit()
-    return {"ok": True}
-
-@r.post("/pending/ludo/{req_id}/reject")
-def ludo_reject(req_id: int, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    db.execute(text("UPDATE ludo_requests SET status='rejected' WHERE id=:id"), {"id": req_id})
-    db.commit()
-    return {"ok": True}
-
-# ========= الرصيد (تعبئة/خصم) =========
-@r.post("/users/{uid}/topup")
-def user_topup(uid: str, body: AmountIn, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    with db.begin():
-        db.execute(text("""
-            INSERT INTO users (uid, balance) VALUES (:u, :a)
-            ON CONFLICT (uid) DO UPDATE SET balance = users.balance + EXCLUDED.balance
-        """), {"u": uid, "a": float(body.amount)})
-    return {"ok": True}
-
-@r.post("/users/{uid}/deduct")
-def user_deduct(uid: str, body: AmountIn, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    row = db.execute(text("SELECT balance FROM users WHERE uid=:u FOR UPDATE"), {"u": uid}).first()
-    if not row:
-        raise HTTPException(404, "user not found")
-    bal = float(row[0] or 0)
-    if bal < body.amount:
-        raise HTTPException(400, "insufficient balance")
-    with db.begin():
-        db.execute(text("UPDATE users SET balance = balance - :a WHERE uid=:u"),
-                   {"a": float(body.amount), "u": uid})
-    return {"ok": True}
-
-# ========= إحصاءات =========
-@r.get("/users/count")
-def users_count(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    c = db.execute(text("SELECT COUNT(*) FROM users")).scalar() or 0
-    return {"ok": True, "count": int(c)}
-
-@r.get("/users/balances")
-def users_balances(_: bool = Depends(require_admin), db: Session = Depends(get_db)):
-    rows = db.execute(text("SELECT uid, balance FROM users ORDER BY balance DESC")).mappings().all()
-    lst = [{"uid": r["uid"], "balance": to_float(r["balance"])} for r in rows]
-    return {"ok": True, "list": lst}
-
-# ========= رصيد المزود =========
-@r.get("/provider/balance")
-def provider_balance(_: bool = Depends(require_admin)):
-    kb = kd1s_balance()
-    if not kb.get("ok"):
-        raise HTTPException(502, kb.get("error", "provider error"))
-    return {"ok": True, "balance": kb["balance"]}
+@r.get("/provider/order-status/{ext_order_id}", dependencies=[Depends(guard)])
+def provider_order_status(ext_order_id: str):
+    return provider_status(ext_order_id)
