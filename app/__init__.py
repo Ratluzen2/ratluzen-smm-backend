@@ -1,1 +1,1 @@
-# empty init to make 'app' a package
+# empty to mark package
