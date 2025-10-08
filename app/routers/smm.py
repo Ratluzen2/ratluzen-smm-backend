@@ -1,172 +1,173 @@
-from fastapi import APIRouter, Depends, HTTPException, Body, Query
+from fastapi import APIRouter, HTTPException, Body, Query, Depends
 from sqlalchemy.orm import Session
 from datetime import datetime
-from typing import Optional, List
 
 from ..database import get_db
-from ..models import User, ServiceOrder, WalletCard, Notice, ItunesOrder, PhoneTopup, PubgOrder, LudoOrder
+from ..models import (
+    User, ServiceOrder, WalletCard, ItunesOrder, PhoneTopup,
+    PubgOrder, LudoOrder
+)
 
 r = APIRouter()
 
-def _row(obj):
-    out = {}
-    for c in obj.__table__.columns:
-        v = getattr(obj, c.name)
-        out[c.name] = v.isoformat() if isinstance(v, datetime) else v
-    return out
-
-@r.post("/users/upsert")
-def upsert_user(uid: str = Body(..., embed=True), db: Session = Depends(get_db)):
+def _ensure_user(db: Session, uid: str) -> User:
     u = db.query(User).filter_by(uid=uid).first()
     if not u:
         u = User(uid=uid, balance=0.0)
         db.add(u)
-        db.add(Notice(title="مرحبًا", body="تم إنشاء حسابك.", for_owner=False, uid=uid))
-        db.add(Notice(title="مستخدم جديد", body=f"UID={uid} اشترك للتو.", for_owner=True))
         db.commit()
+        db.refresh(u)
+    return u
+
+@r.post("/users/upsert")
+def upsert_uid(payload: dict = Body(...), db: Session = Depends(get_db)):
+    uid = (payload.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(400, "uid required")
+    _ensure_user(db, uid)
     return {"ok": True}
 
 @r.get("/wallet/balance")
 def wallet_balance(uid: str, db: Session = Depends(get_db)):
-    u = db.query(User).filter_by(uid=uid).first()
-    if not u:
-        u = User(uid=uid, balance=0.0)
-        db.add(u); db.commit()
-    return {"balance": u.balance}
+    u = _ensure_user(db, uid)
+    return {"ok": True, "balance": round(u.balance, 2)}
 
 @r.post("/wallet/asiacell/submit")
-def asiacell_submit(uid: str = Body(...), card: str = Body(...), db: Session = Depends(get_db)):
-    digits = "".join([d for d in card if d.isdigit()])
-    if len(digits) not in (14, 16):
-        raise HTTPException(400, "invalid card")
-    wc = WalletCard(uid=uid, card_number=digits, status="pending")
+def submit_asiacell_card(payload: dict = Body(...), db: Session = Depends(get_db)):
+    uid = (payload.get("uid") or "").strip()
+    card = (payload.get("card") or "").strip()
+    if not uid or not card:
+        raise HTTPException(400, "uid/card required")
+    if not (len(card) in (14, 16) and card.isdigit()):
+        raise HTTPException(400, "card must be 14 or 16 digits")
+    _ensure_user(db, uid)
+    wc = WalletCard(uid=uid, card_number=card, status="pending")
     db.add(wc)
-    db.add(Notice(
-        title="كارت أسيا سيل جديد",
-        body=f"UID={uid} | كارت={digits}",
-        for_owner=True
-    ))
-    db.add(Notice(
-        title="استلمنا كارتك",
-        body=f"تم إرسال كارت أسيا سيل للمراجعة",
-        for_owner=False,
-        uid=uid
-    ))
     db.commit()
-    return {"ok": True, "id": wc.id}
+    return {"ok": True}
 
 @r.post("/orders/create/provider")
-def create_provider_order(
-    uid: str = Body(...),
-    service_id: int = Body(...),
-    service_name: str = Body(...),
-    link: str = Body(...),
-    quantity: int = Body(...),
-    price: float = Body(...),
-    db: Session = Depends(get_db)
-):
-    u = db.query(User).filter_by(uid=uid).first()
-    if not u: u = User(uid=uid, balance=0.0)
+def create_provider_order(payload: dict = Body(...), db: Session = Depends(get_db)):
+    uid = (payload.get("uid") or "").strip()
+    service_id = int(payload.get("service_id") or 0)
+    service_name = (payload.get("service_name") or "SERVICE").strip()
+    link = (payload.get("link") or "").strip()
+    quantity = int(payload.get("quantity") or 0)
+    price = float(payload.get("price") or 0.0)
+    unit_per_k = float(payload.get("unit_price_per_k") or 0.0) or (price * 1000.0 / max(1, quantity))
+
+    if not uid or not service_id or not link or quantity <= 0 or price <= 0:
+        raise HTTPException(400, "invalid payload")
+
+    u = _ensure_user(db, uid)
     if u.balance < price:
         raise HTTPException(400, "insufficient balance")
 
-    # نخصم السعر الآن، وإن رُفض الطلب من لوحة المالك نردّه
-    u.balance = round(u.balance - float(price), 2)
+    # خصم الرصيد الآن، التنفيذ فعليًا سيتم عند موافقة المالك
+    u.balance = round(u.balance - price, 2)
     order = ServiceOrder(
-        uid=uid,
-        service_key=service_name,
-        service_code=service_id,
-        link=link,
-        quantity=quantity,
-        unit_price_per_k=price * 1000.0 / max(quantity, 1),
-        price=price,
-        status="pending"
+        uid=uid, service_key=service_name, service_code=service_id,
+        link=link, quantity=quantity, unit_price_per_k=unit_per_k,
+        price=price, status="pending"
     )
-    db.add(u); db.add(order)
-    db.add(Notice(title="طلب خدمات معلّق", body=f"{service_name} | {quantity}", for_owner=True))
-    db.add(Notice(title="طلبك قيد المراجعة", body=f"{service_name} | {quantity}", for_owner=False, uid=uid))
+    db.add(u)
+    db.add(order)
     db.commit()
-    return {"ok": True, "id": order.id}
+    return {"ok": True, "order_id": order.id}
 
 @r.post("/orders/create/manual")
-def create_manual(uid: str = Body(...), title: str = Body(...), db: Session = Depends(get_db)):
-    t = title.strip()
-    created_id = None
+def create_manual(payload: dict = Body(...), db: Session = Depends(get_db)):
+    uid = (payload.get("uid") or "").strip()
+    title = (payload.get("title") or "").strip()
+    if not uid or not title:
+        raise HTTPException(400, "uid/title required")
+    _ensure_user(db, uid)
+
+    t = title.replace(" ", "")
     if "ايتونز" in t or "itunes" in t.lower():
-        it = ItunesOrder(uid=uid, amount=0, status="pending")
-        db.add(it); db.commit(); created_id = it.id
-    elif any(k in t for k in ["أثير", "اثير", "asiacell", "اسياسيل", "زين", "korek", "كورك"]):
-        op = "asiacell" if any(k in t for k in ["اسياسيل","asiacell"]) else ("atheir" if any(k in t for k in ["أثير","اثير"]) else "korek")
-        ph = PhoneTopup(uid=uid, operator=op, amount=0, status="pending")
-        db.add(ph); db.commit(); created_id = ph.id
-    elif "ببجي" in t or "pubg" in t.lower():
-        o = PubgOrder(uid=uid, pkg=60, pubg_id="0", status="pending")
-        db.add(o); db.commit(); created_id = o.id
-    elif "لودو" in t or "ludo" in t.lower():
-        o = LudoOrder(uid=uid, kind="diamonds", pack=100, ludo_id="0", status="pending")
-        db.add(o); db.commit(); created_id = o.id
+        db.add(ItunesOrder(uid=uid, amount=0))
+    elif "اسياسيل" in t:
+        db.add(PhoneTopup(uid=uid, operator="asiacell", amount=0))
+    elif "اتير" in t or "اثير" in t:
+        db.add(PhoneTopup(uid=uid, operator="atheir", amount=0))
+    elif "كورك" in t:
+        db.add(PhoneTopup(uid=uid, operator="korek", amount=0))
+    elif "ببجي" in t:
+        db.add(PubgOrder(uid=uid, pkg=0, pubg_id=""))
+    elif "لudo" in t.lower() or "لودو" in t:
+        db.add(LudoOrder(uid=uid, kind="diamonds", pack=0, ludo_id=""))
     else:
-        db.add(Notice(title="طلب يدوي", body=f"{t} | UID={uid}", for_owner=True)); db.commit()
-    db.add(Notice(title="طلبك قيد المراجعة", body=t, for_owner=False, uid=uid)); db.commit()
-    return {"ok": True, "id": created_id}
+        # كطلب عام: نخزّنه كطلب خدمة اسم فقط بدون مزوّد
+        db.add(ServiceOrder(uid=uid, service_key=title, service_code=0, link="", quantity=0,
+                            unit_price_per_k=0.0, price=0.0, status="pending"))
+    db.commit()
+    return {"ok": True}
 
 @r.get("/orders/my")
-def my_orders(uid: str, db: Session = Depends(get_db)) -> list[dict]:
-    out: list[dict] = []
+def my_orders(uid: str, db: Session = Depends(get_db)):
+    out = []
 
-    for o in db.query(ServiceOrder).filter_by(uid=uid).order_by(ServiceOrder.created_at.desc()).all():
+    for o in db.query(ServiceOrder).filter_by(uid=uid).order_by(ServiceOrder.created_at.desc()).limit(200):
         out.append({
-            "id": str(o.id),
+            "id": f"svc:{o.id}",
             "title": o.service_key,
             "quantity": o.quantity,
             "price": o.price,
             "payload": o.link,
             "status": o.status.capitalize(),
-            "created_at": int(o.created_at.timestamp() * 1000)
+            "created_at": int(o.created_at.timestamp()*1000) if o.created_at else 0
         })
-
-    for it in db.query(ItunesOrder).filter_by(uid=uid).order_by(ItunesOrder.created_at.desc()).all():
+    for c in db.query(WalletCard).filter_by(uid=uid).order_by(WalletCard.created_at.desc()).limit(200):
         out.append({
-            "id": f"itunes-{it.id}",
-            "title": "طلب آيتونز",
-            "quantity": it.amount,
+            "id": f"card:{c.id}",
+            "title": "Asiacell Card",
+            "quantity": 1,
             "price": 0.0,
+            "payload": c.card_number,
+            "status": c.status.capitalize(),
+            "created_at": int(c.created_at.timestamp()*1000) if c.created_at else 0
+        })
+    for it in db.query(ItunesOrder).filter_by(uid=uid).order_by(ItunesOrder.created_at.desc()).limit(200):
+        out.append({
+            "id": f"itunes:{it.id}",
+            "title": "iTunes",
+            "quantity": 1,
+            "price": float(it.amount or 0),
             "payload": it.gift_code or "",
             "status": it.status.capitalize(),
-            "created_at": int(it.created_at.timestamp() * 1000)
+            "created_at": int(it.created_at.timestamp()*1000) if it.created_at else 0
         })
-
-    for ph in db.query(PhoneTopup).filter_by(uid=uid).order_by(PhoneTopup.created_at.desc()).all():
+    for ph in db.query(PhoneTopup).filter_by(uid=uid).order_by(PhoneTopup.created_at.desc()).limit(200):
         out.append({
-            "id": f"phone-{ph.id}",
-            "title": f"شحن هاتف ({ph.operator})",
-            "quantity": ph.amount,
-            "price": 0.0,
+            "id": f"phone:{ph.id}",
+            "title": f"Phone {ph.operator}",
+            "quantity": 1,
+            "price": float(ph.amount or 0),
             "payload": ph.code or "",
             "status": ph.status.capitalize(),
-            "created_at": int(ph.created_at.timestamp() * 1000)
+            "created_at": int(ph.created_at.timestamp()*1000) if ph.created_at else 0
         })
-
-    for pb in db.query(PubgOrder).filter_by(uid=uid).order_by(PubgOrder.created_at.desc()).all():
+    for pb in db.query(PubgOrder).filter_by(uid=uid).order_by(PubgOrder.created_at.desc()).limit(200):
         out.append({
-            "id": f"pubg-{pb.id}",
-            "title": f"شدات ببجي {pb.pkg}",
+            "id": f"pubg:{pb.id}",
+            "title": "PUBG UC",
             "quantity": pb.pkg,
             "price": 0.0,
             "payload": pb.pubg_id,
             "status": pb.status.capitalize(),
-            "created_at": int(pb.created_at.timestamp() * 1000)
+            "created_at": int(pb.created_at.timestamp()*1000) if pb.created_at else 0
         })
-
-    for ld in db.query(LudoOrder).filter_by(uid=uid).order_by(LudoOrder.created_at.desc()).all():
+    for ld in db.query(LudoOrder).filter_by(uid=uid).order_by(LudoOrder.created_at.desc()).limit(200):
         out.append({
-            "id": f"ludo-{ld.id}",
-            "title": f"لودو {ld.kind} {ld.pack}",
+            "id": f"ludo:{ld.id}",
+            "title": f"Ludo {ld.kind}",
             "quantity": ld.pack,
             "price": 0.0,
             "payload": ld.ludo_id,
             "status": ld.status.capitalize(),
-            "created_at": int(ld.created_at.timestamp() * 1000)
+            "created_at": int(ld.created_at.timestamp()*1000) if ld.created_at else 0
         })
 
+    # الأحدث أولًا
+    out.sort(key=lambda x: x["created_at"], reverse=True)
     return out
