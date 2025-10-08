@@ -59,7 +59,6 @@ def pending_topups(token: str = Depends(_token)):
             } for r in rows]
     finally: put_conn(conn)
 
-# alias بطلب بعض النسخ من التطبيق
 @router.get("/pending/cards")
 def pending_cards_alias(token: str = Depends(_token)):
     return pending_topups(token)
