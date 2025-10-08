@@ -1,110 +1,123 @@
-import uuid
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
-from ..database import get_db
-from ..models import User, Order, CardSubmission, ItunesOrder, PubgOrder, LudoOrder
-from ..providers.smm_client import SMMClient
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+from ..db import get_conn, put_conn
 
 router = APIRouter(prefix="/api", tags=["public"])
 
-# /health
-@router.get("/health")
-def health():
-    return {"ok": True}
+class UpsertUserIn(BaseModel):
+    uid: str
 
-# --- users ---
 @router.post("/users/upsert")
-def users_upsert(payload: dict, db: Session = Depends(get_db)):
-    uid = str(payload.get("uid", "")).strip()
-    if not uid: raise HTTPException(400, "uid required")
-    u = db.query(User).filter(User.uid == uid).first()
-    if not u:
-        u = User(uid=uid, balance=0.0, is_banned=False)
-        db.add(u); db.commit()
-    return {"ok": True, "uid": uid}
+def upsert_user(body: UpsertUserIn):
+    uid = body.uid.strip()
+    if not uid: raise HTTPException(422, "uid required")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM public.users WHERE uid=%s", (uid,))
+            if not cur.fetchone():
+                cur.execute("INSERT INTO public.users(uid) VALUES(%s)", (uid,))
+        return {"ok": True, "uid": uid}
+    finally: put_conn(conn)
 
-# --- wallet ---
 @router.get("/wallet/balance")
-def wallet_balance(uid: str = Query(...), db: Session = Depends(get_db)):
-    u = db.query(User).filter(User.uid == uid).first()
-    if not u:
-        u = User(uid=uid, balance=0.0)
-        db.add(u); db.commit()
-    return {"balance": float(u.balance or 0.0)}
+def wallet_balance(uid: str):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT balance FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+        return {"ok": True, "balance": float(r[0] if r else 0.0)}
+    finally: put_conn(conn)
+
+class AsiacellCardIn(BaseModel):
+    uid: str
+    card: str
 
 @router.post("/wallet/asiacell/submit")
-def wallet_asiacell_submit(payload: dict, db: Session = Depends(get_db)):
-    uid = str(payload.get("uid", "")).strip()
-    card = str(payload.get("card", "")).strip()
-    if not uid or not card: raise HTTPException(400, "uid/card required")
-    sub = CardSubmission(uid=uid, card_number=card)
-    db.add(sub); db.commit()
-    return {"ok": True, "id": sub.id}
-
-# --- orders ---
-@router.post("/orders/create/provider")
-async def create_provider_order(payload: dict, db: Session = Depends(get_db)):
-    uid = str(payload.get("uid", "")).strip()
-    service_id = int(payload.get("service_id", 0))
-    service_name = str(payload.get("service_name", ""))
-    link = str(payload.get("link", ""))
-    quantity = int(payload.get("quantity", 0))
-    price = float(payload.get("price", 0.0))
-    if not uid or service_id <= 0 or quantity <= 0: raise HTTPException(400, "bad request")
-
-    u = db.query(User).filter(User.uid == uid).first()
-    if not u:
-        u = User(uid=uid, balance=0.0); db.add(u); db.commit()
-    if (u.balance or 0.0) < price:
-        raise HTTPException(402, "insufficient balance")
-
-    # اطلب من مزود SMM (يمكنك تعطيل هذه الخطوة لو أردت)
-    panel_id = None
+def submit_card(body: AsiacellCardIn):
+    if not body.card or len(body.card) not in (14,16): raise HTTPException(422, "invalid card")
+    conn = get_conn()
     try:
-        created = await SMMClient().add_order(service=service_id, link=link, quantity=quantity)
-        panel_id = int(created.get("order"))
-    except Exception:
-        panel_id = None  # لا توقف التطبيق لو فشل المزود
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (body.uid,))
+            u = cur.fetchone()
+            if not u: raise HTTPException(404, "user not found")
+            cur.execute("""
+                INSERT INTO public.asiacell_cards(user_id, card_number, status)
+                VALUES(%s,%s,'Pending') RETURNING id
+            """, (u[0], body.card))
+            cid = cur.fetchone()[0]
+        return {"ok": True, "card_id": cid}
+    finally: put_conn(conn)
 
-    u.balance = (u.balance or 0.0) - price  # خصم السعر
-    oid = str(uuid.uuid4())
-    order = Order(
-        id=oid, uid=uid, title=service_name or f"Service {service_id}", quantity=quantity,
-        price=price, payload=link, status="Pending", kind="provider", panel_order_id=panel_id
-    )
-    db.add(order); db.commit()
-    return {"ok": True, "order_id": oid}
+class ProviderOrderIn(BaseModel):
+    uid: str
+    service_id: int
+    service_name: str
+    link: str
+    quantity: int = Field(ge=1)
+    price: float = Field(ge=0)
+
+@router.post("/orders/create/provider")
+def create_provider_order(body: ProviderOrderIn):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id, balance FROM public.users WHERE uid=%s", (body.uid,))
+            r = cur.fetchone()
+            if not r: raise HTTPException(404, "user not found")
+            user_id, bal = r[0], float(r[1])
+            if bal < body.price: raise HTTPException(400, "insufficient balance")
+            cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (body.price, user_id))
+            cur.execute("""
+                INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                VALUES(%s, %s, %s, %s)
+            """, (user_id, -body.price, "order_charge",
+                  {"service_id": body.service_id, "name": body.service_name, "qty": body.quantity}))
+            cur.execute("""
+                INSERT INTO public.orders(user_id, title, service_id, link, quantity, price, status)
+                VALUES(%s,%s,%s,%s,%s,%s,'Pending') RETURNING id
+            """, (user_id, body.service_name, body.service_id, body.link, body.quantity, body.price))
+            oid = cur.fetchone()[0]
+        return {"ok": True, "order_id": oid}
+    finally: put_conn(conn)
+
+class ManualOrderIn(BaseModel):
+    uid: str
+    title: str
 
 @router.post("/orders/create/manual")
-def create_manual_order(payload: dict, db: Session = Depends(get_db)):
-    uid = str(payload.get("uid", "")).strip()
-    title = str(payload.get("title", "")).strip()
-    if not uid or not title: raise HTTPException(400, "uid/title required")
-
-    # نحاول تصنيف الطلب اليدوي إلى جداول خاصة إن أمكن
-    low = title.lower()
-    if "ايتونز" in title or "itunes" in low:
-        it = ItunesOrder(uid=uid, amount=0, status="Pending")
-        db.add(it); db.commit()
-    elif "ببجي" in title or "pubg" in low:
-        it = PubgOrder(uid=uid, pkg=0, pubg_id="", status="Pending")
-        db.add(it); db.commit()
-    elif "لودو" in title or "ludo" in low:
-        it = LudoOrder(uid=uid, kind="diamonds", pack=0, ludo_id="", status="Pending")
-        db.add(it); db.commit()
-
-    # أيضاً سجّل كـOrder للعرض في /orders/my
-    oid = str(uuid.uuid4())
-    o = Order(id=oid, uid=uid, title=title, quantity=0, price=0.0, payload="", status="Pending", kind="manual")
-    db.add(o); db.commit()
-    return {"ok": True, "order_id": oid}
+def create_manual_order(body: ManualOrderIn):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (body.uid,))
+            r = cur.fetchone()
+            if not r: raise HTTPException(404, "user not found")
+            cur.execute("""
+                INSERT INTO public.orders(user_id, title, quantity, price, status)
+                VALUES(%s,%s,0,0,'Pending') RETURNING id
+            """, (r[0], body.title))
+            oid = cur.fetchone()[0]
+        return {"ok": True, "order_id": oid}
+    finally: put_conn(conn)
 
 @router.get("/orders/my")
-def my_orders(uid: str = "", db: Session = Depends(get_db)):
-    q = db.query(Order).filter(Order.uid==uid).order_by(Order.created_at.desc()).limit(200).all()
-    return [
-        {
-            "id": o.id, "title": o.title, "quantity": o.quantity, "price": o.price,
-            "payload": o.payload or "", "status": o.status, "created_at": int(o.created_at.timestamp()*1000)
-        } for o in q
-    ]
+def my_orders(uid: str):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r: return []
+            cur.execute("""
+                SELECT id, title, quantity, price, status, EXTRACT(EPOCH FROM created_at)*1000
+                FROM public.orders WHERE user_id=%s ORDER BY id DESC
+            """, (r[0],))
+            rows = cur.fetchall()
+        return [
+            {"id": a, "title": b, "quantity": c, "price": float(d), "status": e, "created_at": int(f)}
+            for (a,b,c,d,e,f) in rows
+        ]
+    finally: put_conn(conn)
