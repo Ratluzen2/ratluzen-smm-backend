@@ -1,36 +1,49 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .database import Base, engine
-from .config import settings
-from .routers import routes_users, routes_provider, admin
-from . import smm_balance_router
+import logging
 
-Base.metadata.create_all(bind=engine)
+from .database import engine
+from .models import Base
+from .routers.smm import r as public_router
+from .routers.admin import r as admin_router
 
-app = FastAPI(title=settings.APP_NAME, version="1.0.0")
+app = FastAPI(title="ratluzen-smm-backend", version="1.0.0")
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# نقاط عامة
-app.include_router(routes_users.router)
-app.include_router(routes_provider.router)
+# إنشاء الجداول عند بدء التشغيل
+@app.on_event("startup")
+def on_startup() -> None:
+    try:
+        Base.metadata.create_all(bind=engine)
+    except Exception:
+        logging.exception("Failed to initialize database schema on startup")
 
-# نقاط الأدمن (x-admin-pass)
-app.include_router(admin.router)
-app.include_router(smm_balance_router.router)
+# نستخدم /api لكل الراوترات كما يعتمد التطبيق
+app.include_router(public_router, prefix="/api")
+app.include_router(admin_router,  prefix="/api")
 
-# اختيارياً: /config
-@app.get("/api/config")
-def get_config():
-    return {
-        "ok": True,
-        "data": {
-            "app_name": settings.APP_NAME,
-            "support_telegram_url": settings.SUPPORT_TELEGRAM_URL,
-            "support_whatsapp_url": settings.SUPPORT_WHATSAPP_URL,
-        }
-    }
+@app.get("/")
+def root():
+    return {"ok": True, "name": "ratluzen-smm-backend"}
+
+@app.get("/health")
+def health():
+    try:
+        with engine.connect() as conn:
+            conn.exec_driver_sql("SELECT 1")
+        db_ok = True
+    except Exception:
+        db_ok = False
+    return {"ok": True, "db": db_ok}
+
+@app.get("/api/health")
+def api_health():
+    return health()
