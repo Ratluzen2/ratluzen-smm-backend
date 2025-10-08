@@ -1,15 +1,14 @@
-from pydantic_settings import BaseSettings
-from pydantic import Field
+import os
 
-class Settings(BaseSettings):
-    DATABASE_URL: str = Field(..., description="PostgreSQL URL e.g. postgresql://user:pass@host/db?sslmode=require")
-    ADMIN_PASSWORD: str = Field("2000", description="Admin pass used in 'x-admin-pass' header")
-    KD1S_API_URL: str = Field("https://kd1s.com/api/v2", description="KD1S SMM API base")
-    KD1S_API_KEY: str = Field("", description="KD1S SMM API key")
-    FCM_SERVER_KEY: str = Field("", description="(Optional) Firebase server key")
+class Settings:
+    DATABASE_URL: str = os.getenv(
+        "DATABASE_URL",
+        "postgresql://user:pass@localhost:5432/postgres"
+    )
+    ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "2000")
+    FCM_SERVER_KEY: str | None = os.getenv("FCM_SERVER_KEY")
 
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
+    KD1S_BASE: str = os.getenv("KD1S_BASE", "https://kd1s.com/api/v2").rstrip("/")
+    KD1S_API_KEY: str = os.getenv("KD1S_API_KEY", "")
 
 settings = Settings()
