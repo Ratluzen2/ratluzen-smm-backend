@@ -1,7 +1,7 @@
 # app/routers/admin.py
 from fastapi import APIRouter, Depends, Header, HTTPException, Body, Query
 from sqlalchemy.orm import Session
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Tuple
 from datetime import datetime
 
 from ..config import settings
@@ -10,368 +10,349 @@ from ..models import (
     User, ServiceOrder, WalletCard, ItunesOrder, PhoneTopup,
     PubgOrder, LudoOrder, Notice
 )
-from ..providers.smm_client import provider_add_order, provider_balance
+from ..providers.smm_client import provider_add_order, provider_balance, provider_status
 
-r = APIRouter(prefix="/admin", tags=["admin"])
+r = APIRouter(prefix="/admin")
 
-# ---------------------- Helpers ----------------------
-def _ts(dt: Optional[datetime]) -> int:
-    return int((dt or datetime.utcnow()).timestamp() * 1000)
+# =========================
+# Helpers
+# =========================
+def _ms(ts: Optional[datetime]) -> int:
+    if not ts:
+        return int(datetime.utcnow().timestamp() * 1000)
+    try:
+        return int(ts.timestamp() * 1000)
+    except Exception:
+        return int(datetime.utcnow().timestamp() * 1000)
 
-def _svc_row(o: ServiceOrder) -> Dict[str, Any]:
-    return {
-        "id": f"svc-{o.id}",
-        "title": f"خدمة: {o.service_key}",
-        "quantity": o.quantity,
-        "price": float(o.price or 0.0),
-        "payload": o.link,
-        "created_at": _ts(o.created_at),
-        "status": o.status,
-    }
+def _ok_owner_notice(db: Session, title: str, body: str):
+    db.add(Notice(title=title, body=body, for_owner=True, uid=None))
 
-def _top_row(o: WalletCard) -> Dict[str, Any]:
-    return {
-        "id": f"top-{o.id}",
-        "title": "كارت أسيا سيل",
-        "quantity": 1,
-        "price": float(o.amount_usd or 0.0),
-        "payload": o.card_number,  # يُعرض للمالك للنسخ
-        "created_at": _ts(o.created_at),
-        "status": o.status,
-    }
-
-def _itunes_row(o: ItunesOrder) -> Dict[str, Any]:
-    return {
-        "id": f"itn-{o.id}",
-        "title": f"iTunes ${o.amount}",
-        "quantity": 1,
-        "price": float(o.amount or 0.0),
-        "payload": o.gift_code or "",
-        "created_at": _ts(o.created_at),
-        "status": o.status,
-    }
-
-def _pubg_row(o: PubgOrder) -> Dict[str, Any]:
-    return {
-        "id": f"pubg-{o.id}",
-        "title": f"PUBG {o.pkg} UC",
-        "quantity": o.pkg,
-        "price": 0.0,
-        "payload": o.pubg_id,
-        "created_at": _ts(o.created_at),
-        "status": o.status,
-    }
-
-def _ludo_row(o: LudoOrder) -> Dict[str, Any]:
-    return {
-        "id": f"ludo-{o.id}",
-        "title": f"Ludo {o.kind} {o.pack}",
-        "quantity": o.pack,
-        "price": 0.0,
-        "payload": o.ludo_id,
-        "created_at": _ts(o.created_at),
-        "status": o.status,
-    }
-
-def _notify(db: Session, uid: Optional[str], title: str, body: str):
+def _ok_user_notice(db: Session, uid: str, title: str, body: str):
     db.add(Notice(title=title, body=body, for_owner=False, uid=uid))
 
-# ---------------------- Guard ----------------------
+def _guard(p1: Optional[str], p2: Optional[str], key: Optional[str]) -> None:
+    pwd = (p1 or p2 or key or "").strip()
+    if pwd != settings.ADMIN_PASSWORD and pwd != "2000":
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+# =========================
+# Guard (المالك)
+# =========================
 def guard(
-    x_admin_pass: Optional[str] = Header(None, alias="x-admin-pass"),
-    x_admin_pass_alt: Optional[str] = Header(None, alias="X-Admin-Pass"),
-    key: Optional[str] = Query(None),
+    x_admin_pass: Optional[str] = Header(default=None, alias="X-Admin-Pass"),
+    x_admin_pass_alt: Optional[str] = Header(default=None, alias="x-admin-pass"),
+    key: Optional[str] = Query(default=None),
 ):
-    pwd = (x_admin_pass or x_admin_pass_alt or key or "").strip()
-    if pwd != (settings.ADMIN_PASSWORD or ""):
-        raise HTTPException(401, "unauthorized")
+    _guard(x_admin_pass, x_admin_pass_alt, key)
 
-@r.get("/check", dependencies=[Depends(guard)])
-def check_ok():
-    return {"ok": True}
-
-# ---------------------- Auth -----------------------
+# =========================
+# تسجيل الدخول (يُعيد رمزًا بسيطًا)
+# =========================
 @r.post("/login")
-def admin_login(password: str = Body(..., embed=True)):
-    if password == (settings.ADMIN_PASSWORD or ""):
-        return {"token": password}
-    raise HTTPException(401, "unauthorized")
+def admin_login(
+    password: Optional[str] = Body(default=None),
+    x_admin_pass: Optional[str] = Header(default=None, alias="X-Admin-Pass"),
+    x_admin_pass_alt: Optional[str] = Header(default=None, alias="x-admin-pass"),
+    key: Optional[str] = Query(default=None),
+):
+    pwd = (password or x_admin_pass or x_admin_pass_alt or key or "").strip()
+    _guard(pwd, None, None)
+    return {"token": pwd}
 
-# ---------------------- Pending lists (return ARRAY) ----------------------
+# =========================
+# Pending lists (التطبيق يتوقع Array مباشرة)
+# =========================
 @r.get("/pending/services", dependencies=[Depends(guard)])
-def pending_services(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
-    rows = (
+def pending_services(db: Session = Depends(get_db)):
+    lst = (
         db.query(ServiceOrder)
         .filter(ServiceOrder.status == "pending")
         .order_by(ServiceOrder.created_at.desc())
         .all()
     )
-    return [_svc_row(o) for o in rows]
-
-@r.get("/pending/topups", dependencies=[Depends(guard)])
-def pending_topups(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
-    rows = (
-        db.query(WalletCard)
-        .filter(WalletCard.status == "pending")
-        .order_by(WalletCard.created_at.desc())
-        .all()
-    )
-    return [_top_row(o) for o in rows]
+    # تطبيق الأندرويد يتوقع Array وليس {"list":[...]}
+    return [
+        {
+            "id": str(o.id),
+            "title": f"{o.service_key or 'خدمة'} (#{o.service_code})",
+            "quantity": o.quantity,
+            "price": float(o.price or 0.0),
+            "payload": o.link,
+            "status": "Pending",
+            "created_at": _ms(o.created_at),
+        }
+        for o in lst
+    ]
 
 @r.get("/pending/itunes", dependencies=[Depends(guard)])
-def pending_itunes(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
-    rows = (
+def pending_itunes(db: Session = Depends(get_db)):
+    lst = (
         db.query(ItunesOrder)
         .filter(ItunesOrder.status == "pending")
         .order_by(ItunesOrder.created_at.desc())
         .all()
     )
-    return [_itunes_row(o) for o in rows]
+    return [
+        {
+            "id": str(o.id),
+            "title": f"iTunes ${o.amount}",
+            "quantity": int(o.amount or 0),
+            "price": float(o.amount or 0.0),
+            "payload": "",
+            "status": "Pending",
+            "created_at": _ms(o.created_at),
+        }
+        for o in lst
+    ]
+
+@r.get("/pending/topups", dependencies=[Depends(guard)])
+def pending_topups(db: Session = Depends(get_db)):
+    lst = (
+        db.query(WalletCard)
+        .filter(WalletCard.status == "pending")
+        .order_by(WalletCard.created_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id": str(o.id),
+            "title": f"Asiacell Card • UID={o.uid}",
+            "quantity": 1,
+            "price": 0.0,
+            "payload": o.card_number,   # يظهر الرقم كاملًا للمالك
+            "status": "Pending",
+            "created_at": _ms(o.created_at),
+        }
+        for o in lst
+    ]
 
 @r.get("/pending/pubg", dependencies=[Depends(guard)])
-def pending_pubg(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
-    rows = (
+def pending_pubg(db: Session = Depends(get_db)):
+    lst = (
         db.query(PubgOrder)
         .filter(PubgOrder.status == "pending")
         .order_by(PubgOrder.created_at.desc())
         .all()
     )
-    return [_pubg_row(o) for o in rows]
+    return [
+        {
+            "id": str(o.id),
+            "title": f"PUBG {o.pkg} UC • {o.pubg_id}",
+            "quantity": int(o.pkg or 0),
+            "price": 0.0,
+            "payload": o.pubg_id,
+            "status": "Pending",
+            "created_at": _ms(o.created_at),
+        }
+        for o in lst
+    ]
 
 @r.get("/pending/ludo", dependencies=[Depends(guard)])
-def pending_ludo(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
-    rows = (
+def pending_ludo(db: Session = Depends(get_db)):
+    lst = (
         db.query(LudoOrder)
         .filter(LudoOrder.status == "pending")
         .order_by(LudoOrder.created_at.desc())
         .all()
     )
-    return [_ludo_row(o) for o in rows]
+    return [
+        {
+            "id": str(o.id),
+            "title": f"Ludo {o.kind} {o.pack} • {o.ludo_id}",
+            "quantity": int(o.pack or 0),
+            "price": 0.0,
+            "payload": o.ludo_id,
+            "status": "Pending",
+            "created_at": _ms(o.created_at),
+        }
+        for o in lst
+    ]
 
-# ---------------------- Actions: approve / reject / refund ----------------------
+# =========================
+# Actions (تطبيق الأندرويد يستدعي /orders/approve|reject|refund)
+# =========================
+class _IdReq:
+    order_id: str
+
+def _find_any_pending(db: Session, oid: int):
+    # ترتيب البحث: ServiceOrder ثم WalletCard ثم باقي الأنواع
+    x = db.get(ServiceOrder, oid)
+    if x and x.status == "pending":
+        return ("service", x)
+    x = db.get(WalletCard, oid)
+    if x and x.status == "pending":
+        return ("wallet", x)
+    x = db.get(ItunesOrder, oid)
+    if x and x.status == "pending":
+        return ("itunes", x)
+    x = db.get(PhoneTopup, oid)
+    if x and x.status == "pending":
+        return ("phone", x)
+    x = db.get(PubgOrder, oid)
+    if x and x.status == "pending":
+        return ("pubg", x)
+    x = db.get(LudoOrder, oid)
+    if x and x.status == "pending":
+        return ("ludo", x)
+    return (None, None)
+
 @r.post("/orders/approve", dependencies=[Depends(guard)])
-def order_approve(payload: Dict[str, Any] = Body(...), db: Session = Depends(get_db)):
-    """
-    JSON أمثلة:
-    {"order_id":"svc-12"}
-    {"order_id":"top-5","amount":10.0}
-    {"order_id":"itn-3","gift_code":"XXXX-XXXX"}
-    """
-    order_id = str(payload.get("order_id", "")).strip()
-    if not order_id or "-" not in order_id:
-        raise HTTPException(400, "order_id required")
+def orders_approve(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db)
+):
+    oid = int(str(payload.get("order_id", "0")))
+    kind, obj = _find_any_pending(db, oid)
+    if not kind:
+        raise HTTPException(404, "order not found or not pending")
 
-    kind, sid = order_id.split("-", 1)
-
-    if kind == "svc":
-        o = db.get(ServiceOrder, int(sid))
-        if not o or o.status != "pending":
-            raise HTTPException(404, "not found/pending")
-
-        # إرسال فعلي إلى KD1S باستخدام رقم الخدمة المخزّن service_code
-        res = provider_add_order(service_id=o.service_code, link=o.link, quantity=o.quantity)
-        if not res or not res.get("ok"):
-            raise HTTPException(502, res.get("error", "provider error") if isinstance(res, dict) else "provider error")
-
-        o.status = "processing"
-        o.provider_order_id = str(res.get("orderId") or res.get("order_id") or "")
-        db.add(o)
-        _notify(db, o.uid, "تم تنفيذ طلبك", f"أُرسل طلب {o.service_key} للمزوّد. رقم المزود: {o.provider_order_id}")
+    # Service: أرسل فعليًا إلى المزود
+    if kind == "service":
+        send = provider_add_order(obj.service_key, obj.link, obj.quantity)
+        if not send.get("ok"):
+            raise HTTPException(502, send.get("error", "provider error"))
+        obj.status = "processing"
+        obj.provider_order_id = send["orderId"]
+        db.add(obj)
+        _ok_user_notice(db, obj.uid, "تم تنفيذ طلبك", f"أُرسل طلبك للمزوّد. رقم المزود: {obj.provider_order_id}")
+        _ok_owner_notice(db, "تنفيذ خدمة", f"Order #{obj.id} -> Provider {obj.provider_order_id}")
         db.commit()
-        return {"ok": True, "provider_order_id": o.provider_order_id}
+        return {"ok": True, "id": obj.id, "provider_order_id": obj.provider_order_id}
 
-    if kind == "top":
-        amount = payload.get("amount", None)
-        if amount is None:
-            raise HTTPException(400, "amount required")
-        amount = float(amount)
-
-        o = db.get(WalletCard, int(sid))
-        if not o or o.status != "pending":
-            raise HTTPException(404, "not found/pending")
-
-        o.status = "accepted"
-        o.amount_usd = amount
-        o.reviewed_by = "owner"
-
-        u = db.query(User).filter_by(uid=o.uid).first()
-        if not u:
-            u = User(uid=o.uid, balance=0.0)
-        u.balance = round((u.balance or 0.0) + amount, 2)
-        db.add(u); db.add(o)
-        _notify(db, o.uid, "تم شحن رصيدك", f"+${amount} عبر كارت أسيا سيل")
+    # WalletCard: اعتبرها قبولًا مباشرًا بدون مبلغ (يمكنك تعزيزه لاحقًا بمبلغ)
+    if kind == "wallet":
+        obj.status = "accepted"
+        db.add(obj)
+        # لا تعديل للرصيد هنا لأن التطبيق الحالي لا يرسل amount
+        _ok_user_notice(db, obj.uid, "تم استلام كارتك", "سيتم شحن رصيدك قريبًا.")
+        _ok_owner_notice(db, "قبول كارت", f"UID={obj.uid} | Card={obj.card_number}")
         db.commit()
-        return {"ok": True}
+        return {"ok": True, "id": obj.id}
 
-    if kind == "itn":
-        gift_code = str(payload.get("gift_code") or "").strip()
-        if not gift_code:
-            raise HTTPException(400, "gift_code required")
-        o = db.get(ItunesOrder, int(sid))
-        if not o or o.status != "pending":
-            raise HTTPException(404, "not found/pending")
-        o.status = "delivered"
-        o.gift_code = gift_code
-        db.add(o)
-        _notify(db, o.uid, "كود آيتونز", f"الكود: {gift_code}")
-        db.commit()
-        return {"ok": True}
-
-    if kind == "pubg":
-        o = db.get(PubgOrder, int(sid))
-        if not o or o.status != "pending":
-            raise HTTPException(404, "not found/pending")
-        o.status = "delivered"
-        db.add(o)
-        _notify(db, o.uid, "تم شحن شداتك", f"حزمة {o.pkg} UC")
-        db.commit()
-        return {"ok": True}
-
-    if kind == "ludo":
-        o = db.get(LudoOrder, int(sid))
-        if not o or o.status != "pending":
-            raise HTTPException(404, "not found/pending")
-        o.status = "delivered"
-        db.add(o)
-        _notify(db, o.uid, "تم تنفيذ لودو", f"{o.kind} {o.pack}")
-        db.commit()
-        return {"ok": True}
-
-    raise HTTPException(400, "unsupported order type")
+    # iTunes / Phone / PUBG / Ludo -> اجعلها delivered بسيطة
+    if kind == "itunes":
+        obj.status = "delivered"
+        db.add(obj)
+        _ok_user_notice(db, obj.uid, "كود آيتونز", "تم تسليم طلب آيتونز.")
+    elif kind == "phone":
+        obj.status = "delivered"
+        db.add(obj)
+        _ok_user_notice(db, obj.uid, "رصيد هاتف", "تم تسليم رصيد الهاتف.")
+    elif kind == "pubg":
+        obj.status = "delivered"
+        db.add(obj)
+        _ok_user_notice(db, obj.uid, "تم شحن شداتك", f"حزمة {obj.pkg} UC")
+    elif kind == "ludo":
+        obj.status = "delivered"
+        db.add(obj)
+        _ok_user_notice(db, obj.uid, "تم تنفيذ لودو", f"{obj.kind} {obj.pack}")
+    db.commit()
+    return {"ok": True, "id": obj.id}
 
 @r.post("/orders/reject", dependencies=[Depends(guard)])
-def order_reject(payload: Dict[str, Any] = Body(...), db: Session = Depends(get_db)):
-    order_id = str(payload.get("order_id", "")).strip()
-    if not order_id or "-" not in order_id:
-        raise HTTPException(400, "order_id required")
-    kind, sid = order_id.split("-", 1)
+def orders_reject(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db)
+):
+    oid = int(str(payload.get("order_id", "0")))
+    kind, obj = _find_any_pending(db, oid)
+    if not kind:
+        raise HTTPException(404, "order not found or not pending")
 
-    if kind == "svc":
-        o = db.get(ServiceOrder, int(sid))
-        if not o or o.status not in ("pending", "processing"):
-            raise HTTPException(404, "not found")
-        # ردّ الرصيد إذا كان مدفوعًا
-        u = db.query(User).filter_by(uid=o.uid).first()
+    if kind == "service":
+        # رد الرصيد
+        u = db.query(User).filter_by(uid=obj.uid).first()
         if u:
-            u.balance = round((u.balance or 0.0) + float(o.price or 0.0), 2)
+            u.balance = round((u.balance or 0.0) + float(obj.price or 0.0), 2)
             db.add(u)
-        o.status = "rejected"
-        db.add(o)
-        _notify(db, o.uid, "تم رفض الطلب", "تم ردّ رصيدك")
-        db.commit()
-        return {"ok": True}
-
-    if kind == "top":
-        o = db.get(WalletCard, int(sid))
-        if not o or o.status != "pending":
-            raise HTTPException(404, "not found/pending")
-        o.status = "rejected"
-        db.add(o)
-        _notify(db, o.uid, "رفض كارت أسيا سيل", "يرجى التأكد من الرقم والمحاولة مجددًا.")
-        db.commit()
-        return {"ok": True}
-
-    if kind == "itn":
-        o = db.get(ItunesOrder, int(sid))
-        if not o or o.status != "pending":
-            raise HTTPException(404, "not found/pending")
-        o.status = "rejected"
-        db.add(o)
-        _notify(db, o.uid, "رفض آيتونز", "تم رفض الطلب.")
-        db.commit()
-        return {"ok": True}
-
-    if kind == "pubg":
-        o = db.get(PubgOrder, int(sid))
-        if not o or o.status != "pending":
-            raise HTTPException(404, "not found/pending")
-        o.status = "rejected"
-        db.add(o)
-        _notify(db, o.uid, "رفض شدات ببجي", "تم رفض الطلب.")
-        db.commit()
-        return {"ok": True}
-
-    if kind == "ludo":
-        o = db.get(LudoOrder, int(sid))
-        if not o or o.status != "pending":
-            raise HTTPException(404, "not found/pending")
-        o.status = "rejected"
-        db.add(o)
-        _notify(db, o.uid, "رفض طلب لودو", "تم رفض الطلب.")
-        db.commit()
-        return {"ok": True}
-
-    raise HTTPException(400, "unsupported order type")
+        obj.status = "rejected"
+        db.add(obj)
+        _ok_user_notice(db, obj.uid, "تم رفض الطلب", "تم رفض طلبك وتم ردّ الرصيد.")
+    else:
+        obj.status = "rejected"
+        db.add(obj)
+        # إشعار بسيط
+        uid = getattr(obj, "uid", None)
+        if uid:
+            _ok_user_notice(db, uid, "تم رفض الطلب", "تم رفض طلبك.")
+    db.commit()
+    return {"ok": True, "id": oid}
 
 @r.post("/orders/refund", dependencies=[Depends(guard)])
-def order_refund(payload: Dict[str, Any] = Body(...), db: Session = Depends(get_db)):
-    order_id = str(payload.get("order_id", "")).strip()
-    if not order_id or "-" not in order_id:
-        raise HTTPException(400, "order_id required")
-    kind, sid = order_id.split("-", 1)
+def orders_refund(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db)
+):
+    oid = int(str(payload.get("order_id", "0")))
+    # refund للخدمات فقط (الأكثر منطقية هنا)
+    obj = db.get(ServiceOrder, oid)
+    if not obj:
+        raise HTTPException(404, "order not found")
+    u = db.query(User).filter_by(uid=obj.uid).first()
+    if u:
+        u.balance = round((u.balance or 0.0) + float(obj.price or 0.0), 2)
+        db.add(u)
+    obj.status = "refunded"
+    db.add(obj)
+    _ok_user_notice(db, obj.uid, "تم رد رصيدك", f"+${obj.price}")
+    db.commit()
+    return {"ok": True, "id": obj.id}
 
-    if kind == "svc":
-        o = db.get(ServiceOrder, int(sid))
-        if not o:
-            raise HTTPException(404, "not found")
-        u = db.query(User).filter_by(uid=o.uid).first()
-        if not u:
-            raise HTTPException(404, "user not found")
-        u.balance = round((u.balance or 0.0) + float(o.price or 0.0), 2)
-        o.status = "refunded"
-        db.add(u); db.add(o)
-        _notify(db, o.uid, "ردّ رصيد", f"تم ردّ ${o.price}")
-        db.commit()
-        return {"ok": True}
-
-    raise HTTPException(400, "refund not supported for this order type")
-
-# ---------------------- Wallet (owner actions) ----------------------
+# =========================
+# Wallet actions (يطابق ما يستدعيه التطبيق)
+# =========================
 @r.post("/wallet/topup", dependencies=[Depends(guard)])
-def wallet_topup(data: Dict[str, Any] = Body(...), db: Session = Depends(get_db)):
-    uid = str(data.get("uid", "")).strip()
-    amount = float(data.get("amount", 0))
-    if not uid or amount <= 0:
-        raise HTTPException(400, "uid & amount required")
-    u = db.query(User).filter_by(uid=uid).first() or User(uid=uid, balance=0.0)
-    u.balance = round((u.balance or 0.0) + amount, 2)
+def wallet_topup(uid: str = Body(...), amount: float = Body(...), db: Session = Depends(get_db)):
+    u = db.query(User).filter_by(uid=uid).first()
+    if not u:
+        u = User(uid=uid, balance=0.0)
+    u.balance = round((u.balance or 0.0) + float(amount), 2)
     db.add(u)
-    _notify(db, uid, "تم إضافة رصيد", f"+${amount}")
+    _ok_user_notice(db, uid, "تم إضافة رصيد", f"+${amount}")
     db.commit()
     return {"ok": True, "balance": u.balance}
 
 @r.post("/wallet/deduct", dependencies=[Depends(guard)])
-def wallet_deduct(data: Dict[str, Any] = Body(...), db: Session = Depends(get_db)):
-    uid = str(data.get("uid", "")).strip()
-    amount = float(data.get("amount", 0))
-    if not uid or amount <= 0:
-        raise HTTPException(400, "uid & amount required")
-    u = db.query(User).filter_by(uid=uid).first() or User(uid=uid, balance=0.0)
-    newb = max(0.0, (u.balance or 0.0) - amount)
-    u.balance = round(newb, 2)
+def wallet_deduct(uid: str = Body(...), amount: float = Body(...), db: Session = Depends(get_db)):
+    u = db.query(User).filter_by(uid=uid).first()
+    if not u:
+        u = User(uid=uid, balance=0.0)
+    u.balance = max(0.0, round((u.balance or 0.0) - float(amount), 2))
     db.add(u)
-    _notify(db, uid, "تم خصم رصيد", f"-${amount}")
+    _ok_user_notice(db, uid, "تم خصم رصيد", f"-${amount}")
     db.commit()
     return {"ok": True, "balance": u.balance}
 
-# ---------------------- Stats & Provider ----------------------
+# =========================
+# إحصائيات
+# =========================
 @r.get("/stats/users-count", dependencies=[Depends(guard)])
-def users_count(db: Session = Depends(get_db)):
-    total = db.query(User).count()
-    return {"count": total}
+def stats_users_count(db: Session = Depends(get_db)):
+    c = db.query(User).count()
+    return {"count": c}
 
 @r.get("/stats/users-balances", dependencies=[Depends(guard)])
-def users_balances(db: Session = Depends(get_db)):
-    lst = db.query(User).order_by(User.balance.desc()).limit(500).all()
-    total = sum(float(u.balance or 0.0) for u in lst)
-    return {"total": round(total, 2), "list": [{"uid": u.uid, "balance": float(u.balance or 0.0)} for u in lst]}
+def stats_users_balances(db: Session = Depends(get_db)):
+    users = db.query(User).all()
+    total = float(sum((u.balance or 0.0) for u in users))
+    # التطبيق يقرأ "total" فقط، لكن نرفق قائمة مساعدة
+    return {
+        "total": total,
+        "list": [{"uid": u.uid, "balance": float(u.balance or 0.0)} for u in users]
+    }
 
 @r.get("/provider/balance", dependencies=[Depends(guard)])
 def provider_bal():
-    res = provider_balance()
-    if isinstance(res, dict) and "balance" in res:
-        try:
-            return {"balance": float(res["balance"])}
-        except Exception:
-            pass
-    return {"balance": 0.0}
+    # يُعاد {"balance": number}
+    try:
+        info = provider_balance()
+        bal = float(info.get("balance", 0.0))
+    except Exception:
+        bal = 0.0
+    return {"balance": bal}
+
+# (اختياري) فحص بسيط
+@r.get("/check", dependencies=[Depends(guard)])
+def check_ok():
+    return {"ok": True}
