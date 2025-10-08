@@ -1,73 +1,78 @@
-# app/providers/smm_client.py
+from . .config import settings
 import httpx
-from typing import Dict, Any
-from ..config import settings
 
-TIMEOUT = 15.0
+def _fail(msg: str):
+    return {"ok": False, "error": msg}
 
-def _base_params() -> Dict[str, Any]:
-    return {
-        "key": settings.PROVIDER_API_KEY or "",
-    }
-
-def provider_add_order(service_id: int, link: str, quantity: int) -> Dict[str, Any]:
+def provider_add_order(service_key: str, link: str, quantity: int):
     """
-    يرسل الطلب إلى مزود SMM قياسي:
-    params: key, action=add, service, link, quantity
+    استدعاء مزوّد الخدمات (SMM) لإضافة طلب.
+    يتوقع أن يكون لدى المزوّد endpoints مثل:
+      POST {PROVIDER_URL}/add  json: {key, service, link, quantity}
+    عدّل حسب مزوّدك الحقيقي.
     """
-    if not settings.PROVIDER_API_URL or not settings.PROVIDER_API_KEY:
-        return {"ok": False, "error": "provider not configured (set PROVIDER_API_URL & PROVIDER_API_KEY)"}
-    url = settings.PROVIDER_API_URL
-    params = _base_params()
-    params.update({
-        "action": "add",
-        "service": int(service_id),
-        "link": link,
-        "quantity": int(quantity),
-    })
-    try:
-        r = httpx.post(url, data=params, timeout=TIMEOUT)
-        r.raise_for_status()
-        data = r.json() if "application/json" in r.headers.get("Content-Type", "") else {}
-        # بعض الـ panels ترجع {"order": 12345}
-        oid = data.get("order") or data.get("orderId") or data.get("id")
-        if oid:
-            return {"ok": True, "orderId": str(oid)}
-        # لو لم يكن JSON واضحًا، جرّب قراءة النص
-        txt = r.text.strip()
-        if txt.isdigit():
-            return {"ok": True, "orderId": txt}
-        return {"ok": False, "error": data.get("error") or "unknown provider response"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    if not settings.PROVIDER_URL or not settings.PROVIDER_KEY:
+        # للعمل بدون مزود — وضع تجريبي
+        return {"ok": True, "orderId": f"SIM-{service_key}-{quantity}"}
 
-def provider_balance() -> Dict[str, Any]:
-    if not settings.PROVIDER_API_URL or not settings.PROVIDER_API_KEY:
-        return {"ok": False, "error": "provider not configured"}
-    url = settings.PROVIDER_API_URL
-    params = _base_params()
-    params.update({"action": "balance"})
     try:
-        r = httpx.post(url, data=params, timeout=TIMEOUT)
-        r.raise_for_status()
-        data = r.json() if "application/json" in r.headers.get("Content-Type", "") else {}
-        bal = data.get("balance") or (data.get("data") or {}).get("balance")
-        if bal is not None:
-            return {"ok": True, "balance": float(bal)}
-        return {"ok": False, "error": data.get("error") or "unknown provider response"}
+        with httpx.Client(timeout=20.0) as c:
+            resp = c.post(
+                f"{settings.PROVIDER_URL.rstrip('/')}/add",
+                json={
+                    "key": settings.PROVIDER_KEY,
+                    "service": service_key,  # بعض المزودين يتوقعون رقم خدمة، إن لزم عدّل
+                    "link": link,
+                    "quantity": quantity,
+                }
+            )
+            if resp.status_code // 100 != 2:
+                return _fail(f"provider http {resp.status_code}")
+            data = resp.json()
+            # عدّل حسب شكل استجابة مزودك:
+            if "order" in data:
+                return {"ok": True, "orderId": str(data["order"])}
+            if "orderId" in data:
+                return {"ok": True, "orderId": str(data["orderId"])}
+            return _fail("unknown provider response")
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return _fail(str(e))
 
-def provider_status(order_id: str) -> Dict[str, Any]:
-    if not settings.PROVIDER_API_URL or not settings.PROVIDER_API_KEY:
-        return {"ok": False, "error": "provider not configured"}
-    url = settings.PROVIDER_API_URL
-    params = _base_params()
-    params.update({"action": "status", "order": str(order_id)})
+def provider_balance():
+    if not settings.PROVIDER_URL or not settings.PROVIDER_KEY:
+        return {"ok": True, "balance": 0.0}
     try:
-        r = httpx.post(url, data=params, timeout=TIMEOUT)
-        r.raise_for_status()
-        data = r.json() if "application/json" in r.headers.get("Content-Type", "") else {}
-        return {"ok": True, "data": data}
+        with httpx.Client(timeout=15.0) as c:
+            resp = c.get(
+                f"{settings.PROVIDER_URL.rstrip('/')}/balance",
+                params={"key": settings.PROVIDER_KEY}
+            )
+            if resp.status_code // 100 != 2:
+                return _fail(f"provider http {resp.status_code}")
+            data = resp.json()
+            bal = data.get("balance") or data.get("Balance") or 0.0
+            try:
+                bal = float(bal)
+            except Exception:
+                bal = 0.0
+            return {"ok": True, "balance": bal}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return _fail(str(e))
+
+def provider_status(order_id: str):
+    if not settings.PROVIDER_URL or not settings.PROVIDER_KEY:
+        # وضع تجريبي
+        return {"ok": True, "status": "processing"}
+    try:
+        with httpx.Client(timeout=15.0) as c:
+            resp = c.get(
+                f"{settings.PROVIDER_URL.rstrip('/')}/status",
+                params={"key": settings.PROVIDER_KEY, "order": order_id}
+            )
+            if resp.status_code // 100 != 2:
+                return _fail(f"provider http {resp.status_code}")
+            data = resp.json()
+            # عدّل حسب استجابة مزودك
+            return {"ok": True, "raw": data}
+    except Exception as e:
+        return _fail(str(e))
