@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, Header, Query, HTTPException, Request
-from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict, Any
+from psycopg2.extras import Json
 import base64
 
 from ..config import ADMIN_PASS
@@ -8,7 +8,7 @@ from ..db import get_conn, put_conn
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
-# -------- Auth helpers --------
+# --------- Auth ---------
 def _extract_bearer(auth: Optional[str]) -> Optional[str]:
     if not auth: return None
     auth = auth.strip()
@@ -16,22 +16,25 @@ def _extract_bearer(auth: Optional[str]) -> Optional[str]:
         return auth.split(" ", 1)[1].strip()
     if auth.lower().startswith("basic "):
         try:
-            raw = base64.b64decode(auth.split(" ",1)[1]).decode()
-            # "user:pass" — أحياناً يرسل التطبيق كلمة المرور فقط
-            if ":" in raw: return raw.split(":",1)[1]
-            return raw
+            raw = base64.b64decode(auth.split(" ", 1)[1]).decode()
+            return raw.split(":", 1)[1] if ":" in raw else raw
         except Exception:
             return None
-    # أحياناً يرسلها مباشرةً بدون Bearer
-    return auth
+    return auth  # أحياناً يُرسل التوكن مباشرة
 
 def _token(
-    x_admin_upper: Optional[str] = Header(default=None, alias="X-Admin-Pass", convert_underscores=False),
-    x_admin_lower: Optional[str] = Header(default=None, alias="x-admin-pass", convert_underscores=False),
-    key: Optional[str] = Query(default=None),
-    authorization: Optional[str] = Header(default=None, alias="Authorization", convert_underscores=False),
+    x_admin_pass: Optional[str] = Header(None, alias="x-admin-pass", convert_underscores=False),
+    x_admin_key: Optional[str]  = Header(None, alias="x-admin-key",  convert_underscores=False),
+    x_owner_key: Optional[str]  = Header(None, alias="x-owner-key",  convert_underscores=False),
+    x_key: Optional[str]        = Header(None, alias="x-key",        convert_underscores=False),
+    admin_password: Optional[str] = Query(None, alias="admin_password"),
+    key: Optional[str] = Query(None),
+    token_q: Optional[str] = Query(None, alias="token"),
+    password: Optional[str] = Query(None, alias="password"),
+    _auth: Optional[str] = Header(None, alias="Authorization", convert_underscores=False),
 ):
-    return (x_admin_upper or x_admin_lower or key or _extract_bearer(authorization) or "").strip()
+    return (x_admin_pass or x_admin_key or x_owner_key or x_key or
+            admin_password or key or token_q or password or _extract_bearer(_auth) or "").strip()
 
 def _require_admin(token: str):
     if token != ADMIN_PASS:
@@ -41,21 +44,20 @@ def _require_admin(token: str):
 def check(token: str = Depends(_token)):
     _require_admin(token); return {"ok": True}
 
-# -------- Helpers لقراءة الجسم من json/form/query --------
-async def _read_payload(request: Request) -> dict:
-    # جرّب JSON
+# --------- Helpers ---------
+async def _read_payload(request: Request) -> Dict[str, Any]:
     try:
-        return await request.json()
+        data = await request.json()
+        if isinstance(data, dict): return data
     except Exception:
         pass
-    # جرّب form
     try:
         form = await request.form()
         return {k: form.get(k) for k in form.keys()}
     except Exception:
         return {}
 
-# -------- Pending Services --------
+# --------- Pending services (الخدمات) ---------
 @router.get("/pending/services")
 def pending_services(token: str = Depends(_token)):
     _require_admin(token)
@@ -77,7 +79,7 @@ def pending_services(token: str = Depends(_token)):
     finally:
         put_conn(conn)
 
-# -------- Pending Topups --------
+# --------- Pending topups (كروت/إيداعات) ---------
 @router.get("/pending/topups")
 def pending_topups(token: str = Depends(_token)):
     _require_admin(token)
@@ -97,22 +99,12 @@ def pending_topups(token: str = Depends(_token)):
     finally:
         put_conn(conn)
 
-@router.get("/pending/cards")  # alias مطلوب ببعض النسخ من الواجهة
-def pending_cards_alias(token: str = Depends(_token)):
-    return pending_topups(token)
-
-class TopupAccept(BaseModel):
-    card_id: int
-    amount_usd: float
-
 @router.post("/pending/topups/accept")
-async def topup_accept(request: Request, token: str = Depends(_token),
-                       card_id: Optional[int] = Query(None), amount_usd: Optional[float] = Query(None)):
+async def topup_accept(request: Request, token: str = Depends(_token)):
     _require_admin(token)
-    if card_id is None or amount_usd is None:
-        p = await _read_payload(request)
-        card_id = card_id or int(p.get("card_id"))
-        amount_usd = amount_usd or float(p.get("amount_usd"))
+    p = await _read_payload(request)
+    card_id = int(p.get("card_id") or p.get("id"))
+    amount_usd = float(p.get("amount_usd") or p.get("amount") or 0)
 
     conn = get_conn()
     try:
@@ -125,19 +117,17 @@ async def topup_accept(request: Request, token: str = Depends(_token),
             cur.execute("""
                 INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
                 VALUES(%s,%s,%s,%s)
-            """, (user_id, amount_usd, "admin_topup_card", {"card_id": card_id}))
+            """, (user_id, amount_usd, "admin_topup_card", Json({"card_id": card_id})))
             cur.execute("UPDATE public.asiacell_cards SET status='Accepted' WHERE id=%s", (card_id,))
         return {"ok": True}
     finally:
         put_conn(conn)
 
 @router.post("/pending/topups/reject")
-async def topup_reject(request: Request, token: str = Depends(_token),
-                       card_id: Optional[int] = Query(None)):
+async def topup_reject(request: Request, token: str = Depends(_token)):
     _require_admin(token)
-    if card_id is None:
-        p = await _read_payload(request)
-        card_id = int(p.get("card_id"))
+    p = await _read_payload(request)
+    card_id = int(p.get("card_id") or p.get("id"))
 
     conn = get_conn()
     try:
@@ -148,20 +138,15 @@ async def topup_reject(request: Request, token: str = Depends(_token),
     finally:
         put_conn(conn)
 
-# -------- عمليات الرصيد (Add / Deduct) --------
-class WalletOp(BaseModel):
-    uid: str
-    amount: float
-
+# --------- Wallet ops (إضافة/خصم) ---------
 @router.post("/wallet/topup")
-@router.post("/wallet/add")       # alias
+@router.post("/wallet/add")     # aliases
 async def admin_topup(request: Request, token: str = Depends(_token),
                       uid: Optional[str] = Query(None), amount: Optional[float] = Query(None)):
     _require_admin(token)
     if uid is None or amount is None:
         p = await _read_payload(request)
-        uid = uid or p.get("uid")
-        amount = amount or float(p.get("amount"))
+        uid = uid or p.get("uid"); amount = amount or float(p.get("amount"))
 
     conn = get_conn()
     try:
@@ -173,20 +158,19 @@ async def admin_topup(request: Request, token: str = Depends(_token),
             cur.execute("""
                 INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
                 VALUES(%s,%s,%s,%s)
-            """, (r[0], amount, "admin_topup", {}))
+            """, (r[0], amount, "admin_topup", Json({})))
         return {"ok": True}
     finally:
         put_conn(conn)
 
 @router.post("/wallet/deduct")
-@router.post("/wallet/remove")    # alias
+@router.post("/wallet/remove")  # aliases
 async def admin_deduct(request: Request, token: str = Depends(_token),
                        uid: Optional[str] = Query(None), amount: Optional[float] = Query(None)):
     _require_admin(token)
     if uid is None or amount is None:
         p = await _read_payload(request)
-        uid = uid or p.get("uid")
-        amount = amount or float(p.get("amount"))
+        uid = uid or p.get("uid"); amount = amount or float(p.get("amount"))
 
     conn = get_conn()
     try:
@@ -199,12 +183,12 @@ async def admin_deduct(request: Request, token: str = Depends(_token),
             cur.execute("""
                 INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
                 VALUES(%s,%s,%s,%s)
-            """, (r[0], -amount, "admin_deduct", {}))
+            """, (r[0], -amount, "admin_deduct", Json({})))
         return {"ok": True}
     finally:
         put_conn(conn)
 
-# -------- إحصاءات --------
+# --------- Stats ---------
 @router.get("/users/count")
 def users_count(token: str = Depends(_token)):
     _require_admin(token)
