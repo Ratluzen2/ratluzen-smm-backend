@@ -1,7 +1,7 @@
 # app/routers/admin.py
 from fastapi import APIRouter, Depends, Header, HTTPException, Body, Query
 from sqlalchemy.orm import Session
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 from datetime import datetime, timezone
 
 from ..config import settings
@@ -13,12 +13,9 @@ from ..models import (
 from ..providers.smm_client import provider_add_order, provider_balance, provider_status
 
 router = APIRouter(prefix="/admin", tags=["admin"])
-# للتوافق مع من يستورد r
-r = router
+r = router  # للتوافق مع import قديم
 
-# ======================
-# Helpers
-# ======================
+# ---------- Helpers ----------
 def _epoch_ms(dt: Optional[datetime]) -> int:
     if not dt:
         return 0
@@ -26,10 +23,10 @@ def _epoch_ms(dt: Optional[datetime]) -> int:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
 
-def _guard_pwd(
+def _pwd_ok(
     x_admin_pass: Optional[str] = Header(default=None, alias="X-Admin-Pass"),
     x_admin_pass_alt: Optional[str] = Header(default=None, alias="x-admin-pass"),
-    key: Optional[str] = Query(default=None)
+    key: Optional[str] = Query(default=None),
 ):
     pwd = (x_admin_pass or x_admin_pass_alt or key or "").strip()
     if pwd != settings.ADMIN_PASSWORD:
@@ -38,6 +35,8 @@ def _guard_pwd(
 def _service_row(o: ServiceOrder) -> Dict[str, Any]:
     return {
         "id": str(o.id),
+        "kind": "service",
+        "uid": o.uid,
         "title": f"{o.service_key} (code={o.service_code})",
         "quantity": o.quantity,
         "price": float(o.price or 0),
@@ -49,10 +48,12 @@ def _service_row(o: ServiceOrder) -> Dict[str, Any]:
 def _card_row(c: WalletCard) -> Dict[str, Any]:
     return {
         "id": str(c.id),
+        "kind": "card",
+        "uid": c.uid,
         "title": "كارت أسيا سيل",
         "quantity": 1,
         "price": float(c.amount_usd or 0.0),
-        "payload": c.card_number,  # يظهر رقم الكارت في التطبيق
+        "payload": c.card_number,  # يظهر رقم الكارت في التطبيق (قابل للنسخ)
         "status": c.status,
         "created_at": _epoch_ms(c.created_at),
     }
@@ -60,6 +61,8 @@ def _card_row(c: WalletCard) -> Dict[str, Any]:
 def _itunes_row(o: ItunesOrder) -> Dict[str, Any]:
     return {
         "id": str(o.id),
+        "kind": "itunes",
+        "uid": o.uid,
         "title": f"آيتونز {o.amount}$",
         "quantity": 1,
         "price": float(o.amount or 0),
@@ -71,6 +74,8 @@ def _itunes_row(o: ItunesOrder) -> Dict[str, Any]:
 def _phone_row(o: PhoneTopup) -> Dict[str, Any]:
     return {
         "id": str(o.id),
+        "kind": "phone",
+        "uid": o.uid,
         "title": f"كارت هاتف ({o.operator}) {o.amount}$",
         "quantity": 1,
         "price": float(o.amount or 0),
@@ -82,6 +87,8 @@ def _phone_row(o: PhoneTopup) -> Dict[str, Any]:
 def _pubg_row(o: PubgOrder) -> Dict[str, Any]:
     return {
         "id": str(o.id),
+        "kind": "pubg",
+        "uid": o.uid,
         "title": f"شدات ببجي {o.pkg} UC",
         "quantity": o.pkg,
         "price": 0.0,
@@ -93,6 +100,8 @@ def _pubg_row(o: PubgOrder) -> Dict[str, Any]:
 def _ludo_row(o: LudoOrder) -> Dict[str, Any]:
     return {
         "id": str(o.id),
+        "kind": "ludo",
+        "uid": o.uid,
         "title": f"لودو ({o.kind}) {o.pack}",
         "quantity": o.pack,
         "price": 0.0,
@@ -101,20 +110,15 @@ def _ludo_row(o: LudoOrder) -> Dict[str, Any]:
         "created_at": _epoch_ms(o.created_at),
     }
 
-# ======================
-# Login (اختياري - للتوافق)
-# ======================
+# ---------- Login (للتوافق مع التطبيق) ----------
 @router.post("/login")
 def admin_login(password: str = Body(..., embed=True)):
     if password != settings.ADMIN_PASSWORD:
         raise HTTPException(401, "invalid password")
-    # التطبيق يخزن التوكن كما هو ويرسله في x-admin-pass
-    return {"token": password}
+    return {"token": password}  # التطبيق يخزن هذا ويرسله في x-admin-pass
 
-# ======================
-# Pending lists (ترجع Array مباشرة)
-# ======================
-@router.get("/pending/services", dependencies=[Depends(_guard_pwd)])
+# ---------- Pending (ترجع Array مباشرة كما يتوقع التطبيق) ----------
+@router.get("/pending/services", dependencies=[Depends(_pwd_ok)])
 def pending_services(db: Session = Depends(get_db)):
     rows = (
         db.query(ServiceOrder)
@@ -124,7 +128,7 @@ def pending_services(db: Session = Depends(get_db)):
     )
     return [_service_row(o) for o in rows]
 
-@router.get("/pending/itunes", dependencies=[Depends(_guard_pwd)])
+@router.get("/pending/itunes", dependencies=[Depends(_pwd_ok)])
 def pending_itunes(db: Session = Depends(get_db)):
     rows = (
         db.query(ItunesOrder)
@@ -134,9 +138,8 @@ def pending_itunes(db: Session = Depends(get_db)):
     )
     return [_itunes_row(o) for o in rows]
 
-@router.get("/pending/topups", dependencies=[Depends(_guard_pwd)])
-def pending_topups_alias(db: Session = Depends(get_db)):
-    # Alias للكروت (Asiacell)
+@router.get("/pending/topups", dependencies=[Depends(_pwd_ok)])
+def pending_topups(db: Session = Depends(get_db)):
     rows = (
         db.query(WalletCard)
         .filter(WalletCard.status == "pending")
@@ -145,7 +148,7 @@ def pending_topups_alias(db: Session = Depends(get_db)):
     )
     return [_card_row(o) for o in rows]
 
-@router.get("/pending/phone", dependencies=[Depends(_guard_pwd)])
+@router.get("/pending/phone", dependencies=[Depends(_pwd_ok)])
 def pending_phone(db: Session = Depends(get_db)):
     rows = (
         db.query(PhoneTopup)
@@ -155,7 +158,7 @@ def pending_phone(db: Session = Depends(get_db)):
     )
     return [_phone_row(o) for o in rows]
 
-@router.get("/pending/pubg", dependencies=[Depends(_guard_pwd)])
+@router.get("/pending/pubg", dependencies=[Depends(_pwd_ok)])
 def pending_pubg(db: Session = Depends(get_db)):
     rows = (
         db.query(PubgOrder)
@@ -165,7 +168,7 @@ def pending_pubg(db: Session = Depends(get_db)):
     )
     return [_pubg_row(o) for o in rows]
 
-@router.get("/pending/ludo", dependencies=[Depends(_guard_pwd)])
+@router.get("/pending/ludo", dependencies=[Depends(_pwd_ok)])
 def pending_ludo(db: Session = Depends(get_db)):
     rows = (
         db.query(LudoOrder)
@@ -175,122 +178,167 @@ def pending_ludo(db: Session = Depends(get_db)):
     )
     return [_ludo_row(o) for o in rows]
 
-# ======================
-# Generic actions used by the app buttons
-# ======================
-class _OrderReq(BaseException):
-    pass
-
-@router.post("/orders/approve", dependencies=[Depends(_guard_pwd)])
-def orders_approve(order_id: int = Body(..., embed=True), db: Session = Depends(get_db)):
-    # 1) Service order => إرسال للمزوّد
+# ---------- Approve/Deliver لكل نوع (كما يحتاج التطبيق للمطالبة بمبلغ/كود) ----------
+@router.post("/pending/services/{order_id}/approve", dependencies=[Depends(_pwd_ok)])
+def approve_service(order_id: int, db: Session = Depends(get_db)):
     o = db.get(ServiceOrder, order_id)
-    if o and o.status == "pending":
-        send = provider_add_order(o.service_key, o.link, o.quantity)
-        if not send.get("ok"):
-            raise HTTPException(502, send.get("error", "provider error"))
-        o.status = "processing"
-        o.provider_order_id = send.get("orderId")
-        db.add(o)
-        db.add(Notice(title="تم تنفيذ طلبك", body=f"رقم المزوّد: {o.provider_order_id}", for_owner=False, uid=o.uid))
-        db.commit()
-        return {"ok": True, "kind": "service", "id": order_id}
+    if not o or o.status != "pending":
+        raise HTTPException(404, "order not found or not pending")
 
-    # 2) WalletCard / Itunes / Phone / Pubg / Ludo => تحويلها إلى processing
-    c = db.get(WalletCard, order_id)
-    if c and c.status == "pending":
-        c.status = "processing"
-        db.add(c)
-        db.add(Notice(title="جاري معالجة كارتك", body=f"الكارت: {c.card_number}", for_owner=False, uid=c.uid))
-        db.commit()
-        return {"ok": True, "kind": "card", "id": order_id}
+    # إرسال للمزوّد (kd1s) عبر client
+    res = provider_add_order(o.service_key, o.link, o.quantity)
+    if not res.get("ok"):
+        # لا نغيّر الحالة حتى لا يختفي من المعلّقة
+        raise HTTPException(502, res.get("error", "provider error"))
 
-    it = db.get(ItunesOrder, order_id)
-    if it and it.status == "pending":
-        it.status = "processing"
-        db.add(it)
-        db.add(Notice(title="جاري تجهيز كود آيتونز", body=f"قيمة {it.amount}$", for_owner=False, uid=it.uid))
-        db.commit()
-        return {"ok": True, "kind": "itunes", "id": order_id}
+    o.status = "processing"
+    o.provider_order_id = res.get("orderId")
+    db.add(o)
+    db.add(Notice(
+        title="تم تنفيذ طلبك",
+        body=f"تم إرسال الطلب للمزوّد. رقم المزود: {o.provider_order_id}",
+        for_owner=False, uid=o.uid
+    ))
+    db.commit()
+    return {"ok": True, "provider_order_id": o.provider_order_id}
 
-    ph = db.get(PhoneTopup, order_id)
-    if ph and ph.status == "pending":
-        ph.status = "processing"
-        db.add(ph)
-        db.add(Notice(title="جاري تجهيز كارت الهاتف", body=f"{ph.operator} {ph.amount}$", for_owner=False, uid=ph.uid))
-        db.commit()
-        return {"ok": True, "kind": "phone", "id": order_id}
+class AcceptCardReq(BaseModel):
+    amount_usd: float
+    reviewed_by: Optional[str] = "owner"
 
-    pb = db.get(PubgOrder, order_id)
-    if pb and pb.status == "pending":
-        pb.status = "processing"
-        db.add(pb)
-        db.add(Notice(title="جاري شحن شداتك", body=f"{pb.pkg} UC", for_owner=False, uid=pb.uid))
-        db.commit()
-        return {"ok": True, "kind": "pubg", "id": order_id}
+from pydantic import BaseModel
 
-    ld = db.get(LudoOrder, order_id)
-    if ld and ld.status == "pending":
-        ld.status = "processing"
-        db.add(ld)
-        db.add(Notice(title="جاري تنفيذ طلب لودو", body=f"{ld.kind} {ld.pack}", for_owner=False, uid=ld.uid))
-        db.commit()
-        return {"ok": True, "kind": "ludo", "id": order_id}
+@router.post("/pending/cards/{card_id}/accept", dependencies=[Depends(_pwd_ok)])
+def accept_card(card_id: int, payload: AcceptCardReq, db: Session = Depends(get_db)):
+    c = db.get(WalletCard, card_id)
+    if not c or c.status != "pending":
+        raise HTTPException(404, "card not found or not pending")
+    if payload.amount_usd <= 0:
+        raise HTTPException(400, "amount_usd must be > 0")
 
-    raise HTTPException(404, "order not found or not pending")
+    c.status = "accepted"
+    c.amount_usd = float(payload.amount_usd)
+    c.reviewed_by = payload.reviewed_by or "owner"
 
-@router.post("/orders/reject", dependencies=[Depends(_guard_pwd)])
-def orders_reject(order_id: int = Body(..., embed=True), db: Session = Depends(get_db)):
-    o = db.get(ServiceOrder, order_id)
-    if o and o.status in ("pending", "processing"):
-        o.status = "rejected"
-        # رد السعر للخدمات فقط
-        u = db.query(User).filter_by(uid=o.uid).first()
-        if u and o.price:
-            u.balance = round((u.balance or 0.0) + float(o.price), 2)
-            db.add(u)
-        db.add(o)
-        db.add(Notice(title="تم رفض الطلب", body="تم رفض طلبك وتم رد الرصيد إن وُجد.", for_owner=False, uid=o.uid))
-        db.commit()
-        return {"ok": True, "kind": "service", "id": order_id}
-
-    for model, title, uid_field in [
-        (WalletCard, "تم رفض الكارت", "uid"),
-        (ItunesOrder, "تم رفض آيتونز", "uid"),
-        (PhoneTopup, "تم رفض كارت الهاتف", "uid"),
-        (PubgOrder, "تم رفض شدات ببجي", "uid"),
-        (LudoOrder, "تم رفض طلب لودو", "uid"),
-    ]:
-        obj = db.get(model, order_id)
-        if obj and getattr(obj, "status", None) in ("pending", "processing"):
-            setattr(obj, "status", "rejected")
-            db.add(obj)
-            uid = getattr(obj, uid_field)
-            db.add(Notice(title=title, body="يرجى المراجعة.", for_owner=False, uid=uid))
-            db.commit()
-            return {"ok": True, "kind": model.__tablename__, "id": order_id}
-
-    raise HTTPException(404, "order not found")
-
-@router.post("/orders/refund", dependencies=[Depends(_guard_pwd)])
-def orders_refund(order_id: int = Body(..., embed=True), db: Session = Depends(get_db)):
-    o = db.get(ServiceOrder, order_id)
-    if not o:
-        raise HTTPException(404, "service order not found")
-    u = db.query(User).filter_by(uid=o.uid).first()
+    u = db.query(User).filter_by(uid=c.uid).first()
     if not u:
-        raise HTTPException(404, "user not found")
-    u.balance = round((u.balance or 0.0) + float(o.price or 0.0), 2)
-    o.status = "refunded"
-    db.add(u); db.add(o)
-    db.add(Notice(title="تم رد الرصيد", body=f"+${o.price}", for_owner=False, uid=o.uid))
+        u = User(uid=c.uid, balance=0.0)
+    u.balance = round((u.balance or 0.0) + float(payload.amount_usd), 2)
+
+    db.add(u); db.add(c)
+    db.add(Notice(
+        title="تم شحن رصيدك",
+        body=f"+${payload.amount_usd} عبر كارت أسيا سيل",
+        for_owner=False, uid=c.uid
+    ))
+    db.commit()
+    return {"ok": True, "balance": u.balance}
+
+@router.post("/pending/cards/{card_id}/reject", dependencies=[Depends(_pwd_ok)])
+def reject_card(card_id: int, db: Session = Depends(get_db)):
+    c = db.get(WalletCard, card_id)
+    if not c or c.status not in ("pending", "processing"):
+        raise HTTPException(404, "card not found or not pending/processing")
+    c.status = "rejected"
+    db.add(c)
+    db.add(Notice(title="تم رفض الكارت", body="يرجى التأكد من الرقم.", for_owner=False, uid=c.uid))
     db.commit()
     return {"ok": True}
 
-# ======================
-# Wallet operations
-# ======================
-@router.post("/wallet/topup", dependencies=[Depends(_guard_pwd)])
+class GiftCodeReq(BaseModel):
+    gift_code: str
+
+@router.post("/pending/itunes/{oid}/deliver", dependencies=[Depends(_pwd_ok)])
+def deliver_itunes(oid: int, payload: GiftCodeReq, db: Session = Depends(get_db)):
+    o = db.get(ItunesOrder, oid)
+    if not o or o.status != "pending":
+        raise HTTPException(404, "not found or not pending")
+    if not payload.gift_code:
+        raise HTTPException(400, "gift_code required")
+    o.status = "delivered"
+    o.gift_code = payload.gift_code
+    db.add(o)
+    db.add(Notice(title="كود آيتونز", body=f"الكود: {payload.gift_code}", for_owner=False, uid=o.uid))
+    db.commit()
+    return {"ok": True}
+
+class CodeReq(BaseModel):
+    code: str
+
+@router.post("/pending/phone/{oid}/deliver", dependencies=[Depends(_pwd_ok)])
+def deliver_phone(oid: int, payload: CodeReq, db: Session = Depends(get_db)):
+    o = db.get(PhoneTopup, oid)
+    if not o or o.status != "pending":
+        raise HTTPException(404, "not found or not pending")
+    if not payload.code:
+        raise HTTPException(400, "code required")
+    o.status = "delivered"
+    o.code = payload.code
+    db.add(o)
+    db.add(Notice(title="كارت الهاتف", body=f"الكود: {payload.code}", for_owner=False, uid=o.uid))
+    db.commit()
+    return {"ok": True}
+
+@router.post("/pending/pubg/{oid}/deliver", dependencies=[Depends(_pwd_ok)])
+def deliver_pubg(oid: int, db: Session = Depends(get_db)):
+    o = db.get(PubgOrder, oid)
+    if not o or o.status != "pending":
+        raise HTTPException(404, "not found or not pending")
+    o.status = "delivered"
+    db.add(o)
+    db.add(Notice(title="تم شحن شداتك", body=f"حزمة {o.pkg} UC", for_owner=False, uid=o.uid))
+    db.commit()
+    return {"ok": True}
+
+@router.post("/pending/ludo/{oid}/deliver", dependencies=[Depends(_pwd_ok)])
+def deliver_ludo(oid: int, db: Session = Depends(get_db)):
+    o = db.get(LudoOrder, oid)
+    if not o or o.status != "pending":
+        raise HTTPException(404, "not found or not pending")
+    o.status = "delivered"
+    db.add(o)
+    db.add(Notice(title="تم تنفيذ لودو", body=f"{o.kind} {o.pack}", for_owner=False, uid=o.uid))
+    db.commit()
+    return {"ok": True}
+
+# ---------- رفض عام بديل ----------
+@router.post("/orders/reject", dependencies=[Depends(_pwd_ok)])
+def orders_reject(order_id: int = Body(..., embed=True), db: Session = Depends(get_db)):
+    # نحاول على كل الجداول بسرعة:
+    so = db.get(ServiceOrder, order_id)
+    if so and so.status in ("pending", "processing"):
+        so.status = "rejected"
+        # ردّ السعر إن وُجد
+        if so.price:
+            u = db.query(User).filter_by(uid=so.uid).first()
+            if not u:
+                u = User(uid=so.uid, balance=0.0)
+            u.balance = round((u.balance or 0.0) + float(so.price), 2)
+            db.add(u)
+        db.add(so)
+        db.add(Notice(title="تم رفض الطلب", body="تم رفض طلبك وتم رد الرصيد إن وُجد.", for_owner=False, uid=so.uid))
+        db.commit()
+        return {"ok": True}
+
+    for model, title in [
+        (WalletCard, "تم رفض الكارت"),
+        (ItunesOrder, "تم رفض آيتونز"),
+        (PhoneTopup, "تم رفض كارت الهاتف"),
+        (PubgOrder, "تم رفض شدات ببجي"),
+        (LudoOrder, "تم رفض طلب لودو"),
+    ]:
+        obj = db.get(model, order_id)
+        if obj and obj.status in ("pending", "processing"):
+            obj.status = "rejected"
+            db.add(obj)
+            db.add(Notice(title=title, body="يرجى المراجعة.", for_owner=False, uid=obj.uid))
+            db.commit()
+            return {"ok": True}
+
+    raise HTTPException(404, "order not found")
+
+# ---------- رصيد المحفظة (الأزرار Topup/Deduct) ----------
+@router.post("/wallet/topup", dependencies=[Depends(_pwd_ok)])
 def wallet_topup(uid: str = Body(...), amount: float = Body(...), db: Session = Depends(get_db)):
     if amount <= 0:
         raise HTTPException(400, "amount must be > 0")
@@ -303,7 +351,7 @@ def wallet_topup(uid: str = Body(...), amount: float = Body(...), db: Session = 
     db.commit()
     return {"ok": True, "balance": u.balance}
 
-@router.post("/wallet/deduct", dependencies=[Depends(_guard_pwd)])
+@router.post("/wallet/deduct", dependencies=[Depends(_pwd_ok)])
 def wallet_deduct(uid: str = Body(...), amount: float = Body(...), db: Session = Depends(get_db)):
     if amount <= 0:
         raise HTTPException(400, "amount must be > 0")
@@ -316,25 +364,22 @@ def wallet_deduct(uid: str = Body(...), amount: float = Body(...), db: Session =
     db.commit()
     return {"ok": True, "balance": u.balance}
 
-# ======================
-# Stats / Provider
-# ======================
-@router.get("/stats/users-count", dependencies=[Depends(_guard_pwd)])
+# ---------- إحصائيات + رصيد المزوّد ----------
+@router.get("/stats/users-count", dependencies=[Depends(_pwd_ok)])
 def users_count(db: Session = Depends(get_db)):
     total = db.query(User).count()
-    # لا نملك حقل last_active، نعيد 0 مؤقتًا
     return {"count": total, "active_last_hour": 0}
 
-@router.get("/stats/users-balances", dependencies=[Depends(_guard_pwd)])
+@router.get("/stats/users-balances", dependencies=[Depends(_pwd_ok)])
 def users_balances(db: Session = Depends(get_db)):
     rows = db.query(User).all()
     total = round(sum(float(u.balance or 0.0) for u in rows), 2)
-    return {"total": total}
+    # إن أردت إرجاع قائمة مفصلة للموبايل:
+    return {"total": total, "list": [{"uid": u.uid, "balance": float(u.balance or 0.0)} for u in rows]}
 
-@router.get("/provider/balance", dependencies=[Depends(_guard_pwd)])
+@router.get("/provider/balance", dependencies=[Depends(_pwd_ok)])
 def provider_bal():
     res = provider_balance()
-    # نتوقع {"ok": bool, "balance": float}
     if not res.get("ok"):
         raise HTTPException(502, res.get("error", "provider error"))
     return {"balance": float(res.get("balance", 0.0))}
