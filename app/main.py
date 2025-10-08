@@ -2,12 +2,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import logging
+from importlib import import_module
 
 from .database import engine
 from .models import Base
-from .routers.smm import r as public_router
-from .routers.routes_provider import r as provider_router
-from .routers.admin import r as admin_router
 
 app = FastAPI(title="ratluzen-smm-backend", version="1.0.0")
 
@@ -20,7 +18,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# إنشاء الجداول عند تشغيل التطبيق
+def _load_router(module_path: str):
+    """
+    يحاول قراءة المتغيّر router أو r من الموديول المحدد.
+    يفيد إذا كانت بعض الراوترات تسمي المتغيّر r وأخرى router.
+    """
+    try:
+        m = import_module(module_path, package=__package__)
+    except Exception as e:
+        raise ImportError(f"Failed to import module {module_path}: {e}") from e
+
+    rtr = getattr(m, "router", None) or getattr(m, "r", None)
+    if rtr is None:
+        raise ImportError(
+            f"Module {module_path} does not expose 'router' nor 'r'. "
+            f"Please define 'router = APIRouter(...)' (or alias r = router) inside it."
+        )
+    return rtr
+
+# إنشاء الجداول عند التشغيل
 @app.on_event("startup")
 def on_startup() -> None:
     try:
@@ -28,10 +44,25 @@ def on_startup() -> None:
     except Exception:
         logging.exception("Failed to initialize database schema on startup")
 
-# ضمّ الراوترات
-app.include_router(public_router, prefix="/api")
-app.include_router(provider_router, prefix="/api")
-app.include_router(admin_router, prefix="/api")
+# ضمّ الراوترات (ندعم router أو r في كل ملف)
+# تأكد أن لديك الملفات التالية:
+# app/routers/smm.py
+# app/routers/routes_provider.py
+# app/routers/admin.py
+try:
+    app.include_router(_load_router(".routers.smm"),            prefix="/api")
+except Exception:
+    logging.exception("Failed to include public (smm) router")
+
+try:
+    app.include_router(_load_router(".routers.routes_provider"), prefix="/api")
+except Exception:
+    logging.exception("Failed to include provider router")
+
+try:
+    app.include_router(_load_router(".routers.admin"),          prefix="/api")
+except Exception:
+    logging.exception("Failed to include admin router")
 
 @app.get("/")
 def root():
