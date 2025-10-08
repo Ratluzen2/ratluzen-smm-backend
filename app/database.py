@@ -1,29 +1,16 @@
-# app/database.py
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-import os
+from .config import settings
 
-# خذ عنوان قاعدة البيانات من متغيرات البيئة (Neon / Heroku)
-DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DB_URL") or "sqlite:///./local.db"
-
-# معاملات خاصة بالـ SQLite فقط
-connect_args = {}
-if DATABASE_URL.startswith("sqlite"):
-    connect_args = {"check_same_thread": False}
-
-# محرك SQLAlchemy
+# ملاحظة: psycopg (v3) يستخدم sslmode من URL مباشرة
 engine = create_engine(
-    DATABASE_URL,
+    settings.DATABASE_URL,
     pool_pre_ping=True,
-    pool_size=5,
-    max_overflow=10,
-    connect_args=connect_args,
+    future=True
 )
 
-# جلسات قاعدة البيانات
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
-# دالة الحقن مع FastAPI
 def get_db():
     db = SessionLocal()
     try:
