@@ -197,6 +197,31 @@ async def cards_accept_path(card_id: int, request: Request, token: str = Depends
 def cards_reject_path(card_id: int, token: str = Depends(_token)):
     _require_admin(token); _reject_card(card_id); return {"ok": True}
 
+# Aliases قديمة (لو التطبيق أرسل id في الجسم/الاستعلام)
+@router.post("/pending/cards/accept")
+@router.post("/pending/topups/accept")
+async def cards_accept_legacy(request: Request, token: str = Depends(_token),
+                              card_id_q: Optional[int] = Query(None, alias="card_id")):
+    _require_admin(token)
+    p = await _read_payload(request)
+    cid = card_id_q or _pick_id(p, "card_id", "id")
+    if cid is None: raise HTTPException(422, "card_id required")
+    amount = _pick_amount(p, "amount_usd", "amount", "value", "qty", "quantity")
+    if amount <= 0: raise HTTPException(422, "amount required")
+    _accept_card(cid, amount)
+    return {"ok": True}
+
+@router.post("/pending/cards/reject")
+@router.post("/pending/topups/reject")
+async def cards_reject_legacy(request: Request, token: str = Depends(_token),
+                              card_id_q: Optional[int] = Query(None, alias="card_id")):
+    _require_admin(token)
+    p = await _read_payload(request)
+    cid = card_id_q or _pick_id(p, "card_id", "id")
+    if cid is None: raise HTTPException(422, "card_id required")
+    _reject_card(cid)
+    return {"ok": True}
+
 # ========== Pending: Provider services approve/reject ==========
 def _approve_service(order_id: int):
     conn = get_conn()
@@ -272,6 +297,44 @@ def ludo_deliver(order_id: int, token: str = Depends(_token)):
 @router.post("/pending/ludo/{order_id}/reject")
 def ludo_reject(order_id: int, token: str = Depends(_token)):
     _require_admin(token); _finish_order(order_id, "Rejected"); return {"ok": True}
+
+# Legacy بدون {id} (لو UI قديم أرسل id بالـBody/Query)
+@router.post("/pending/itunes/deliver")
+@router.post("/pending/itunes/reject")
+async def itunes_legacy(request: Request, token: str = Depends(_token),
+                        order_id_q: Optional[int] = Query(None, alias="order_id")):
+    _require_admin(token)
+    p = await _read_payload(request)
+    oid = order_id_q or _pick_id(p, "order_id", "id")
+    if oid is None: raise HTTPException(422, "order_id required")
+    if str(request.url.path).endswith("/deliver"):
+        code = _pick_text(p, "gift_code", "code", "card", "voucher", "pin") or ""
+        _finish_order(oid, "Done", f"gift:{code}")
+    else:
+        _finish_order(oid, "Rejected")
+    return {"ok": True}
+
+@router.post("/pending/pubg/deliver")
+@router.post("/pending/pubg/reject")
+async def pubg_legacy(request: Request, token: str = Depends(_token),
+                      order_id_q: Optional[int] = Query(None, alias="order_id")):
+    _require_admin(token)
+    p = await _read_payload(request)
+    oid = order_id_q or _pick_id(p, "order_id", "id")
+    if oid is None: raise HTTPException(422, "order_id required")
+    _finish_order(oid, "Done" if str(request.url.path).endswith("/deliver") else "Rejected")
+    return {"ok": True}
+
+@router.post("/pending/ludo/deliver")
+@router.post("/pending/ludo/reject")
+async def ludo_legacy(request: Request, token: str = Depends(_token),
+                      order_id_q: Optional[int] = Query(None, alias="order_id")):
+    _require_admin(token)
+    p = await _read_payload(request)
+    oid = order_id_q or _pick_id(p, "order_id", "id")
+    if oid is None: raise HTTPException(422, "order_id required")
+    _finish_order(oid, "Done" if str(request.url.path).endswith("/deliver") else "Rejected")
+    return {"ok": True}
 
 # ========== Users: add/deduct + stats ==========
 @router.post("/users/{uid}/topup")
