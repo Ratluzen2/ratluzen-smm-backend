@@ -1,177 +1,173 @@
-# app/routers/admin.py
-from fastapi import APIRouter, HTTPException, Depends, Header
+import os
+from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from ..db import get_conn, put_conn
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
-# ======== Auth (Header) ========
-def verify_admin(x_admin_password: Optional[str] = Header(None)) -> None:
-    # غيّر كلمة السر من متغير البيئة ADMIN_PASSWORD داخل هيروكو
-    import os
-    if not x_admin_password or x_admin_password != os.getenv("ADMIN_PASSWORD", ""):
-        raise HTTPException(401, "bad admin password")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "2000")
 
-# ======== Utilities ========
-def _orders_where(where_sql: str, params: tuple) -> List[dict]:
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT o.id,
-                       u.uid,
-                       o.title,
-                       COALESCE(o.service_id, 0) AS service_id,
-                       o.link,
-                       o.quantity,
-                       o.price,
-                       o.status,
-                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_ms
-                FROM public.orders o
-                JOIN public.users u ON u.id = o.user_id
-                WHERE {where_sql}
-                ORDER BY o.id DESC
-                """,
-                params,
-            )
-            rows = cur.fetchall()
-        return [
-            {
-                "id": r[0],
-                "uid": r[1],
-                "title": r[2],
-                "service_id": int(r[3]) if r[3] is not None else 0,
-                "link": r[4],
-                "quantity": r[5],
-                "price": float(r[6]),
-                "status": r[7],
-                "created_at": int(r[8]),
-            }
-            for r in rows
-        ]
-    finally:
-        put_conn(conn)
+def _check_admin(x_admin_password: Optional[str]):
+    if not x_admin_password or x_admin_password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="bad admin password")
 
-# ======== Ping / Basic ========
+# ======= Schemas =======
+class WalletChangeIn(BaseModel):
+    uid: str
+    amount: float = Field(gt=0)
+
+# ======= Basic =======
 @router.get("/ping")
-def admin_ping(_: None = Depends(verify_admin)):
+def ping(x_admin_password: Optional[str] = Header(default=None)):
+    _check_admin(x_admin_password)
     return {"ok": True}
 
 @router.get("/users/count")
-def users_count(_: None = Depends(verify_admin)):
+def users_count(x_admin_password: Optional[str] = Header(default=None)):
+    _check_admin(x_admin_password)
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM public.users")
-            c = cur.fetchone()[0]
+            (c,) = cur.fetchone()
         return {"ok": True, "count": int(c)}
     finally:
         put_conn(conn)
 
-# ======== Wallet Ops ========
-class WalletOpIn(BaseModel):
-    uid: str
-    amount: float = Field(gt=0)
-
-@router.post("/wallet/topup")
-def wallet_topup(body: WalletOpIn, _: None = Depends(verify_admin)):
-    uid = body.uid.strip()
+@router.get("/users/balances")
+def users_balances(x_admin_password: Optional[str] = Header(default=None)):
+    _check_admin(x_admin_password)
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            cur.execute("SELECT uid, balance FROM public.users ORDER BY id DESC")
+            rows = cur.fetchall()
+        return [{"uid": r[0], "balance": float(r[1])} for r in rows]
+    finally:
+        put_conn(conn)
+
+# ======= Wallet Ops =======
+@router.post("/wallet/topup")
+def topup_wallet(body: WalletChangeIn, x_admin_password: Optional[str] = Header(default=None)):
+    _check_admin(x_admin_password)
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (body.uid,))
             r = cur.fetchone()
             if not r:
                 raise HTTPException(404, "user not found")
             user_id = r[0]
-            cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (body.amount, user_id))
+            cur.execute("UPDATE public.users SET balance = balance + %s WHERE id=%s", (body.amount, user_id))
             cur.execute(
                 "INSERT INTO public.wallet_txns(user_id, amount, reason) VALUES(%s,%s,%s)",
-                (user_id, body.amount, "admin_topup"),
+                (user_id, body.amount, "admin_topup")
             )
         return {"ok": True}
     finally:
         put_conn(conn)
 
 @router.post("/wallet/deduct")
-def wallet_deduct(body: WalletOpIn, _: None = Depends(verify_admin)):
-    uid = body.uid.strip()
+def deduct_wallet(body: WalletChangeIn, x_admin_password: Optional[str] = Header(default=None)):
+    _check_admin(x_admin_password)
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            cur.execute("SELECT id, balance FROM public.users WHERE uid=%s", (uid,))
+            cur.execute("SELECT id, balance FROM public.users WHERE uid=%s", (body.uid,))
             r = cur.fetchone()
             if not r:
                 raise HTTPException(404, "user not found")
             user_id, bal = r[0], float(r[1])
             if bal < body.amount:
                 raise HTTPException(400, "insufficient balance")
-            cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (body.amount, user_id))
+            cur.execute("UPDATE public.users SET balance = balance - %s WHERE id=%s", (body.amount, user_id))
             cur.execute(
                 "INSERT INTO public.wallet_txns(user_id, amount, reason) VALUES(%s,%s,%s)",
-                (user_id, -body.amount, "admin_deduct"),
+                (user_id, -body.amount, "admin_deduct")
             )
         return {"ok": True}
     finally:
         put_conn(conn)
 
-# ======== Pending Orders (NEW) ========
-# خدمات المزود (لديها service_id)
+# ======= Pending Lists (الخدمات/ايتونز/ببجي/لودو) =======
+def _pending_like(pattern: str):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT o.id, u.uid, o.title, o.quantity, o.price, o.status, EXTRACT(EPOCH FROM o.created_at)*1000
+                FROM public.orders o
+                JOIN public.users u ON u.id = o.user_id
+                WHERE o.status='Pending' AND o.title ILIKE %s
+                ORDER BY o.id DESC
+                """,
+                (pattern,)
+            )
+            rows = cur.fetchall()
+        return [
+            {"id": a, "uid": b, "title": c, "quantity": d, "price": float(e), "status": f, "created_at": int(g)}
+            for (a, b, c, d, e, f, g) in rows
+        ]
+    finally:
+        put_conn(conn)
+
 @router.get("/pending/services")
-def pending_services(_: None = Depends(verify_admin)):
-    return _orders_where("o.status='Pending' AND o.service_id IS NOT NULL", ())
+def pending_services(x_admin_password: Optional[str] = Header(default=None)):
+    _check_admin(x_admin_password)
+    return _pending_like("%")
 
-# آيتونز
 @router.get("/pending/itunes")
-def pending_itunes(_: None = Depends(verify_admin)):
-    # نبحث في العنوان عن كلمات آيتونز بالإنجليزية أو العربية
-    return _orders_where(
-        "o.status='Pending' AND (LOWER(o.title) LIKE %s OR o.title ILIKE %s)",
-        ("%itunes%", "%ايتونز%"),
-    )
+def pending_itunes(x_admin_password: Optional[str] = Header(default=None)):
+    _check_admin(x_admin_password)
+    return _pending_like("%itunes%")
 
-# PUBG
 @router.get("/pending/pubg")
-def pending_pubg(_: None = Depends(verify_admin)):
-    return _orders_where(
-        "o.status='Pending' AND (LOWER(o.title) LIKE %s OR o.title ILIKE %s)",
-        ("%pubg%", "%شدات%"),
-    )
+def pending_pubg(x_admin_password: Optional[str] = Header(default=None)):
+    _check_admin(x_admin_password)
+    return _pending_like("%pubg%")
 
-# Ludo
 @router.get("/pending/ludo")
-def pending_ludo(_: None = Depends(verify_admin)):
-    return _orders_where(
-        "o.status='Pending' AND (LOWER(o.title) LIKE %s OR o.title ILIKE %s)",
-        ("%ludo%", "%لودو%"),
-    )
+def pending_ludo(x_admin_password: Optional[str] = Header(default=None)):
+    _check_admin(x_admin_password)
+    return _pending_like("%ludo%")
 
-# ======== Approve/Deliver (عينات اختيارية) ========
-class OrderActionIn(BaseModel):
-    order_id: int
-
-@router.post("/approve")
-def approve_order(body: OrderActionIn, _: None = Depends(verify_admin)):
+# ======= Orders admin actions (approve / deliver) =======
+@router.post("/orders/{order_id}/approve")
+def approve_order(order_id: int, x_admin_password: Optional[str] = Header(default=None)):
+    _check_admin(x_admin_password)
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            cur.execute("UPDATE public.orders SET status='Approved' WHERE id=%s", (body.order_id,))
-            if cur.rowcount == 0:
+            cur.execute("UPDATE public.orders SET status='Approved' WHERE id=%s RETURNING 1", (order_id,))
+            if not cur.fetchone():
                 raise HTTPException(404, "order not found")
         return {"ok": True}
     finally:
         put_conn(conn)
 
-@router.post("/deliver")
-def deliver_order(body: OrderActionIn, _: None = Depends(verify_admin)):
+@router.post("/orders/{order_id}/deliver")
+def deliver_order(order_id: int, x_admin_password: Optional[str] = Header(default=None)):
+    _check_admin(x_admin_password)
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            cur.execute("UPDATE public.orders SET status='Delivered' WHERE id=%s", (body.order_id,))
-            if cur.rowcount == 0:
+            cur.execute("UPDATE public.orders SET status='Delivered' WHERE id=%s RETURNING 1", (order_id,))
+            if not cur.fetchone():
                 raise HTTPException(404, "order not found")
         return {"ok": True}
     finally:
         put_conn(conn)
+
+# ======= Provider/API Balance check (stub) =======
+@router.get("/provider/balance")
+def provider_balance(x_admin_password: Optional[str] = Header(default=None)):
+    """
+    زر 'فحص رصيد API' — يُرجع قيمة ثابتة من ENV أو 0.0
+    غيّر PROVIDER_BALANCE في المتغيّرات البيئية إن أردت.
+    """
+    _check_admin(x_admin_password)
+    import os
+    bal = float(os.getenv("PROVIDER_BALANCE", "0") or 0)
+    return {"ok": True, "balance": bal}
