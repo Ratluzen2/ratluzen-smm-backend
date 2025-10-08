@@ -1,11 +1,11 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from typing import List
+from psycopg2.extras import Json
 from ..db import get_conn, put_conn
 
 router = APIRouter(prefix="/api", tags=["public"])
 
-# ---------- Users ----------
 class UpsertUserIn(BaseModel):
     uid: str
 
@@ -35,7 +35,6 @@ def wallet_balance(uid: str):
     finally:
         put_conn(conn)
 
-# ---------- Orders ----------
 class ProviderOrderIn(BaseModel):
     uid: str
     service_id: int
@@ -51,17 +50,15 @@ def create_provider_order(body: ProviderOrderIn):
         with conn, conn.cursor() as cur:
             cur.execute("SELECT id, balance FROM public.users WHERE uid=%s", (body.uid,))
             r = cur.fetchone()
-            if not r:
-                raise HTTPException(404, "user not found")
+            if not r: raise HTTPException(404, "user not found")
             user_id, bal = r[0], float(r[1])
-            if bal < body.price:
-                raise HTTPException(400, "insufficient balance")
+            if bal < body.price: raise HTTPException(400, "insufficient balance")
             cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (body.price, user_id))
-            cur.execute("""
-                INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
-                VALUES(%s,%s,%s,%s)
-            """, (user_id, -body.price, "order_charge",
-                  {"service_id": body.service_id, "name": body.service_name, "qty": body.quantity}))
+            cur.execute(
+                "INSERT INTO public.wallet_txns(user_id, amount, reason, meta) VALUES(%s,%s,%s,%s)",
+                (user_id, -body.price, "order_charge",
+                 Json({"service_id": body.service_id, "name": body.service_name, "qty": body.quantity}))
+            )
             cur.execute("""
                 INSERT INTO public.orders(user_id, title, service_id, link, quantity, price, status)
                 VALUES(%s,%s,%s,%s,%s,%s,'Pending') RETURNING id
@@ -82,8 +79,7 @@ def create_manual_order(body: ManualOrderIn):
         with conn, conn.cursor() as cur:
             cur.execute("SELECT id FROM public.users WHERE uid=%s", (body.uid,))
             r = cur.fetchone()
-            if not r:
-                raise HTTPException(404, "user not found")
+            if not r: raise HTTPException(404, "user not found")
             cur.execute("""
                 INSERT INTO public.orders(user_id, title, quantity, price, status)
                 VALUES(%s,%s,0,0,'Pending') RETURNING id
@@ -99,16 +95,14 @@ def _orders_for_uid(uid: str) -> List[dict]:
         with conn, conn.cursor() as cur:
             cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
             r = cur.fetchone()
-            if not r:
-                return []
+            if not r: return []
             user_id = r[0]
             cur.execute("""
                 SELECT id, title, quantity, price, status, EXTRACT(EPOCH FROM created_at)*1000
                 FROM public.orders
-                WHERE user_id=%s
-                ORDER BY id DESC
+                WHERE user_id=%s ORDER BY id DESC
             """, (user_id,))
-            rows = cur.fetchall()  # <-- كانت بدون أقواس
+            rows = cur.fetchall()
         return [
             {"id": a, "title": b, "quantity": c, "price": float(d), "status": e, "created_at": int(f)}
             for (a, b, c, d, e, f) in rows
@@ -116,7 +110,7 @@ def _orders_for_uid(uid: str) -> List[dict]:
     finally:
         put_conn(conn)
 
-# المسارات التي تستعملها الواجهة (كلها ترجع مصفوفة):
+# تُعيد مصفوفة:
 @router.get("/orders/my")
 def my_orders(uid: str):
     return _orders_for_uid(uid)
@@ -132,3 +126,12 @@ def user_orders_alias(uid: str):
 @router.get("/users/{uid}/orders")
 def user_orders_path(uid: str):
     return _orders_for_uid(uid)
+
+# بدائل تُعيد {"orders": []} لبعض الواجهات:
+@router.get("/orders/list")
+def orders_list(uid: str):
+    return {"orders": _orders_for_uid(uid)}
+
+@router.get("/user/orders/list")
+def user_orders_list(uid: str):
+    return {"orders": _orders_for_uid(uid)}
