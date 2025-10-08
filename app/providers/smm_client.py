@@ -7,7 +7,8 @@ class SMMClient:
         self.key = SMM_API_KEY
 
     async def _post(self, payload: dict):
-        data = {"key": self.key}; data.update(payload)
+        data = {"key": self.key}
+        data.update(payload)
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.post(self.url, data=data)
             r.raise_for_status()
