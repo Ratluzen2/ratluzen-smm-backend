@@ -1,242 +1,238 @@
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Body
-from sqlalchemy.orm import Session
-from typing import Optional
+# app/models.py
+from __future__ import annotations
+
 from datetime import datetime
-from pydantic import BaseModel
+from typing import Optional
 
-from ..config import settings
-from ..database import get_db
-from ..models import (
-    User, ServiceOrder, WalletCard, ItunesOrder, PhoneTopup,
-    PubgOrder, LudoOrder, Notice, Token
+from sqlalchemy import (
+    String, Integer, Float, Boolean, DateTime, Text, func, Index
 )
-from ..providers.smm_client import provider_add_order, provider_balance, provider_status
-import httpx
+from sqlalchemy.orm import declarative_base, Mapped, mapped_column
 
-r = APIRouter(prefix="/admin")
+Base = declarative_base()
 
-# ---------- Pydantic payloads ----------
-class AmountReq(BaseModel):
-    uid: Optional[str] = None
-    amount: float
+# =========================
+# Users
+# =========================
+class User(Base):
+    __tablename__ = "users"
 
-class AcceptCardReq(BaseModel):
-    amount_usd: float
-    reviewed_by: Optional[str] = None
-
-class GiftCodeReq(BaseModel):
-    gift_code: str
-
-class CodeReq(BaseModel):
-    code: str
-
-# -------- Helpers --------
-def _row(obj):
-    if obj is None:
-        return None
-    out = {}
-    for c in obj.__table__.columns:
-        v = getattr(obj, c.name)
-        out[c.name] = v.isoformat() if isinstance(v, datetime) else v
-    return out
-
-def _rows(lst):
-    return [_row(o) for o in lst]
-
-# -------- Guard (owner password) --------
-def guard(
-    x_admin_pass: Optional[str] = Header(default=None, alias="X-Admin-Pass"),
-    x_admin_pass_alt: Optional[str] = Header(default=None, alias="x-admin-pass"),
-    key: Optional[str] = Query(default=None)
-):
-    pwd = (x_admin_pass or x_admin_pass_alt or key or "").strip()
-    if pwd != settings.ADMIN_PASSWORD:
-        raise HTTPException(401, "unauthorized")
-
-# فحص سريع
-@r.get("/check", dependencies=[Depends(guard)])
-def check_ok():
-    return {"ok": True}
-
-# ---------- الخدمات المعلّقة (ترجيع مصفوفة مباشرة) ----------
-@r.get("/pending/services", dependencies=[Depends(guard)])
-def pending_services(db: Session = Depends(get_db)):
-    lst = (
-        db.query(ServiceOrder)
-        .filter_by(status="pending")
-        .order_by(ServiceOrder.created_at.desc())
-        .all()
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    uid: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    balance: Mapped[float] = mapped_column(Float, default=0.0)
+    is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
+    role: Mapped[str] = mapped_column(String(16), default="user")  # user/admin
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
     )
-    # يعيد مصفوفة فقط لأن التطبيق يتوقع JSONArray
-    return _rows(lst)
 
-# alias للمسارات التي يتوقعها التطبيق
-@r.get("/pending/topups", dependencies=[Depends(guard)])
-def pending_topups_alias(db: Session = Depends(get_db)):
-    lst = (
-        db.query(WalletCard)
-        .filter_by(status="pending")
-        .order_by(WalletCard.created_at.desc())
-        .all()
+    __table_args__ = (
+        Index("ix_users_uid", "uid"),
     )
-    return _rows(lst)
 
-@r.get("/pending/cards", dependencies=[Depends(guard)])
-def pending_cards(db: Session = Depends(get_db)):
-    lst = (
-        db.query(WalletCard)
-        .filter_by(status="pending")
-        .order_by(WalletCard.created_at.desc())
-        .all()
+# =========================
+# Notifications (in-app + push log)
+# =========================
+class Notice(Base):
+    __tablename__ = "notices"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(120))
+    body: Mapped[str] = mapped_column(Text)
+    # إذا كانت خاصة بالمالك فقط
+    for_owner: Mapped[bool] = mapped_column(Boolean, default=False)
+    # إذا كانت موجهة لمستخدم محدد
+    uid: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
     )
-    return _rows(lst)
 
-@r.get("/pending/itunes", dependencies=[Depends(guard)])
-def pending_itunes(db: Session = Depends(get_db)):
-    lst = (
-        db.query(ItunesOrder)
-        .filter_by(status="pending")
-        .order_by(ItunesOrder.created_at.desc())
-        .all()
+    __table_args__ = (
+        Index("ix_notices_uid", "uid"),
     )
-    return _rows(lst)
 
-@r.get("/pending/phone", dependencies=[Depends(guard)])
-def pending_phone(db: Session = Depends(get_db)):
-    lst = (
-        db.query(PhoneTopup)
-        .filter_by(status="pending")
-        .order_by(PhoneTopup.created_at.desc())
-        .all()
+# =========================
+# FCM Tokens
+# =========================
+class Token(Base):
+    __tablename__ = "tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    uid: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    token: Mapped[str] = mapped_column(Text, unique=True)
+    # true = للمالك (لوحة المالك) / false = للمستخدمين
+    for_owner: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
     )
-    return _rows(lst)
 
-@r.get("/pending/pubg", dependencies=[Depends(guard)])
-def pending_pubg(db: Session = Depends(get_db)):
-    lst = (
-        db.query(PubgOrder)
-        .filter_by(status="pending")
-        .order_by(PubgOrder.created_at.desc())
-        .all()
+    __table_args__ = (
+        Index("ix_tokens_uid", "uid"),
+        Index("ix_tokens_for_owner", "for_owner"),
     )
-    return _rows(lst)
 
-@r.get("/pending/ludo", dependencies=[Depends(guard)])
-def pending_ludo(db: Session = Depends(get_db)):
-    lst = (
-        db.query(LudoOrder)
-        .filter_by(status="pending")
-        .order_by(LudoOrder.created_at.desc())
-        .all()
+# =========================
+# Service Orders (Connected to external SMM provider)
+# =========================
+class ServiceOrder(Base):
+    __tablename__ = "service_orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    uid: Mapped[str] = mapped_column(String(64), index=True)
+
+    # احتفظنا بالحقلين للتوافق مع الإصدارات المختلفة من الراوتر:
+    # service_key: اسم أو مفتاح الخدمة (نصي)
+    service_key: Mapped[Optional[str]] = mapped_column(String(120), nullable=True, index=True)
+    # service_code: رقم الخدمة للمزوّد (رقم)
+    service_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+
+    link: Mapped[str] = mapped_column(Text)          # رابط الحساب/المنشور
+    quantity: Mapped[int] = mapped_column(Integer)   # الكمية المطلوبة
+
+    # السعر لكل 1000 (للحسبة والعرض)
+    unit_price_per_k: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # السعر النهائي للطلب (يجب تخزينه وقت الإنشاء)
+    price: Mapped[float] = mapped_column(Float)
+
+    # pending / processing / done / rejected
+    status: Mapped[str] = mapped_column(String(16), index=True, default="pending")
+
+    # رقم الطلب عند المزوّد بعد التنفيذ
+    provider_order_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
     )
-    return _rows(lst)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
-# ---------- إجراءات الخدمات (تنفيذ/رفض/رد) ----------
-@r.post("/orders/approve", dependencies=[Depends(guard)])
-def orders_approve(order_id: int = Body(..., embed=True), db: Session = Depends(get_db)):
-    order = db.get(ServiceOrder, order_id)
-    if not order or order.status != "pending":
-        raise HTTPException(404, "order not found or not pending")
+    __table_args__ = (
+        Index("ix_service_orders_uid", "uid"),
+        Index("ix_service_orders_status", "status"),
+        Index("ix_service_orders_service_key", "service_key"),
+        Index("ix_service_orders_service_code", "service_code"),
+    )
 
-    send = provider_add_order(str(order.service_code), order.link, order.quantity)
-    if not send.get("ok"):
-        raise HTTPException(502, send.get("error", "provider error"))
+# =========================
+# Wallet Cards (Asiacell cards submitted by users)
+# =========================
+class WalletCard(Base):
+    __tablename__ = "wallet_cards"
 
-    order.status = "processing"
-    order.provider_order_id = send["orderId"]
-    db.add(order)
-    db.add(Notice(title="تم تنفيذ طلبك", body=f"أُرسل للمزوّد | رقم: {order.provider_order_id}", for_owner=False, uid=order.uid))
-    db.commit()
-    return {"ok": True}
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    uid: Mapped[str] = mapped_column(String(64), index=True)
+    card_number: Mapped[str] = mapped_column(String(32))  # 14 أو 16 رقم
+    # pending / accepted / rejected
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    # يتم وضع قيمة الشحن بالدولار عند القبول
+    amount_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    reviewed_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
-@r.post("/orders/reject", dependencies=[Depends(guard)])
-def orders_reject(order_id: int = Body(..., embed=True), db: Session = Depends(get_db)):
-    order = db.get(ServiceOrder, order_id)
-    if not order or order.status != "pending":
-        raise HTTPException(404, "order not found or not pending")
-    order.status = "rejected"
-    u = db.query(User).filter_by(uid=order.uid).first()
-    if u:
-        u.balance = round(u.balance + order.price, 2)
-        db.add(u)
-    db.add(order)
-    db.add(Notice(title="تم رفض الطلب", body="تم ردّ الرصيد لحسابك.", for_owner=False, uid=order.uid))
-    db.commit()
-    return {"ok": True}
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
-@r.post("/orders/refund", dependencies=[Depends(guard)])
-def orders_refund(order_id: int = Body(..., embed=True), db: Session = Depends(get_db)):
-    order = db.get(ServiceOrder, order_id)
-    if not order:
-        raise HTTPException(404, "order not found")
-    u = db.query(User).filter_by(uid=order.uid).first()
-    if u:
-        u.balance = round(u.balance + order.price, 2)
-        db.add(u)
-    order.status = "rejected"
-    db.add(order)
-    db.commit()
-    return {"ok": True}
+    __table_args__ = (
+        Index("ix_wallet_cards_uid", "uid"),
+        Index("ix_wallet_cards_status", "status"),
+    )
 
-# ---------- كارتات أسيا سيل ----------
-@r.post("/cards/accept", dependencies=[Depends(guard)])
-def accept_card(
-    card_id: int = Body(..., embed=True),
-    amount_usd: float = Body(..., embed=True),
-    reviewed_by: Optional[str] = Body(default="owner", embed=True),
-    db: Session = Depends(get_db)
-):
-    card = db.get(WalletCard, card_id)
-    if not card or card.status != "pending":
-        raise HTTPException(404, "card not found or not pending")
-    card.status = "accepted"
-    card.amount_usd = float(amount_usd)
-    card.reviewed_by = reviewed_by or "owner"
-    u = db.query(User).filter_by(uid=card.uid).first()
-    if not u:
-        u = User(uid=card.uid, balance=0.0)
-    u.balance = round(u.balance + float(amount_usd), 2)
-    db.add(u)
-    db.add(card)
-    db.add(Notice(title="تم شحن رصيدك", body=f"+${amount_usd} عبر بطاقة أسيا سيل", for_owner=False, uid=card.uid))
-    db.commit()
-    return {"ok": True}
+# =========================
+# iTunes Orders (manual delivery by owner)
+# =========================
+class ItunesOrder(Base):
+    __tablename__ = "itunes_orders"
 
-@r.post("/cards/reject", dependencies=[Depends(guard)])
-def reject_card(card_id: int = Body(..., embed=True), db: Session = Depends(get_db)):
-    card = db.get(WalletCard, card_id)
-    if not card or card.status != "pending":
-        raise HTTPException(404, "card not found or not pending")
-    card.status = "rejected"
-    db.add(card)
-    db.add(Notice(title="تم رفض الكارت", body="يرجى التأكد من الرقم والمحاولة مجددًا.", for_owner=False, uid=card.uid))
-    db.commit()
-    return {"ok": True}
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    uid: Mapped[str] = mapped_column(String(64), index=True)
+    # القيمة المطلوبة (2 / 3 / 4 / ... / 100)
+    amount: Mapped[int] = mapped_column(Integer)
+    # pending / delivered / rejected
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    gift_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
-# ---------- آيتونز ----------
-@r.post("/itunes/deliver", dependencies=[Depends(guard)])
-def deliver_itunes(oid: int = Body(..., embed=True), gift_code: str = Body(..., embed=True), db: Session = Depends(get_db)):
-    o = db.get(ItunesOrder, oid)
-    if not o or o.status != "pending":
-        raise HTTPException(404, "not found or not pending")
-    o.status = "delivered"
-    o.gift_code = gift_code
-    db.add(o)
-    db.add(Notice(title="كود آيتونز", body=f"الكود: {gift_code}", for_owner=False, uid=o.uid))
-    db.commit()
-    return {"ok": True}
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
-@r.post("/itunes/reject", dependencies=[Depends(guard)])
-def reject_itunes(oid: int = Body(..., embed=True), db: Session = Depends(get_db)):
-    o = db.get(ItunesOrder, oid)
-    if not o or o.status != "pending":
-        raise HTTPException(404, "not found or not pending")
-    o.status = "rejected"
-    db.add(o)
-    db.add(Notice(title="رفض آيتونز", body="تم رفض طلبك.", for_owner=False, uid=o.uid))
-    db.commit()
-    return {"ok": True}
+    __table_args__ = (
+        Index("ix_itunes_orders_uid", "uid"),
+        Index("ix_itunes_orders_status", "status"),
+    )
 
-# ---------- أرصدة الهاتف ----------
-@r.post("/phone/deliver", dependencies=[Depends(guard)])
-def deliver_phone(oid: int = Body(..., embed=True), code: str = Body(..., embed=True), db: Session = Depends(get_db
+# =========================
+# Phone Topups (Atheer / Asiacell / Korek)
+# =========================
+class PhoneTopup(Base):
+    __tablename__ = "phone_topups"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    uid: Mapped[str] = mapped_column(String(64), index=True)
+    operator: Mapped[str] = mapped_column(String(16))  # atheir / asiacell / korek
+    amount: Mapped[int] = mapped_column(Integer)
+    # pending / delivered / rejected
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    # كود الكارت المرسل للمستخدم بعد التنفيذ اليدوي
+    code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_phone_topups_uid", "uid"),
+        Index("ix_phone_topups_status", "status"),
+        Index("ix_phone_topups_operator", "operator"),
+    )
+
+# =========================
+# PUBG Orders (manual delivery by owner)
+# =========================
+class PubgOrder(Base):
+    __tablename__ = "pubg_orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    uid: Mapped[str] = mapped_column(String(64), index=True)
+    # الحزمة المطلوبة 60 / 120 / 325 / 660 / 1800 / 3850 / 8100
+    pkg: Mapped[int] = mapped_column(Integer)
+    pubg_id: Mapped[str] = mapped_column(String(64))
+    # pending / delivered / rejected
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_pubg_orders_uid", "uid"),
+        Index("ix_pubg_orders_status", "status"),
+    )
+
+# =========================
+# Ludo Orders (diamonds / gold) — manual delivery
+# =========================
+class LudoOrder(Base):
+    __tablename__ = "ludo_orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    uid: Mapped[str] = mapped_column(String(64), index=True)
+    # diamonds / gold
+    kind: Mapped[str] = mapped_column(String(16))
+    # قيمة الحزمة (810 / 2280 / 5080 / 12750) للماس أو (66680 ... إلخ) للذهب
+    pack: Mapped[int] = mapped_column(Integer)
+    ludo_id: Mapped[str] = mapped_column(String(64))
+    # pending / delivered / rejected
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_ludo_orders_uid", "uid"),
+        Index("ix_ludo_orders_status", "status"),
+        Index("ix_ludo_orders_kind", "kind"),
+    )
