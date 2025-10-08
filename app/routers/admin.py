@@ -8,7 +8,7 @@ from ..db import get_conn, put_conn
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
-# ================= Auth helpers =================
+# ========== Auth ==========
 def _extract_bearer(auth: Optional[str]) -> Optional[str]:
     if not auth: return None
     auth = auth.strip()
@@ -24,12 +24,11 @@ def _extract_bearer(auth: Optional[str]) -> Optional[str]:
 
 def _token(
     x_admin_pass: Optional[str] = Header(None, alias="x-admin-pass", convert_underscores=False),
-    x_admin_key: Optional[str]  = Header(None, alias="x-admin-key",  convert_underscores=False),
     key: Optional[str] = Query(None),
     admin_password: Optional[str] = Query(None, alias="admin_password"),
     authorization: Optional[str] = Header(None, alias="Authorization", convert_underscores=False),
 ):
-    return (x_admin_pass or x_admin_key or key or admin_password or _extract_bearer(authorization) or "").strip()
+    return (x_admin_pass or key or admin_password or _extract_bearer(authorization) or "").strip()
 
 def _require_admin(token: str):
     if token != ADMIN_PASS:
@@ -39,15 +38,13 @@ def _require_admin(token: str):
 def check(token: str = Depends(_token)):
     _require_admin(token); return {"ok": True}
 
-# ================= Utils =================
+# ========== Utils ==========
 async def _read_payload(request: Request) -> Dict[str, Any]:
-    # JSON أولاً
     try:
         data = await request.json()
         if isinstance(data, dict): return data
     except Exception:
         pass
-    # ثم form
     try:
         form = await request.form()
         return {k: form.get(k) for k in form.keys()}
@@ -64,25 +61,20 @@ def _pick_id(p: Dict[str, Any], *names: str) -> Optional[int]:
 def _pick_text(p: Dict[str, Any], *names: str) -> Optional[str]:
     for n in names:
         v = p.get(n)
-        if v not in (None, ""):
-            return str(v).strip()
+        if v not in (None, ""): return str(v).strip()
     return None
 
 def _pick_amount(p: Dict[str, Any], *names: str) -> float:
-    # يقبل "10", "10.0", "IQD 10,000", "12,5" ... إلخ
     for n in names:
         if n in p and p[n] not in (None, ""):
             raw = str(p[n]).strip()
             m = re.search(r"[-+]?\d+(?:[.,]\d+)?", raw)
-            if m:
-                return float(m.group(0).replace(",", "."))
+            if m: return float(m.group(0).replace(",", "."))
     return 0.0
 
-def _json_list(items: List[Dict[str, Any]]):
-    # بعض الشاشات تريد {"list":[...]} وأخرى {"orders":[...]}، نرجّع الشكل الأكثر شيوعًا للوحة
-    return {"list": items}
+def _json_list(items: List[Dict[str, Any]]): return {"list": items}
 
-# ================== PENDING: Lists ==================
+# ========== Pending: Lists ==========
 def _fetch_pending_cards() -> List[Dict[str, Any]]:
     conn = get_conn()
     try:
@@ -166,7 +158,7 @@ def pending_ludo(token: str = Depends(_token)):
     items = [{"id": r[0], "uid": r[1], "pack": r[4] or 0, "ludo_id": r[3] or "", "created_at": int(r[6])} for r in rows]
     return _json_list(items)
 
-# ================== PENDING: Cards (accept/reject) ==================
+# ========== Pending: Cards accept/reject ==========
 def _accept_card(card_id: int, amount: float):
     conn = get_conn()
     try:
@@ -192,12 +184,12 @@ def _reject_card(card_id: int):
     finally:
         put_conn(conn)
 
-# مسارات بـ{card_id} في الـPath
 @router.post("/pending/cards/{card_id}/accept")
 async def cards_accept_path(card_id: int, request: Request, token: str = Depends(_token)):
     _require_admin(token)
     p = await _read_payload(request)
     amount = _pick_amount(p, "amount_usd", "amount", "value", "qty", "quantity")
+    if amount <= 0: raise HTTPException(422, "amount required")
     _accept_card(card_id, amount)
     return {"ok": True}
 
@@ -205,31 +197,7 @@ async def cards_accept_path(card_id: int, request: Request, token: str = Depends
 def cards_reject_path(card_id: int, token: str = Depends(_token)):
     _require_admin(token); _reject_card(card_id); return {"ok": True}
 
-# Aliases بدون {id} في الـPath (id في الجسم/الاستعلام) + أسماء قديمة topups/*
-@router.post("/pending/cards/accept")
-@router.post("/pending/topups/accept")
-async def cards_accept_legacy(request: Request, token: str = Depends(_token),
-                              card_id_q: Optional[int] = Query(None, alias="card_id")):
-    _require_admin(token)
-    p = await _read_payload(request)
-    cid = card_id_q or _pick_id(p, "card_id", "id")
-    if cid is None: raise HTTPException(422, "card_id required")
-    amount = _pick_amount(p, "amount_usd", "amount", "value", "qty", "quantity")
-    _accept_card(cid, amount)
-    return {"ok": True}
-
-@router.post("/pending/cards/reject")
-@router.post("/pending/topups/reject")
-async def cards_reject_legacy(request: Request, token: str = Depends(_token),
-                              card_id_q: Optional[int] = Query(None, alias="card_id")):
-    _require_admin(token)
-    p = await _read_payload(request)
-    cid = card_id_q or _pick_id(p, "card_id", "id")
-    if cid is None: raise HTTPException(422, "card_id required")
-    _reject_card(cid)
-    return {"ok": True}
-
-# ================== PENDING: Provider services approve/reject ==================
+# ========== Pending: Provider services approve/reject ==========
 def _approve_service(order_id: int):
     conn = get_conn()
     try:
@@ -256,7 +224,6 @@ def _reject_service(order_id: int):
     finally:
         put_conn(conn)
 
-# بـ{order_id} في الـPath
 @router.post("/pending/services/{order_id}/approve")
 def services_approve_path(order_id: int, token: str = Depends(_token)):
     _require_admin(token); _approve_service(order_id); return {"ok": True}
@@ -265,22 +232,7 @@ def services_approve_path(order_id: int, token: str = Depends(_token)):
 def services_reject_path(order_id: int, token: str = Depends(_token)):
     _require_admin(token); _reject_service(order_id); return {"ok": True}
 
-# Aliases بدون {id} (id في الجسم/الاستعلام)
-@router.post("/pending/services/approve")
-@router.post("/pending/services/reject")
-async def services_action_legacy(request: Request, token: str = Depends(_token),
-                                 order_id_q: Optional[int] = Query(None, alias="order_id")):
-    _require_admin(token)
-    p = await _read_payload(request)
-    oid = order_id_q or _pick_id(p, "order_id", "id")
-    if oid is None: raise HTTPException(422, "order_id required")
-    if str(request.url.path).endswith("/approve"):
-        _approve_service(oid)
-    else:
-        _reject_service(oid)
-    return {"ok": True}
-
-# ================== PENDING: iTunes / PUBG / Ludo (deliver/reject) ==================
+# ========== Pending: iTunes / PUBG / Ludo (deliver/reject) ==========
 def _finish_order(order_id: int, status: str, link_note: Optional[str] = None):
     conn = get_conn()
     try:
@@ -294,75 +246,73 @@ def _finish_order(order_id: int, status: str, link_note: Optional[str] = None):
     finally:
         put_conn(conn)
 
-def _deliver_alias(request: Request) -> bool:
-    # true إذا endpoint ينتهي بـ deliver
-    return str(request.url.path).endswith("/deliver")
-
-async def _itunes_action(order_id: Optional[int], request: Request):
-    p = await _read_payload(request)
-    code = _pick_text(p, "gift_code", "code", "card", "voucher", "pin")
-    if _deliver_alias(request):
-        _finish_order(order_id, "Done", f"gift:{code or ''}")
-    else:
-        _finish_order(order_id, "Rejected")
-
-async def _simple_action(order_id: Optional[int], request: Request):
-    if _deliver_alias(request):
-        _finish_order(order_id, "Done")
-    else:
-        _finish_order(order_id, "Rejected")
-
-# paths مع {order_id}
 @router.post("/pending/itunes/{order_id}/deliver")
+async def itunes_deliver(order_id: int, request: Request, token: str = Depends(_token)):
+    _require_admin(token)
+    code = _pick_text(await _read_payload(request), "gift_code", "code", "card", "voucher", "pin") or ""
+    _finish_order(order_id, "Done", f"gift:{code}")
+    return {"ok": True}
+
 @router.post("/pending/itunes/{order_id}/reject")
-async def itunes_path(order_id: int, request: Request, token: str = Depends(_token)):
-    _require_admin(token); await _itunes_action(order_id, request); return {"ok": True}
+def itunes_reject(order_id: int, token: str = Depends(_token)):
+    _require_admin(token); _finish_order(order_id, "Rejected"); return {"ok": True}
 
 @router.post("/pending/pubg/{order_id}/deliver")
+def pubg_deliver(order_id: int, token: str = Depends(_token)):
+    _require_admin(token); _finish_order(order_id, "Done"); return {"ok": True}
+
 @router.post("/pending/pubg/{order_id}/reject")
-async def pubg_path(order_id: int, request: Request, token: str = Depends(_token)):
-    _require_admin(token); await _simple_action(order_id, request); return {"ok": True}
+def pubg_reject(order_id: int, token: str = Depends(_token)):
+    _require_admin(token); _finish_order(order_id, "Rejected"); return {"ok": True}
 
 @router.post("/pending/ludo/{order_id}/deliver")
+def ludo_deliver(order_id: int, token: str = Depends(_token)):
+    _require_admin(token); _finish_order(order_id, "Done"); return {"ok": True}
+
 @router.post("/pending/ludo/{order_id}/reject")
-async def ludo_path(order_id: int, request: Request, token: str = Depends(_token)):
-    _require_admin(token); await _simple_action(order_id, request); return {"ok": True}
+def ludo_reject(order_id: int, token: str = Depends(_token)):
+    _require_admin(token); _finish_order(order_id, "Rejected"); return {"ok": True}
 
-# legacy بدون {id} في الـPath — نقرأ order_id من الجسم/الاستعلام
-@router.post("/pending/itunes/deliver")
-@router.post("/pending/itunes/reject")
-async def itunes_legacy(request: Request, token: str = Depends(_token),
-                        order_id_q: Optional[int] = Query(None, alias="order_id")):
+# ========== Users: add/deduct + stats ==========
+@router.post("/users/{uid}/topup")
+async def user_topup(uid: str, request: Request, token: str = Depends(_token)):
     _require_admin(token)
-    p = await _read_payload(request)
-    oid = order_id_q or _pick_id(p, "order_id", "id")
-    if oid is None: raise HTTPException(422, "order_id required")
-    await _itunes_action(oid, request)
-    return {"ok": True}
+    amount = _pick_amount(await _read_payload(request), "amount", "value", "qty", "quantity")
+    if amount <= 0: raise HTTPException(422, "amount required")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r: raise HTTPException(404, "user not found")
+            user_id = r[0]
+            cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (amount, user_id))
+            cur.execute("""INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                           VALUES(%s,%s,%s,%s)""", (user_id, amount, "admin_topup", Json({})))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
 
-@router.post("/pending/pubg/deliver")
-@router.post("/pending/pubg/reject")
-async def pubg_legacy(request: Request, token: str = Depends(_token),
-                      order_id_q: Optional[int] = Query(None, alias="order_id")):
+@router.post("/users/{uid}/deduct")
+async def user_deduct(uid: str, request: Request, token: str = Depends(_token)):
     _require_admin(token)
-    p = await _read_payload(request)
-    oid = order_id_q or _pick_id(p, "order_id", "id")
-    if oid is None: raise HTTPException(422, "order_id required")
-    await _simple_action(oid, request)
-    return {"ok": True}
+    amount = _pick_amount(await _read_payload(request), "amount", "value", "qty", "quantity")
+    if amount <= 0: raise HTTPException(422, "amount required")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id, balance FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r: raise HTTPException(404, "user not found")
+            if float(r[1]) < amount: raise HTTPException(400, "insufficient balance")
+            user_id = r[0]
+            cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (amount, user_id))
+            cur.execute("""INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                           VALUES(%s,%s,%s,%s)""", (user_id, -amount, "admin_deduct", Json({})))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
 
-@router.post("/pending/ludo/deliver")
-@router.post("/pending/ludo/reject")
-async def ludo_legacy(request: Request, token: str = Depends(_token),
-                      order_id_q: Optional[int] = Query(None, alias="order_id")):
-    _require_admin(token)
-    p = await _read_payload(request)
-    oid = order_id_q or _pick_id(p, "order_id", "id")
-    if oid is None: raise HTTPException(422, "order_id required")
-    await _simple_action(oid, request)
-    return {"ok": True}
-
-# ================== Users / Stats ==================
 @router.get("/users/count")
 def users_count(token: str = Depends(_token)):
     _require_admin(token)
@@ -387,7 +337,7 @@ def users_balances(token: str = Depends(_token)):
     finally:
         put_conn(conn)
 
-# ================== Provider balance (اختياري) ==================
+# ========== Provider balance ==========
 @router.get("/provider/balance")
 def provider_balance(token: str = Depends(_token)):
     _require_admin(token)
@@ -399,8 +349,10 @@ def provider_balance(token: str = Depends(_token)):
         bal = None
         for k in ("balance","funds","data","result"):
             if k in js:
-                try: bal = float(js[k]); break
-                except Exception: pass
+                try:
+                    bal = float(js[k]); break
+                except Exception:
+                    pass
         return {"balance": bal}
     except Exception:
         return {"balance": None}
