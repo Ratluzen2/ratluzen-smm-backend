@@ -6,6 +6,7 @@ from ..db import get_conn, put_conn
 
 router = APIRouter(prefix="/api", tags=["public"])
 
+# ===== Users =====
 class UpsertUserIn(BaseModel):
     uid: str
 
@@ -35,6 +36,31 @@ def wallet_balance(uid: str):
     finally:
         put_conn(conn)
 
+class AsiacellCardIn(BaseModel):
+    uid: str
+    card: str
+
+@router.post("/wallet/asiacell/submit")
+def submit_card(body: AsiacellCardIn):
+    digits = "".join([c for c in body.card if c.isdigit()])
+    if len(digits) not in (14, 16):
+        raise HTTPException(422, "invalid card")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (body.uid,))
+            u = cur.fetchone()
+            if not u: raise HTTPException(404, "user not found")
+            cur.execute("""
+                INSERT INTO public.asiacell_cards(user_id, card_number, status)
+                VALUES(%s,%s,'Pending') RETURNING id
+            """, (u[0], digits))
+            cid = cur.fetchone()[0]
+        return {"ok": True, "card_id": cid}
+    finally:
+        put_conn(conn)
+
+# ===== Orders =====
 class ProviderOrderIn(BaseModel):
     uid: str
     service_id: int
@@ -110,7 +136,6 @@ def _orders_for_uid(uid: str) -> List[dict]:
     finally:
         put_conn(conn)
 
-# تُعيد مصفوفة:
 @router.get("/orders/my")
 def my_orders(uid: str):
     return _orders_for_uid(uid)
@@ -126,12 +151,3 @@ def user_orders_alias(uid: str):
 @router.get("/users/{uid}/orders")
 def user_orders_path(uid: str):
     return _orders_for_uid(uid)
-
-# بدائل تُعيد {"orders": []} لبعض الواجهات:
-@router.get("/orders/list")
-def orders_list(uid: str):
-    return {"orders": _orders_for_uid(uid)}
-
-@router.get("/user/orders/list")
-def user_orders_list(uid: str):
-    return {"orders": _orders_for_uid(uid)}
