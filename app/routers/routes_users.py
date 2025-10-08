@@ -1,16 +1,19 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+from typing import List
 from ..db import get_conn, put_conn
 
 router = APIRouter(prefix="/api", tags=["public"])
 
+# ---------- Users ----------
 class UpsertUserIn(BaseModel):
     uid: str
 
 @router.post("/users/upsert")
 def upsert_user(body: UpsertUserIn):
     uid = body.uid.strip()
-    if not uid: raise HTTPException(422, "uid required")
+    if not uid:
+        raise HTTPException(422, "uid required")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -18,7 +21,8 @@ def upsert_user(body: UpsertUserIn):
             if not cur.fetchone():
                 cur.execute("INSERT INTO public.users(uid) VALUES(%s)", (uid,))
         return {"ok": True, "uid": uid}
-    finally: put_conn(conn)
+    finally:
+        put_conn(conn)
 
 @router.get("/wallet/balance")
 def wallet_balance(uid: str):
@@ -28,29 +32,10 @@ def wallet_balance(uid: str):
             cur.execute("SELECT balance FROM public.users WHERE uid=%s", (uid,))
             r = cur.fetchone()
         return {"ok": True, "balance": float(r[0] if r else 0.0)}
-    finally: put_conn(conn)
+    finally:
+        put_conn(conn)
 
-class AsiacellCardIn(BaseModel):
-    uid: str
-    card: str
-
-@router.post("/wallet/asiacell/submit")
-def submit_card(body: AsiacellCardIn):
-    if not body.card or len(body.card) not in (14,16): raise HTTPException(422, "invalid card")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT id FROM public.users WHERE uid=%s", (body.uid,))
-            u = cur.fetchone()
-            if not u: raise HTTPException(404, "user not found")
-            cur.execute("""
-                INSERT INTO public.asiacell_cards(user_id, card_number, status)
-                VALUES(%s,%s,'Pending') RETURNING id
-            """, (u[0], body.card))
-            cid = cur.fetchone()[0]
-        return {"ok": True, "card_id": cid}
-    finally: put_conn(conn)
-
+# ---------- Orders ----------
 class ProviderOrderIn(BaseModel):
     uid: str
     service_id: int
@@ -72,7 +57,7 @@ def create_provider_order(body: ProviderOrderIn):
             cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (body.price, user_id))
             cur.execute("""
                 INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
-                VALUES(%s, %s, %s, %s)
+                VALUES(%s,%s,%s,%s)
             """, (user_id, -body.price, "order_charge",
                   {"service_id": body.service_id, "name": body.service_name, "qty": body.quantity}))
             cur.execute("""
@@ -81,7 +66,8 @@ def create_provider_order(body: ProviderOrderIn):
             """, (user_id, body.service_name, body.service_id, body.link, body.quantity, body.price))
             oid = cur.fetchone()[0]
         return {"ok": True, "order_id": oid}
-    finally: put_conn(conn)
+    finally:
+        put_conn(conn)
 
 class ManualOrderIn(BaseModel):
     uid: str
@@ -101,23 +87,19 @@ def create_manual_order(body: ManualOrderIn):
             """, (r[0], body.title))
             oid = cur.fetchone()[0]
         return {"ok": True, "order_id": oid}
-    finally: put_conn(conn)
+    finally:
+        put_conn(conn)
 
-@router.get("/orders/my")
-def my_orders(uid: str):
+def _orders_for_uid(uid: str) -> List[dict]:
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
             r = cur.fetchone()
             if not r: return []
+            user_id = r[0]
             cur.execute("""
                 SELECT id, title, quantity, price, status, EXTRACT(EPOCH FROM created_at)*1000
                 FROM public.orders WHERE user_id=%s ORDER BY id DESC
-            """, (r[0],))
-            rows = cur.fetchall()
-        return [
-            {"id": a, "title": b, "quantity": c, "price": float(d), "status": e, "created_at": int(f)}
-            for (a,b,c,d,e,f) in rows
-        ]
-    finally: put_conn(conn)
+            """, (user_id,))
+            rows = cur.fetchall
