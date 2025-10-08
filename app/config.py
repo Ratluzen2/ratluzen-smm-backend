@@ -1,25 +1,22 @@
-from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import BaseSettings, AnyHttpUrl
+from typing import Optional
+import os
 
 class Settings(BaseSettings):
-    APP_NAME: str = "ratluzen-smm-backend"
-    DEBUG: bool = False
+    APP_NAME: str = "SMM Backend"
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "CHANGE_ME_SECRET")
+    OWNER_PIN: str = os.getenv("OWNER_PIN", "2000")
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
 
-    # قاعدة البيانات (Neon / Postgres)
-    DATABASE_URL: str
+    # Database (Postgres on Heroku via DATABASE_URL; fallback to local SQLite)
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./smm_backend.db")
 
-    # كلمة مرور المالك (تطابق ما في التطبيق: 2000)
-    ADMIN_PASSWORD: str = Field(default="2000", alias="ADMIN_PASS")
+    # SMM Panel configuration
+    SMM_API_URL: str = os.getenv("SMM_API_URL", "https://kd1s.com/apikd1s")  # Typical SMM API endpoint
+    SMM_API_KEY: str = os.getenv("SMM_API_KEY", "REPLACE_WITH_REAL_KEY")
 
-    # مفاتيح مزود KD1S
-    KD1S_API_KEY: str | None = None
-    KD1S_API_URL: str = "https://kd1s.com/api/v2"
-
-    # اختيارية: مفاتيح FCM إن أردت إرسال إشعارات Push من الباكند
-    FCM_SERVER_KEY: str | None = None
-
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
+    # Support links (shown inside the app via /config)
+    SUPPORT_TELEGRAM_URL: Optional[str] = os.getenv("SUPPORT_TELEGRAM_URL", "https://t.me/your_support")
+    SUPPORT_WHATSAPP_URL: Optional[str] = os.getenv("SUPPORT_WHATSAPP_URL", "https://wa.me/1234567890")
 
 settings = Settings()
