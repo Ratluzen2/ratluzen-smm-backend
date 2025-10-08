@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, Header, Query, HTTPException, Request
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from psycopg2.extras import Json
 import base64
 
@@ -20,7 +20,7 @@ def _extract_bearer(auth: Optional[str]) -> Optional[str]:
             return raw.split(":", 1)[1] if ":" in raw else raw
         except Exception:
             return None
-    return auth  # أحياناً يُرسل التوكن مباشرة
+    return auth
 
 def _token(
     x_admin_pass: Optional[str] = Header(None, alias="x-admin-pass", convert_underscores=False),
@@ -57,48 +57,62 @@ async def _read_payload(request: Request) -> Dict[str, Any]:
     except Exception:
         return {}
 
-# --------- Pending services (الخدمات) ---------
+def _row_to_admin_item(row) -> Dict[str, Any]:
+    # id, title, quantity, price, link/payload, status, created_ms
+    return {
+        "id": row[0],
+        "title": row[1],
+        "quantity": row[2],
+        "price": float(row[3] or 0),
+        "payload": row[4] or "",
+        "status": row[5],
+        "created_at": int(row[6]),
+    }
+
+def _fetch_pending_where(where_sql: str, params: tuple) -> List[Dict[str, Any]]:
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT id, title, COALESCE(quantity,0), COALESCE(price,0), link, status,
+                       EXTRACT(EPOCH FROM created_at)*1000
+                FROM public.orders
+                WHERE status='Pending' AND {where_sql}
+                ORDER BY id DESC
+            """, params)
+            return [_row_to_admin_item(r) for r in cur.fetchall()]
+    finally:
+        put_conn(conn)
+
+# --------- Pending (aliases المطلوبة من التطبيق) ---------
+@router.get("/pending/cards")
+def pending_cards(token: str = Depends(_token)):
+    _require_admin(token)
+    # بطاقات/كروت (نستخدم title LIKE إذا لم توجد جداول متخصصة)
+    return _fetch_pending_where("LOWER(title) LIKE %s", ("%card%",))
+
+@router.get("/pending/itunes")
+def pending_itunes(token: str = Depends(_token)):
+    _require_admin(token)
+    return _fetch_pending_where("LOWER(title) LIKE %s", ("%itunes%",))
+
+@router.get("/pending/pubg")
+def pending_pubg(token: str = Depends(_token)):
+    _require_admin(token)
+    return _fetch_pending_where("LOWER(title) LIKE %s", ("%pubg%",))
+
+@router.get("/pending/ludo")
+def pending_ludo(token: str = Depends(_token)):
+    _require_admin(token)
+    return _fetch_pending_where("LOWER(title) LIKE %s", ("%ludo%",))
+
+# نسخة أوسع تُعيد كل الخدمات المعلّقة (للواجهات الجديدة)
 @router.get("/pending/services")
 def pending_services(token: str = Depends(_token)):
     _require_admin(token)
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, title, quantity, price, link, status, EXTRACT(EPOCH FROM created_at)*1000
-                FROM public.orders
-                WHERE status='Pending' AND service_id IS NOT NULL
-                ORDER BY id DESC
-            """)
-            rows = cur.fetchall()
-            return [
-                {"id": r[0], "title": r[1], "quantity": r[2], "price": float(r[3]),
-                 "payload": r[4] or "", "status": r[5], "created_at": int(r[6])}
-                for r in rows
-            ]
-    finally:
-        put_conn(conn)
+    return _fetch_pending_where("service_id IS NOT NULL", tuple())
 
-# --------- Pending topups (كروت/إيداعات) ---------
-@router.get("/pending/topups")
-def pending_topups(token: str = Depends(_token)):
-    _require_admin(token)
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT c.id, u.uid, c.card_number, EXTRACT(EPOCH FROM c.created_at)*1000
-                FROM public.asiacell_cards c JOIN public.users u ON u.id=c.user_id
-                WHERE c.status='Pending' ORDER BY c.id DESC
-            """)
-            rows = cur.fetchall()
-            return [{
-                "id": r[0], "title": "كارت أسيا سيل", "quantity": 0, "price": 0.0,
-                "payload": f"UID={r[1]} CARD={r[2]}", "status": "Pending", "created_at": int(r[3])
-            } for r in rows]
-    finally:
-        put_conn(conn)
-
+# --------- Topups (مثال قبول/رفض كارت) ---------
 @router.post("/pending/topups/accept")
 async def topup_accept(request: Request, token: str = Depends(_token)):
     _require_admin(token)
@@ -139,15 +153,13 @@ async def topup_reject(request: Request, token: str = Depends(_token)):
         put_conn(conn)
 
 # --------- Wallet ops (إضافة/خصم) ---------
-@router.post("/wallet/topup")
-@router.post("/wallet/add")     # aliases
+@router.post("/wallet/add")
 async def admin_topup(request: Request, token: str = Depends(_token),
                       uid: Optional[str] = Query(None), amount: Optional[float] = Query(None)):
     _require_admin(token)
     if uid is None or amount is None:
         p = await _read_payload(request)
         uid = uid or p.get("uid"); amount = amount or float(p.get("amount"))
-
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -164,14 +176,12 @@ async def admin_topup(request: Request, token: str = Depends(_token),
         put_conn(conn)
 
 @router.post("/wallet/deduct")
-@router.post("/wallet/remove")  # aliases
 async def admin_deduct(request: Request, token: str = Depends(_token),
                        uid: Optional[str] = Query(None), amount: Optional[float] = Query(None)):
     _require_admin(token)
     if uid is None or amount is None:
         p = await _read_payload(request)
         uid = uid or p.get("uid"); amount = amount or float(p.get("amount"))
-
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
