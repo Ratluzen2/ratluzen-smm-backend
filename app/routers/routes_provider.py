@@ -36,10 +36,8 @@ def _fetch_services():
         return []
     try:
         res = _post_form(SMM_API_URL, {"key": SMM_API_KEY, "action": "services"}, timeout=30)
-        # KD1S يعيد قائمة خدمات مباشرة — نرجعها كما هي
         if isinstance(res, list):
             return res
-        # حالات نادرة: يعيد dict فيه 'services'
         return list(res.get("services", []))
     except Exception:
         return []
@@ -50,10 +48,8 @@ def list_services():
     if now - _SERVICES_CACHE["ts"] > _TTL or not _SERVICES_CACHE["data"]:
         _SERVICES_CACHE["data"] = _fetch_services()
         _SERVICES_CACHE["ts"] = now
-    # مهم: التطبيق يتوقع مصفوفة، لذا نرجّع [] عند الفشل بدل رسالة خطأ
     return _SERVICES_CACHE["data"]
 
-# (اختياري) تفريغ الكاش يدويًا
 @router.get("/services/refresh")
 def refresh_services():
     _SERVICES_CACHE["data"] = _fetch_services()
