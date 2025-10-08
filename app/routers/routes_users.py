@@ -13,8 +13,7 @@ class UpsertUserIn(BaseModel):
 @router.post("/users/upsert")
 def upsert_user(body: UpsertUserIn):
     uid = body.uid.strip()
-    if not uid:
-        raise HTTPException(422, "uid required")
+    if not uid: raise HTTPException(422, "uid required")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -43,8 +42,7 @@ class AsiacellCardIn(BaseModel):
 @router.post("/wallet/asiacell/submit")
 def submit_card(body: AsiacellCardIn):
     digits = "".join([c for c in body.card if c.isdigit()])
-    if len(digits) not in (14, 16):
-        raise HTTPException(422, "invalid card")
+    if len(digits) not in (14, 16): raise HTTPException(422, "invalid card")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -137,17 +135,13 @@ def _orders_for_uid(uid: str) -> List[dict]:
         put_conn(conn)
 
 @router.get("/orders/my")
-def my_orders(uid: str):
-    return _orders_for_uid(uid)
+def my_orders(uid: str): return _orders_for_uid(uid)
 
 @router.get("/orders")
-def orders_alias(uid: str):
-    return _orders_for_uid(uid)
+def orders_alias(uid: str): return _orders_for_uid(uid)
 
 @router.get("/user/orders")
-def user_orders_alias(uid: str):
-    return _orders_for_uid(uid)
+def user_orders_alias(uid: str): return _orders_for_uid(uid)
 
 @router.get("/users/{uid}/orders")
-def user_orders_path(uid: str):
-    return _orders_for_uid(uid)
+def user_orders_path(uid: str): return _orders_for_uid(uid)
