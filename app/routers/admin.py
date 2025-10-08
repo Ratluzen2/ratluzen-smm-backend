@@ -1,166 +1,76 @@
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Body, Query
 from sqlalchemy.orm import Session
-from ..database import get_db
+from typing import Optional
+from datetime import datetime
+
 from ..config import settings
-from ..models import Order, CardSubmission, ItunesOrder, PubgOrder, LudoOrder, User
-from ..providers.smm_client import SMMClient
+from ..database import get_db
+from ..models import User, ServiceOrder, WalletCard, ItunesOrder, PhoneTopup, PubgOrder, LudoOrder, Notice
+from ..providers.kd1s_client import provider_add_order, provider_balance, provider_status
 
-router = APIRouter(prefix="/api/admin", tags=["admin"])
+r = APIRouter()
 
-def admin_guard(x_admin_pass: str = Header(None, convert_underscores=False)):
-    if not x_admin_pass or x_admin_pass != settings.ADMIN_PASS:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    return True
+# -------- Helpers ----------
+def _row(obj):
+    out = {}
+    for c in obj.__table__.columns:
+        v = getattr(obj, c.name)
+        out[c.name] = v.isoformat() if isinstance(v, datetime) else v
+    return out
 
-# ---- قوائم المعلّق ----
-@router.get("/pending/services")
-def pending_services(_: bool = Depends(admin_guard), db: Session = Depends(get_db)):
-    q = db.query(Order).filter(Order.kind=="provider", Order.status=="Pending").all()
+def _guard(x_admin_pass: Optional[str] = Header(default=None, alias="x-admin-pass")):
+    pwd = (x_admin_pass or "").strip()
+    if pwd != settings.ADMIN_PASSWORD:
+        raise HTTPException(401, "unauthorized")
+
+# ---------- فحص سريع لكلمة المرور ----------
+@r.get("/admin/check", dependencies=[Depends(_guard)])
+def admin_check():
+    return {"ok": True}
+
+# ---------- الخدمات المعلّقة ----------
+@r.get("/admin/pending/services", dependencies=[Depends(_guard)])
+def pending_services(db: Session = Depends(get_db)):
+    lst = (
+        db.query(ServiceOrder)
+        .filter_by(status="pending")
+        .order_by(ServiceOrder.created_at.desc())
+        .all()
+    )
+    # يعيد {"list":[...]} ليتوافق مع التطبيق
     return {"list": [
-        {"id": o.id, "uid": o.uid, "quantity": o.quantity, "price": o.price,
-         "service_key": o.title, "link": o.payload}
-        for o in q
+        {
+            "id": o.id,
+            "uid": o.uid,
+            "service_key": o.service_key,
+            "service_code": o.service_code,
+            "link": o.link,
+            "quantity": o.quantity,
+            "price": o.price,
+            "status": o.status
+        } for o in lst
     ]}
 
-@router.post("/pending/services/{oid}/approve")
-def approve_service(oid: str, _: bool = Depends(admin_guard), db: Session = Depends(get_db)):
-    o = db.get(Order, oid)
-    if not o: raise HTTPException(404, "not found")
-    o.status = "Processing"   # أو Done حسب رغبتك
-    db.commit()
-    return {"ok": True}
+# (نسخة بديلة متوافقة مع بعض إصدارات التطبيق)
+@r.post("/admin/orders/approve", dependencies=[Depends(_guard)])
+def approve_service_compat(order_id: int = Body(..., embed=True), db: Session = Depends(get_db)):
+    return approve_service(order_id, db)
 
-@router.post("/pending/services/{oid}/reject")
-def reject_service(oid: str, _: bool = Depends(admin_guard), db: Session = Depends(get_db)):
-    o = db.get(Order, oid)
-    if not o: raise HTTPException(404, "not found")
-    o.status = "Rejected"
-    db.commit()
-    return {"ok": True}
+@r.post("/admin/orders/reject", dependencies=[Depends(_guard)])
+def reject_service_compat(order_id: int = Body(..., embed=True), db: Session = Depends(get_db)):
+    return reject_service(order_id, db)
 
-@router.get("/pending/cards")
-def pending_cards(_: bool = Depends(admin_guard), db: Session = Depends(get_db)):
-    q = db.query(CardSubmission).filter(CardSubmission.status=="Pending").all()
-    return {"list": [{"id": c.id, "uid": c.uid, "card_number": c.card_number} for c in q]}
+@r.post("/admin/orders/refund", dependencies=[Depends(_guard)])
+def refund_service_compat(order_id: int = Body(..., embed=True), db: Session = Depends(get_db)):
+    return refund_service(order_id, db)
 
-@router.post("/pending/cards/{cid}/accept")
-def accept_card(cid: int, payload: dict, _: bool = Depends(admin_guard), db: Session = Depends(get_db)):
-    c = db.get(CardSubmission, cid)
-    if not c: raise HTTPException(404, "not found")
-    c.status = "Accepted"
-    amount = float(payload.get("amount_usd", 0))
-    u = db.query(User).filter(User.uid==c.uid).first()
-    if u:
-        u.balance = (u.balance or 0.0) + amount
-    db.commit()
-    return {"ok": True}
+@r.post("/admin/pending/services/{order_id}/approve", dependencies=[Depends(_guard)])
+def approve_service(order_id: int, db: Session = Depends(get_db)):
+    o = db.get(ServiceOrder, order_id)
+    if not o or o.status != "pending":
+        raise HTTPException(404, "order not found or not pending")
 
-@router.post("/pending/cards/{cid}/reject")
-def reject_card(cid: int, _: bool = Depends(admin_guard), db: Session = Depends(get_db)):
-    c = db.get(CardSubmission, cid)
-    if not c: raise HTTPException(404, "not found")
-    c.status = "Rejected"
-    db.commit()
-    return {"ok": True}
-
-@router.get("/pending/itunes")
-def pending_itunes(_: bool = Depends(admin_guard), db: Session = Depends(get_db)):
-    q = db.query(ItunesOrder).filter(ItunesOrder.status=="Pending").all()
-    return {"list": [{"id": i.id, "uid": i.uid, "amount": i.amount} for i in q]}
-
-@router.post("/pending/itunes/{iid}/deliver")
-def deliver_itunes(iid: int, payload: dict, _: bool = Depends(admin_guard), db: Session = Depends(get_db)):
-    i = db.get(ItunesOrder, iid)
-    if not i: raise HTTPException(404, "not found")
-    i.gift_code = str(payload.get("gift_code", "")).strip()
-    i.status = "Done"
-    db.commit()
-    return {"ok": True}
-
-@router.post("/pending/itunes/{iid}/reject")
-def reject_itunes(iid: int, _: bool = Depends(admin_guard), db: Session = Depends(get_db)):
-    i = db.get(ItunesOrder, iid)
-    if not i: raise HTTPException(404, "not found")
-    i.status = "Rejected"
-    db.commit()
-    return {"ok": True}
-
-@router.get("/pending/pubg")
-def pending_pubg(_: bool = Depends(admin_guard), db: Session = Depends(get_db)):
-    q = db.query(PubgOrder).filter(PubgOrder.status=="Pending").all()
-    return {"list": [{"id": p.id, "uid": p.uid, "pkg": p.pkg, "pubg_id": p.pubg_id} for p in q]}
-
-@router.post("/pending/pubg/{pid}/deliver")
-def deliver_pubg(pid: int, _: bool = Depends(admin_guard), db: Session = Depends(get_db)):
-    p = db.get(PubgOrder, pid)
-    if not p: raise HTTPException(404, "not found")
-    p.status = "Done"
-    db.commit()
-    return {"ok": True}
-
-@router.post("/pending/pubg/{pid}/reject")
-def reject_pubg(pid: int, _: bool = Depends(admin_guard), db: Session = Depends(get_db)):
-    p = db.get(PubgOrder, pid)
-    if not p: raise HTTPException(404, "not found")
-    p.status = "Rejected"
-    db.commit()
-    return {"ok": True}
-
-@router.get("/pending/ludo")
-def pending_ludo(_: bool = Depends(admin_guard), db: Session = Depends(get_db)):
-    q = db.query(LudoOrder).filter(LudoOrder.status=="Pending").all()
-    return {"list": [{"id": l.id, "uid": l.uid, "kind": l.kind, "pack": l.pack, "ludo_id": l.ludo_id} for l in q]}
-
-@router.post("/pending/ludo/{lid}/deliver")
-def deliver_ludo(lid: int, _: bool = Depends(admin_guard), db: Session = Depends(get_db)):
-    l = db.get(LudoOrder, lid)
-    if not l: raise HTTPException(404, "not found")
-    l.status = "Done"
-    db.commit()
-    return {"ok": True}
-
-@router.post("/pending/ludo/{lid}/reject")
-def reject_ludo(lid: int, _: bool = Depends(admin_guard), db: Session = Depends(get_db)):
-    l = db.get(LudoOrder, lid)
-    if not l: raise HTTPException(404, "not found")
-    l.status = "Rejected"
-    db.commit()
-    return {"ok": True}
-
-# ---- المستخدمون: عدد/أرصدة + شحن/خصم ----
-@router.get("/users/count")
-def users_count(_: bool = Depends(admin_guard), db: Session = Depends(get_db)):
-    return {"count": db.query(User).count()}
-
-@router.get("/users/balances")
-def users_balances(_: bool = Depends(admin_guard), db: Session = Depends(get_db)):
-    users = db.query(User).all()
-    return {"list": [{"uid": u.uid, "balance": u.balance or 0.0, "is_banned": bool(u.is_banned)} for u in users]}
-
-@router.post("/users/{uid}/topup")
-def users_topup(uid: str, payload: dict, _: bool = Depends(admin_guard), db: Session = Depends(get_db)):
-    u = db.query(User).filter(User.uid == uid).first()
-    if not u: raise HTTPException(404, "not found")
-    amt = float(payload.get("amount", 0))
-    u.balance = (u.balance or 0.0) + amt
-    db.commit()
-    return {"ok": True, "balance": u.balance}
-
-@router.post("/users/{uid}/deduct")
-def users_deduct(uid: str, payload: dict, _: bool = Depends(admin_guard), db: Session = Depends(get_db)):
-    u = db.query(User).filter(User.uid == uid).first()
-    if not u: raise HTTPException(404, "not found")
-    amt = float(payload.get("amount", 0))
-    u.balance = (u.balance or 0.0) - amt
-    db.commit()
-    return {"ok": True, "balance": u.balance}
-
-@router.get("/provider/balance")
-async def provider_balance(_: bool = Depends(admin_guard)):
-    try:
-        res = await SMMClient().balance()
-        # كثير من لوحات SMM ترجع {"balance":"123.45","currency":"USD"}
-        bal = float(res.get("balance", 0))
-    except Exception:
-        bal = 0.0
-    return {"balance": bal}
+    # إرسال فعلي إلى KD1S
+    send = provider_add_order(o.service_code, o.link, o.quantity)
+    if not send.get("ok"):
+        raise HTTPException(502,
