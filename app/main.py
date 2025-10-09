@@ -503,7 +503,14 @@ def admin_pending_pubg(x_admin_password: str = Header(..., alias="x-admin-passwo
                        o.link, u.uid
                 FROM public.orders o
                 JOIN public.users u ON u.id = o.user_id
-                WHERE o.status='Pending' AND LOWER(o.title) LIKE '%pubg%'
+                WHERE o.status='Pending' AND (
+                LOWER(o.title) LIKE '%pubg%' OR
+                LOWER(o.title) LIKE '%bgmi%' OR
+                LOWER(o.title) LIKE '%uc%' OR
+                o.title LIKE '%شدات%' OR
+                o.title LIKE '%بيجي%' OR
+                o.title LIKE '%ببجي%'
+            )
                 ORDER BY o.id DESC
             """)
             rows = cur.fetchall()
@@ -528,7 +535,12 @@ def admin_pending_ludo(x_admin_password: str = Header(..., alias="x-admin-passwo
                        o.link, u.uid
                 FROM public.orders o
                 JOIN public.users u ON u.id = o.user_id
-                WHERE o.status='Pending' AND LOWER(o.title) LIKE '%ludo%'
+                WHERE o.status='Pending' AND (
+                LOWER(o.title) LIKE '%ludo%' OR
+                LOWER(o.title) LIKE '%yalla%' OR
+                o.title LIKE '%يلا لودو%' OR
+                o.title LIKE '%لودو%'
+            )
                 ORDER BY o.id DESC
             """)
             rows = cur.fetchall()
@@ -543,13 +555,53 @@ def admin_pending_ludo(x_admin_password: str = Header(..., alias="x-admin-passwo
 
 # --------- الكروت المعلّقة (أسيا سيل) ---------
 @app.get("/api/admin/pending/cards")
+
+@app.get("/api/admin/pending/balances")
+def admin_pending_balances(x_admin_password: str = Header(..., alias="x-admin-password")):
+    """
+    يعرض طلبات *رصيد الهاتف* المعلّقة، ويستبعد أي طلبات iTunes بشكل صريح.
+    يعتمد على `type` إن وُجد، وإلا يتحقق من العنوان النصّي.
+    """
+    _require_admin(x_admin_password)
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(r"""
+                SELECT o.id, o.title, o.quantity, o.price, o.status,
+                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
+                       o.link, u.uid
+                FROM public.orders o
+                JOIN public.users u ON u.id = o.user_id
+                WHERE o.status='Pending'
+                  AND (
+                        o.type IN ('mobile_balance','topup_card') OR
+                        LOWER(o.title) LIKE '%رصيد%' OR
+                        LOWER(o.title) LIKE '%topup%' OR
+                        LOWER(o.title) LIKE '%mobile balance%' OR
+                        o.title LIKE '%شحن رصيد%'
+                  )
+                  AND NOT (
+                        LOWER(o.title) LIKE '%itunes%' OR
+                        o.title LIKE '%ايتونز%'
+                  )
+                ORDER BY o.id DESC
+            """)
+            rows = cur.fetchall()
+        out = []
+        for (oid, title, qty, price, status, created_at, link, uid) in rows:
+            d = _row_to_order_dict((oid, title, qty, price, status, created_at, link))
+            d["uid"] = uid
+            out.append(d)
+        return out
+    finally:
+        put_conn(conn)
 def admin_pending_cards(x_admin_password: str = Header(..., alias="x-admin-password")):
     _require_admin(x_admin_password)
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             cur.execute("""
-                SELECT o.id, u.uid, (o.payload->>'card') AS card,
+                SELECT o.id, u.uid, COALESCE((o.payload->>'card'), '') AS card,
                        EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at
                 FROM public.orders o
                 JOIN public.users u ON u.id = o.user_id
@@ -689,7 +741,8 @@ async def admin_deliver_or_reject(oid: int, request: Request, x_admin_password: 
     """
     _require_admin(x_admin_password)
     data = await _coerce_json(request)
-    code_val = (data.get("code") or "").strip() if isinstance(data, dict) else ""
+    data = data if isinstance(data, dict) else {}
+    code_val = (data.get("code") or "").strip()
 
     conn = get_conn()
     try:
