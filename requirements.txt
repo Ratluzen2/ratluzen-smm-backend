@@ -4,3 +4,9 @@ psycopg2-binary==2.9.9
 pydantic==1.10.15
 python-multipart==0.0.9
 requests==2.32.3
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+httpx
+python-dotenv
