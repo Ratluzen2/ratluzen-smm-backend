@@ -27,8 +27,11 @@ PROVIDER_API_KEY = os.getenv("PROVIDER_API_KEY", "25a9ceb07be0d8b2ba88e70dcbe92e
 POOL_MIN, POOL_MAX = 1, int(os.getenv("DB_POOL_MAX", "5"))
 dbpool: pool.SimpleConnectionPool = pool.SimpleConnectionPool(POOL_MIN, POOL_MAX, dsn=DATABASE_URL)
 
-def get_conn(): return dbpool.getconn()
-def put_conn(conn): dbpool.putconn(conn)
+def get_conn() -> psycopg2.extensions.connection:
+    return dbpool.getconn()
+
+def put_conn(conn: psycopg2.extensions.connection) -> None:
+    dbpool.putconn(conn)
 
 # =========================
 # لوجينغ
@@ -81,9 +84,8 @@ def ensure_schema():
             CREATE INDEX IF NOT EXISTS idx_orders_user ON public.orders(user_id);
             CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders(status);
             """)
-            # ترقية: ضمان عمود type موجود وافتراضي
-            cur.execute("""ALTER TABLE public.orders
-                           ADD COLUMN IF NOT EXISTS type TEXT;""")
+            # ترقية: ضمان عمود type موجود وافتراضي وغير فارغ
+            cur.execute("""ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS type TEXT;""")
             cur.execute("""UPDATE public.orders SET type='provider' WHERE type IS NULL;""")
             cur.execute("""ALTER TABLE public.orders
                            ALTER COLUMN type SET DEFAULT 'provider',
@@ -98,7 +100,7 @@ ensure_schema()
 # =========================
 # FastAPI & CORS
 # =========================
-app = FastAPI(title="SMM Backend", version="1.3.0")
+app = FastAPI(title="SMM Backend", version="1.3.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -159,7 +161,8 @@ class AsiacellSubmitIn(BaseModel):
 def _ensure_user(cur, uid: str) -> int:
     cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
     r = cur.fetchone()
-    if r: return r[0]
+    if r:
+        return r[0]
     cur.execute("INSERT INTO public.users(uid) VALUES(%s) RETURNING id", (uid,))
     return cur.fetchone()[0]
 
@@ -192,7 +195,8 @@ async def _coerce_json(request: Request) -> Dict[str, Any]:
             form = await request.form()
             return {k: (v if isinstance(v, str) else str(v)) for k, v in form.items()}
         raw = (await request.body()).decode("utf-8", errors="ignore").strip()
-        if not raw: return {}
+        if not raw:
+            return {}
         try:
             return json.loads(raw)
         except Exception:
@@ -278,7 +282,7 @@ def create_provider_order(body: ProviderOrderIn):
     finally:
         put_conn(conn)
 
-# نقاط توافقية متعددة (ممكن أن التطبيق يرسل عليها)
+# نقاط توافقية متعددة (قد يرسل التطبيق عليها)
 PROVIDER_CREATE_PATHS = [
     "/api/orders/create", "/api/order/create",
     "/api/create/order",  "/api/orders/add",
@@ -313,7 +317,7 @@ for path in PROVIDER_CREATE_PATHS:
         finally:
             put_conn(conn)
 
-# طلب يدوي (إن رغبت)
+# طلب يدوي (اختياري)
 @app.post("/api/orders/create/manual")
 def create_manual_order(body: ManualOrderIn):
     conn = get_conn()
@@ -352,6 +356,7 @@ ASIACELL_PATHS = [
     "/api/topup/asiacell",
     "/api/asiacell",
 ]
+
 @app.post("/api/wallet/asiacell/submit")
 def submit_asiacell(body: AsiacellSubmitIn):
     digits = _extract_digits(body.card)
@@ -392,7 +397,8 @@ def _orders_for_uid(uid: str) -> List[dict]:
         with conn, conn.cursor() as cur:
             cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
             r = cur.fetchone()
-            if not r: return []
+            if not r:
+                return []
             user_id = r[0]
             cur.execute("""
                 SELECT id, title, quantity, price,
@@ -407,12 +413,28 @@ def _orders_for_uid(uid: str) -> List[dict]:
         put_conn(conn)
 
 @app.get("/api/orders/my")
-def my_orders(uid: str): return _orders_for_uid(uid)
-@app.get("/api/orders") def orders_alias(uid: str): return _orders_for_uid(uid)
-@app.get("/api/user/orders") def user_orders_alias(uid: str): return _orders_for_uid(uid)
-@app.get("/api/users/{uid}/orders") def user_orders_path(uid: str): return _orders_for_uid(uid)
-@app.get("/api/orders/list") def orders_list(uid: str): return {"orders": _orders_for_uid(uid)}
-@app.get("/api/user/orders/list") def user_orders_list(uid: str): return {"orders": _orders_for_uid(uid)}
+def my_orders(uid: str):
+    return _orders_for_uid(uid)
+
+@app.get("/api/orders")
+def orders_alias(uid: str):
+    return _orders_for_uid(uid)
+
+@app.get("/api/user/orders")
+def user_orders_alias(uid: str):
+    return _orders_for_uid(uid)
+
+@app.get("/api/users/{uid}/orders")
+def user_orders_path(uid: str):
+    return _orders_for_uid(uid)
+
+@app.get("/api/orders/list")
+def orders_list(uid: str):
+    return {"orders": _orders_for_uid(uid)}
+
+@app.get("/api/user/orders/list")
+def user_orders_list(uid: str):
+    return {"orders": _orders_for_uid(uid)}
 
 # =========================
 # واجهات الأدمن
@@ -496,7 +518,8 @@ def admin_approve_order(oid: int, x_admin_password: str = Header(..., alias="x-a
                 FROM public.orders WHERE id=%s FOR UPDATE
             """, (oid,))
             row = cur.fetchone()
-            if not row: raise HTTPException(404, "order not found")
+            if not row:
+                raise HTTPException(404, "order not found")
 
             (order_id, user_id, service_id, link, quantity, price, status, provider_order_id, title, payload, otype) = row
             price = float(price or 0)
@@ -504,7 +527,7 @@ def admin_approve_order(oid: int, x_admin_password: str = Header(..., alias="x-a
             if status not in ("Pending", "Processing"):
                 raise HTTPException(400, "invalid status")
 
-            # طلبات الكروت/اليدوية: فقط تحويل الحالة إلى Done (أو عالجها كما تريد)
+            # طلبات الكروت/اليدوية: نُتمّه مباشرة
             if otype in ("topup_card", "manual") or service_id is None:
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
                 return {"ok": True, "status": "Done"}
@@ -556,7 +579,8 @@ def admin_deliver_reject(oid: int, x_admin_password: str = Header(..., alias="x-
         with conn, conn.cursor() as cur:
             cur.execute("SELECT id, user_id, price, status FROM public.orders WHERE id=%s FOR UPDATE", (oid,))
             row = cur.fetchone()
-            if not row: raise HTTPException(404, "order not found")
+            if not row:
+                raise HTTPException(404, "order not found")
             order_id, user_id, price, status = row[0], row[1], float(row[2] or 0), row[3]
             if status in ("Done", "Rejected", "Refunded"):
                 return {"ok": True, "status": status}
@@ -570,13 +594,15 @@ def admin_deliver_reject(oid: int, x_admin_password: str = Header(..., alias="x-
 def admin_wallet_topup(body: WalletChangeIn, x_admin_password: str = Header(..., alias="x-admin-password")):
     _require_admin(x_admin_password)
     amount = float(body.amount)
-    if amount <= 0: raise HTTPException(422, "amount must be > 0")
+    if amount <= 0:
+        raise HTTPException(422, "amount must be > 0")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             cur.execute("SELECT id FROM public.users WHERE uid=%s", (body.uid,))
             r = cur.fetchone()
-            if not r: raise HTTPException(404, "user not found")
+            if not r:
+                raise HTTPException(404, "user not found")
             user_id = r[0]
             cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(amount), user_id))
             cur.execute("""
@@ -591,15 +617,18 @@ def admin_wallet_topup(body: WalletChangeIn, x_admin_password: str = Header(...,
 def admin_wallet_deduct(body: WalletChangeIn, x_admin_password: str = Header(..., alias="x-admin-password")):
     _require_admin(x_admin_password)
     amount = float(body.amount)
-    if amount <= 0: raise HTTPException(422, "amount must be > 0")
+    if amount <= 0:
+        raise HTTPException(422, "amount must be > 0")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             cur.execute("SELECT id, balance FROM public.users WHERE uid=%s", (body.uid,))
             r = cur.fetchone()
-            if not r: raise HTTPException(404, "user not found")
+            if not r:
+                raise HTTPException(404, "user not found")
             user_id, bal = r[0], float(r[1] or 0)
-            if bal < amount: raise HTTPException(400, "insufficient balance")
+            if bal < amount:
+                raise HTTPException(400, "insufficient balance")
             cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (Decimal(amount), user_id))
             cur.execute("""
                 INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
@@ -643,11 +672,14 @@ def admin_provider_balance(x_admin_password: str = Header(..., alias="x-admin-pa
         if resp.headers.get("content-type","").startswith("application/json"):
             data = resp.json()
             bal = data.get("balance") or (data.get("data") or {}).get("balance")
-            if bal is not None: return float(bal)
+            if bal is not None:
+                return float(bal)
         # fallback: نص
         txt = resp.text.strip()
-        try: return float(txt)
-        except Exception: raise HTTPException(502, "bad provider payload")
+        try:
+            return float(txt)
+        except Exception:
+            raise HTTPException(502, "bad provider payload")
     except HTTPException:
         raise
     except Exception:
