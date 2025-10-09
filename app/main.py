@@ -441,18 +441,55 @@ def user_orders_list(uid: str):
 # =========================
 @app.get("/api/admin/pending/services")
 def admin_pending_services(x_admin_password: str = Header(..., alias="x-admin-password")):
+    """
+    يعرض الطلبات المعلّقة التي لا تنتمي إلى:
+    PUBG / Ludo / شحن أسيا بالكارت (type='topup_card') / شراء الكارتات (أثير/أسيا/كورك) / iTunes.
+    """
     _require_admin(x_admin_password)
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            # نعيد جميع المعلّقات (التطبيق يرشّح بحسب النوع داخليًا)
-            cur.execute("""
+            cur.execute(r"""
                 SELECT o.id, o.title, o.quantity, o.price, o.status,
                        EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
                        o.link, u.uid
                 FROM public.orders o
                 JOIN public.users u ON u.id = o.user_id
                 WHERE o.status='Pending'
+                  -- استبعاد PUBG
+                  AND NOT (
+                        LOWER(o.title) LIKE '%pubg%' OR
+                        LOWER(o.title) LIKE '%bgmi%' OR
+                        LOWER(o.title) LIKE '%uc%' OR
+                        o.title LIKE '%شدات%' OR
+                        o.title LIKE '%بيجي%' OR
+                        o.title LIKE '%ببجي%'
+                  )
+                  -- استبعاد Ludo
+                  AND NOT (
+                        LOWER(o.title) LIKE '%ludo%' OR
+                        LOWER(o.title) LIKE '%yalla%' OR
+                        o.title LIKE '%يلا لودو%' OR
+                        o.title LIKE '%لودو%'
+                  )
+                  -- استبعاد شحن أسيا بالكارت عبر الـ type
+                  AND (o.type IS NULL OR o.type <> 'topup_card')
+                  -- استبعاد شراء الكارتات (تلخيص نفس شرط balances)
+                  AND NOT (
+                        (
+                          (LOWER(o.title) LIKE '%asiacell%' OR o.title LIKE '%أسيا%' OR o.title LIKE '%اسياسيل%' OR
+                           LOWER(o.title) LIKE '%korek%' OR o.title LIKE '%كورك%' OR o.title LIKE '%اثير%')
+                          AND
+                          (LOWER(o.title) LIKE '%voucher%' OR LOWER(o.title) LIKE '%code%' OR LOWER(o.title) LIKE '%card%' OR
+                           o.title LIKE '%رمز%' OR o.title LIKE '%كود%' OR o.title LIKE '%بطاقة%' OR o.title LIKE '%كارت%' OR o.title LIKE '%شراء%')
+                          AND NOT (
+                                LOWER(o.title) LIKE '%topup%' OR LOWER(o.title) LIKE '%top-up%' OR LOWER(o.title) LIKE '%recharge%' OR
+                                o.title LIKE '%شحن%' OR o.title LIKE '%شحن عبر%' OR o.title LIKE '%شحن اسيا%' OR LOWER(o.title) LIKE '%direct%'
+                          )
+                        )
+                  )
+                  -- استبعاد iTunes
+                  AND NOT (LOWER(o.title) LIKE '%itunes%' OR o.title LIKE '%ايتونز%')
                 ORDER BY o.id DESC
             """)
             rows = cur.fetchall()
@@ -576,8 +613,8 @@ def admin_pending_cards(x_admin_password: str = Header(..., alias="x-admin-passw
 @app.get("/api/admin/pending/balances")
 def admin_pending_balances(x_admin_password: str = Header(..., alias="x-admin-password")):
     """
-    يعرض طلبات *رصيد الهاتف* المعلّقة، ويستبعد أي طلبات iTunes بشكل صريح.
-    يعتمد على `type` إن وُجد، وإلا يتحقق من العنوان النصّي.
+    طلبات شراء الكارتات فقط (أثير/أسيا سيل/كورك) — ليست شحنًا مباشرًا — وتستبعد iTunes.
+    يعتمد على الكلمات المفتاحية في العنوان لضمان الفصل عن شحن أسيا (topup_card).
     """
     _require_admin(x_admin_password)
     conn = get_conn()
@@ -590,13 +627,37 @@ def admin_pending_balances(x_admin_password: str = Header(..., alias="x-admin-pa
                 FROM public.orders o
                 JOIN public.users u ON u.id = o.user_id
                 WHERE o.status='Pending'
+                  -- شبكات العراق (أثير/أسيا/كورك)
                   AND (
-                        o.type IN ('mobile_balance','topup_card') OR
-                        LOWER(o.title) LIKE '%رصيد%' OR
-                        LOWER(o.title) LIKE '%topup%' OR
-                        LOWER(o.title) LIKE '%mobile balance%' OR
-                        o.title LIKE '%شحن رصيد%'
+                        LOWER(o.title) LIKE '%asiacell%' OR
+                        o.title LIKE '%أسيا%' OR
+                        o.title LIKE '%اسياسيل%' OR
+                        LOWER(o.title) LIKE '%korek%' OR
+                        o.title LIKE '%كورك%' OR
+                        o.title LIKE '%اثير%'
                   )
+                  -- شراء كارت/فاوتشر/كود (وليس شحن مباشر)
+                  AND (
+                        LOWER(o.title) LIKE '%voucher%' OR
+                        LOWER(o.title) LIKE '%code%' OR
+                        LOWER(o.title) LIKE '%card%' OR
+                        o.title LIKE '%رمز%' OR
+                        o.title LIKE '%كود%' OR
+                        o.title LIKE '%بطاقة%' OR
+                        o.title LIKE '%كارت%' OR
+                        o.title LIKE '%شراء%'
+                  )
+                  -- استبعاد أي صياغة للشحن المباشر
+                  AND NOT (
+                        LOWER(o.title) LIKE '%topup%' OR
+                        LOWER(o.title) LIKE '%top-up%' OR
+                        LOWER(o.title) LIKE '%recharge%' OR
+                        o.title LIKE '%شحن%' OR
+                        o.title LIKE '%شحن عبر%' OR
+                        o.title LIKE '%شحن اسيا%' OR
+                        LOWER(o.title) LIKE '%direct%'
+                  )
+                  -- استبعاد iTunes
                   AND NOT (
                         LOWER(o.title) LIKE '%itunes%' OR
                         o.title LIKE '%ايتونز%'
