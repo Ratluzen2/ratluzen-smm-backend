@@ -100,7 +100,7 @@ ensure_schema()
 # =========================
 # FastAPI & CORS
 # =========================
-app = FastAPI(title="SMM Backend", version="1.4.0")
+app = FastAPI(title="SMM Backend", version="1.4.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
