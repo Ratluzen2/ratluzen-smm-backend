@@ -555,6 +555,23 @@ def admin_pending_ludo(x_admin_password: str = Header(..., alias="x-admin-passwo
 
 # --------- الكروت المعلّقة (أسيا سيل) ---------
 @app.get("/api/admin/pending/cards")
+def admin_pending_cards(x_admin_password: str = Header(..., alias="x-admin-password")):
+    _require_admin(x_admin_password)
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT o.id, u.uid, COALESCE((o.payload->>'card'), '') AS card,
+                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at
+                FROM public.orders o
+                JOIN public.users u ON u.id = o.user_id
+                WHERE o.status='Pending' AND o.type='topup_card'
+                ORDER BY o.id DESC
+            """)
+            rows = cur.fetchall()
+        return [{"id": r[0], "uid": r[1], "card": r[2], "created_at": int(r[3] or 0)} for r in rows]
+    finally:
+        put_conn(conn)
 
 @app.get("/api/admin/pending/balances")
 def admin_pending_balances(x_admin_password: str = Header(..., alias="x-admin-password")):
@@ -594,81 +611,7 @@ def admin_pending_balances(x_admin_password: str = Header(..., alias="x-admin-pa
             out.append(d)
         return out
     finally:
-        put_conn(conn)
-def admin_pending_cards(x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT o.id, u.uid, COALESCE((o.payload->>'card'), '') AS card,
-                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at
-                FROM public.orders o
-                JOIN public.users u ON u.id = o.user_id
-                WHERE o.status='Pending' AND o.type='topup_card'
-                ORDER BY o.id DESC
-            """)
-            rows = cur.fetchall()
-        return [{"id": r[0], "uid": r[1], "card": r[2], "created_at": int(r[3] or 0)} for r in rows]
-    finally:
-        put_conn(conn)
-
-@app.post("/api/admin/topup_cards/{oid}/reject")
-def admin_topup_card_reject(oid: int, x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT id FROM public.orders WHERE id=%s AND type='topup_card' AND status='Pending' FOR UPDATE", (oid,))
-            if not cur.fetchone():
-                raise HTTPException(404, "card order not found")
-            cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (oid,))
-        return {"ok": True}
-    finally:
-        put_conn(conn)
-
-class ExecuteTopupIn(BaseModel):
-    amount: float
-
-@app.post("/api/admin/topup_cards/{oid}/execute")
-def admin_topup_card_execute(oid: int, body: ExecuteTopupIn, x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
-    amount = float(body.amount)
-    if amount <= 0:
-        raise HTTPException(422, "amount must be > 0")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT o.id, o.user_id
-                FROM public.orders o
-                WHERE o.id=%s AND o.type='topup_card' AND o.status='Pending'
-                FOR UPDATE
-            """, (oid,))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(404, "card order not found or not pending")
-            order_id, user_id = row[0], row[1]
-
-            # إضافة الرصيد للمستخدم وتسجيل الحركة
-            cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(amount), user_id))
-            cur.execute("""
-                INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
-                VALUES(%s,%s,%s,%s)
-            """, (user_id, Decimal(amount), "topup_card", Json({"order_id": order_id})))
-
-            # إتمام الطلب + حفظ المبلغ داخل الـ payload
-            cur.execute("""
-                UPDATE public.orders
-                SET status='Done', payload = COALESCE(payload,'{}'::jsonb) || %s::jsonb
-                WHERE id=%s
-            """, (json.dumps({"executed_amount": amount}), order_id))
-
-        return {"ok": True}
-    finally:
-        put_conn(conn)
-
-# --------- الموافقة/التسليم ---------
+        put_conn(conn)# --------- الموافقة/التسليم ---------
 @app.post("/api/admin/orders/{oid}/approve")
 def admin_approve_order(oid: int, x_admin_password: str = Header(..., alias="x-admin-password")):
     _require_admin(x_admin_password)
