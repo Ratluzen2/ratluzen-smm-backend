@@ -561,7 +561,7 @@ def admin_pending_cards(x_admin_password: str = Header(..., alias="x-admin-passw
     try:
         with conn, conn.cursor() as cur:
             cur.execute("""
-                SELECT o.id, u.uid, COALESCE((o.payload->>'card'), '') AS card,
+                SELECT o.id, u.uid, COALESCE((COALESCE(NULLIF(o.payload,''),'{}')::jsonb->>'card'), '') AS card,
                        EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at
                 FROM public.orders o
                 JOIN public.users u ON u.id = o.user_id
