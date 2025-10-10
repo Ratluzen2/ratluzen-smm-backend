@@ -93,6 +93,25 @@ def ensure_schema():
                            ALTER COLUMN type SET NOT NULL;""")
             # ضمان payload ليس NULL
             cur.execute("""UPDATE public.orders SET payload='{}'::jsonb WHERE payload IS NULL;""")
+
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS public.user_notifications(
+                id BIGSERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                order_id INTEGER NULL REFERENCES public.orders(id) ON DELETE SET NULL,
+                title TEXT NOT NULL,
+                body  TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'unread',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                read_at    TIMESTAMPTZ NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_notifications_user_created
+              ON public.user_notifications(user_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_user_notifications_status
+              ON public.user_notifications(status);
+            """)
+        
     finally:
         put_conn(conn)
 
@@ -1099,7 +1118,7 @@ async def admin_reject(oid: int, request: Request, x_admin_password: str = Heade
                 cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
 
         try:
-            _notify_user_if_possible(conn, user_id, order_id, "تم رفض طلبك", reason or "عذرًا، تم رفض هذا الطلب")
+            _notify_user(conn, user_id, order_id, "تم رفض طلبك", reason or "عذرًا، تم رفض هذا الطلب")
         except Exception:
             pass
 
@@ -1143,7 +1162,7 @@ async def admin_execute_topup_card(oid: int, request: Request, x_admin_password:
 
         try:
             msg = f"{title} - amount: {amount}" if amount is not None else title or "تم التنفيذ"
-            _notify_user_if_possible(conn, user_id, order_id, "تم تنفيذ طلبك", msg)
+            _notify_user(conn, user_id, order_id, "تم تنفيذ طلبك", msg)
         except Exception:
             pass
 
@@ -1186,7 +1205,7 @@ async def admin_reject_topup_card(oid: int, request: Request, x_admin_password: 
                 cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
 
         try:
-            _notify_user_if_possible(conn, user_id, order_id, "تم رفض طلبك", reason or "عذرًا، تم رفض هذا الطلب")
+            _notify_user(conn, user_id, order_id, "تم رفض طلبك", reason or "عذرًا، تم رفض هذا الطلب")
         except Exception:
             pass
 
