@@ -122,6 +122,25 @@ ensure_schema()
 # =========================
 app = FastAPI(title="SMM Backend", version="1.4.1")
 
+def _notify_user(conn, user_id: int, order_id: int | None, title: str, body: str):
+    """Durable in-app notification that always COMMITs to public.user_notifications."""
+    try:
+        with conn:  # start/commit a transaction
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
+                    VALUES (%s, %s, %s, %s, 'unread', NOW())
+                    """,
+                    (user_id, order_id, title, body)
+                )
+    except Exception as e:
+        # As a last resort, avoid crashing admin actions; but log the error to server logs
+        try:
+            print("[notify][ERROR]", e)
+        except Exception:
+            pass
+
 # ===== Helpers: JSON body, JSONB detection, notifications =====
 def _payload_is_jsonb(conn) -> bool:
     try:
@@ -144,35 +163,7 @@ async def _read_json_object(request):
         raise HTTPException(400, "Body must be a JSON object")
     return data
 
-def _notify_user(conn, user_id: int, order_id: int|None, title: str, body: str):
-    """Write a durable in-app notification into public.user_notifications (no silent fallback)."""
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
-            VALUES (%s, %s, %s, %s, 'unread', NOW())
-        """, (user_id, order_id, title, body))
 
-# ===== Admin actions helpers (deliver/reject/execute) =====
-def _payload_is_jsonb(conn) -> bool:
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT pg_typeof(payload)::text FROM public.orders LIMIT 1")
-            row = cur.fetchone()
-            return bool(row and isinstance(row[0], str) and row[0].lower() == "jsonb")
-    except Exception:
-        return False
-
-async def _read_json_object(request):
-    try:
-        data = await request.json()
-    except Exception:
-        raw = (await request.body()).decode("utf-8", errors="ignore").strip()
-        data = json.loads(raw) if raw else {}
-    if data is None:
-        return {}
-    if not isinstance(data, dict):
-        raise HTTPException(400, "Body must be a JSON object")
-    return data
 
 def _needs_code(title: str, otype):
     t = (title or "").lower()
@@ -184,46 +175,6 @@ def _needs_code(title: str, otype):
             return True
     return False
 
-def _notify_user(conn, user_id: int, order_id: int, title: str, body: str):
-    # Try user_notifications
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO public.user_notifications (user_id, order_id, title, body, created_at)
-                VALUES (%s, %s, %s, %s, NOW())
-            """, (user_id, order_id, title, body))
-            return
-    except Exception:
-        pass
-    # Try notifications
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO public.notifications (user_id, order_id, title, body, created_at)
-                VALUES (%s, %s, %s, %s, NOW())
-            """, (user_id, order_id, title, body))
-            return
-    except Exception:
-        pass
-    # Optional webhook
-    import os, urllib.request
-    url = os.getenv("NOTIFY_WEBHOOK_URL")
-    if url:
-        try:
-            req = urllib.request.Request(url, data=json.dumps({
-                "user_id": user_id,
-                "order_id": order_id,
-                "title": title,
-                "body": body
-            }).encode("utf-8"), headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=3).read()
-        except Exception:
-            pass
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"]
-)
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
