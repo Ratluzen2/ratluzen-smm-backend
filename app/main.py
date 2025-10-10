@@ -1,6 +1,8 @@
+
+import os
 import json
-# main.py
-import os, json, time, logging
+import time
+import logging
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
@@ -41,124 +43,132 @@ logger = logging.getLogger("smm")
 logging.basicConfig(level=logging.INFO)
 
 # =========================
-# إنشاء/ترقية الجداول
+# إنشاء/ترقية الجداول + التريغرات
 # =========================
 def ensure_schema():
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
-            cur.execute("""
-            CREATE SCHEMA IF NOT EXISTS public;
+        with conn:  # transaction scope
+            with conn.cursor() as cur:
+                # advisory lock to prevent concurrent init
+                cur.execute("SELECT pg_advisory_lock(987654321)")
+                try:
+                    cur.execute("CREATE SCHEMA IF NOT EXISTS public;")
 
-            CREATE TABLE IF NOT EXISTS public.users(
-                id         SERIAL PRIMARY KEY,
-                uid        TEXT UNIQUE NOT NULL,
-                balance    NUMERIC(18,4) NOT NULL DEFAULT 0,
-                is_banned  BOOLEAN NOT NULL DEFAULT FALSE,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
+                    # users
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.users(
+                            id         SERIAL PRIMARY KEY,
+                            uid        TEXT UNIQUE NOT NULL,
+                            balance    NUMERIC(18,4) NOT NULL DEFAULT 0,
+                            is_banned  BOOLEAN NOT NULL DEFAULT FALSE,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        );
+                    """)
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_uid ON public.users(uid);")
 
-            CREATE TABLE IF NOT EXISTS public.wallet_txns(
-                id         SERIAL PRIMARY KEY,
-                user_id    INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-                amount     NUMERIC(18,4) NOT NULL,
-                reason     TEXT,
-                meta       JSONB,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
+                    # wallet_txns
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.wallet_txns(
+                            id         SERIAL PRIMARY KEY,
+                            user_id    INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                            amount     NUMERIC(18,4) NOT NULL,
+                            reason     TEXT,
+                            meta       JSONB,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        );
+                    """)
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_wallet_txns_user ON public.wallet_txns(user_id);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_wallet_txns_created ON public.wallet_txns(created_at);")
 
-            CREATE TABLE IF NOT EXISTS public.orders(
-                id                 SERIAL PRIMARY KEY,
-                user_id            INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-                title              TEXT NOT NULL,
-                service_id         BIGINT,
-                link               TEXT,
-                quantity           INTEGER NOT NULL DEFAULT 0,
-                price              NUMERIC(18,4) NOT NULL DEFAULT 0,
-                status             TEXT NOT NULL DEFAULT 'Pending',
-                provider_order_id  TEXT,
-                payload            JSONB DEFAULT '{}'::jsonb,
-                created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
+                    # orders
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.orders(
+                            id                 SERIAL PRIMARY KEY,
+                            user_id            INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                            title              TEXT NOT NULL,
+                            service_id         BIGINT,
+                            link               TEXT,
+                            quantity           INTEGER NOT NULL DEFAULT 0,
+                            price              NUMERIC(18,4) NOT NULL DEFAULT 0,
+                            status             TEXT NOT NULL DEFAULT 'Pending',
+                            provider_order_id  TEXT,
+                            payload            JSONB DEFAULT '{}'::jsonb,
+                            created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            type               TEXT
+                        );
+                    """)
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON public.orders(user_id);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders(status);")
 
-            CREATE INDEX IF NOT EXISTS idx_users_uid ON public.users(uid);
-            CREATE INDEX IF NOT EXISTS idx_orders_user ON public.orders(user_id);
-            CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders(status);
-            """)
-            # ترقية: ضمان عمود type موجود وافتراضي وغير فارغ
-            cur.execute("""ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS type TEXT;""")
-            cur.execute("""UPDATE public.orders SET type='provider' WHERE type IS NULL;""")
-            cur.execute("""ALTER TABLE public.orders
-                           ALTER COLUMN type SET DEFAULT 'provider',
-                           ALTER COLUMN type SET NOT NULL;""")
-            # ضمان payload ليس NULL
-            cur.execute("""UPDATE public.orders SET payload='{}'::jsonb WHERE payload IS NULL;""")
+                    # upgrade: make type default/non-null & payload non-null
+                    cur.execute("ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS type TEXT;")
+                    cur.execute("UPDATE public.orders SET type='provider' WHERE type IS NULL;")
+                    cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET DEFAULT 'provider';")
+                    cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET NOT NULL;")
+                    cur.execute("UPDATE public.orders SET payload='{}'::jsonb WHERE payload IS NULL;")
 
-        with conn, conn.cursor() as cur:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS public.user_notifications(
-                id BIGSERIAL PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-                order_id INTEGER NULL REFERENCES public.orders(id) ON DELETE SET NULL,
-                title TEXT NOT NULL,
-                body  TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'unread',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                read_at    TIMESTAMPTZ NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_user_notifications_user_created
-              ON public.user_notifications(user_id, created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_user_notifications_status
-              ON public.user_notifications(status);
-            """)
-        
+                    # user_notifications
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.user_notifications(
+                            id BIGSERIAL PRIMARY KEY,
+                            user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                            order_id INTEGER NULL REFERENCES public.orders(id) ON DELETE SET NULL,
+                            title TEXT NOT NULL,
+                            body  TEXT NOT NULL,
+                            status TEXT NOT NULL DEFAULT 'unread',
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            read_at    TIMESTAMPTZ NULL
+                        );
+                    """)
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_user_created ON public.user_notifications(user_id, created_at DESC);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);")
 
-        # Notification trigger for wallet_txns
-        cur.execute("""
-        CREATE OR REPLACE FUNCTION public.wallet_txns_notify()
-        RETURNS trigger AS $$
-        DECLARE
-            t TEXT := 'تم تعديل رصيدك';
-            b TEXT;
-        BEGIN
-            -- Skip notifications for specific reasons or when meta.no_notify=true
-            IF NEW.reason = 'asiacell_topup' THEN
-                RETURN NEW;
-            END IF;
-            IF NEW.meta IS NOT NULL AND (NEW.meta ? 'no_notify') AND (NEW.meta->>'no_notify')::boolean IS TRUE THEN
-                RETURN NEW;
-            END IF;
+                    # trigger: notify on wallet_txns insert (skip asiacell_topup or meta.no_notify)
+                    cur.execute("""
+                        CREATE OR REPLACE FUNCTION public.wallet_txns_notify()
+                        RETURNS trigger AS $$
+                        DECLARE
+                            t TEXT := 'تم تعديل رصيدك';
+                            b TEXT;
+                        BEGIN
+                            IF NEW.reason = 'asiacell_topup' THEN
+                                RETURN NEW;
+                            END IF;
+                            IF NEW.meta IS NOT NULL AND (NEW.meta ? 'no_notify') AND (NEW.meta->>'no_notify')::boolean IS TRUE THEN
+                                RETURN NEW;
+                            END IF;
 
-            IF NEW.amount > 0 THEN
-                b := 'تم إضافة ' || NEW.amount::text;
-            ELSIF NEW.amount < 0 THEN
-                b := 'تم خصم ' || ABS(NEW.amount)::text;
-            ELSE
-                RETURN NEW;
-            END IF;
+                            IF NEW.amount > 0 THEN
+                                b := 'تم إضافة ' || NEW.amount::text;
+                            ELSIF NEW.amount < 0 THEN
+                                b := 'تم خصم ' || ABS(NEW.amount)::text;
+                            ELSE
+                                RETURN NEW;
+                            END IF;
 
-            INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
-            VALUES (NEW.user_id, NULL, t, b, 'unread', NOW());
+                            INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
+                            VALUES (NEW.user_id, NULL, t, b, 'unread', NOW());
 
-            RETURN NEW;
-        END;
-        $$ LANGUAGE plpgsql;
-        """)
-
-        cur.execute("""
-        DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1 FROM pg_trigger WHERE tgname = 'wallet_txns_notify_ai'
-            ) THEN
-                CREATE TRIGGER wallet_txns_notify_ai
-                AFTER INSERT ON public.wallet_txns
-                FOR EACH ROW
-                EXECUTE FUNCTION public.wallet_txns_notify();
-            END IF;
-        END $$;
-        """)
-
+                            RETURN NEW;
+                        END;
+                        $$ LANGUAGE plpgsql;
+                    """)
+                    cur.execute("""
+                        DO $$
+                        BEGIN
+                            IF NOT EXISTS (
+                                SELECT 1 FROM pg_trigger WHERE tgname = 'wallet_txns_notify_ai'
+                            ) THEN
+                                CREATE TRIGGER wallet_txns_notify_ai
+                                AFTER INSERT ON public.wallet_txns
+                                FOR EACH ROW
+                                EXECUTE FUNCTION public.wallet_txns_notify();
+                            END IF;
+                        END $$;
+                    """)
+                finally:
+                    cur.execute("SELECT pg_advisory_unlock(987654321)")
     finally:
         put_conn(conn)
 
@@ -167,132 +177,59 @@ ensure_schema()
 # =========================
 # FastAPI & CORS
 # =========================
-app = FastAPI(title="SMM Backend", version="1.4.1")
-
-# ===== Helpers: JSON body, JSONB detection, notifications =====
-def _payload_is_jsonb(conn) -> bool:
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT pg_typeof(payload)::text FROM public.orders LIMIT 1")
-            row = cur.fetchone()
-            return bool(row and isinstance(row[0], str) and row[0].lower() == "jsonb")
-    except Exception:
-        return False
-
-async def _read_json_object(request):
-    try:
-        data = await request.json()
-    except Exception:
-        raw = (await request.body()).decode("utf-8", errors="ignore").strip()
-        data = json.loads(raw) if raw else {}
-    if data is None:
-        return {}
-    if not isinstance(data, dict):
-        raise HTTPException(400, "Body must be a JSON object")
-    return data
-
-def _notify_user(conn, user_id: int, order_id: int|None, title: str, body: str):
-    """Write a durable in-app notification into public.user_notifications (no silent fallback)."""
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
-            VALUES (%s, %s, %s, %s, 'unread', NOW())
-        """, (user_id, order_id, title, body))
-
-# ===== Admin actions helpers (deliver/reject/execute) =====
-def _payload_is_jsonb(conn) -> bool:
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT pg_typeof(payload)::text FROM public.orders LIMIT 1")
-            row = cur.fetchone()
-            return bool(row and isinstance(row[0], str) and row[0].lower() == "jsonb")
-    except Exception:
-        return False
-
-async def _read_json_object(request):
-    try:
-        data = await request.json()
-    except Exception:
-        raw = (await request.body()).decode("utf-8", errors="ignore").strip()
-        data = json.loads(raw) if raw else {}
-    if data is None:
-        return {}
-    if not isinstance(data, dict):
-        raise HTTPException(400, "Body must be a JSON object")
-    return data
-
-def _needs_code(title: str, otype):
-    t = (title or "").lower()
-    # iTunes + purchase cards need a code; Asiacell topup_card does NOT
-    if (otype or "").lower() == "topup_card":
-        return False
-    for k in ("itunes","ايتونز","voucher","code","card","gift","رمز","كود","بطاقة","كارت","شراء"):
-        if k in t:
-            return True
-    return False
-
-def _notify_user(conn, user_id: int, order_id: int, title: str, body: str):
-    # Try user_notifications
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO public.user_notifications (user_id, order_id, title, body, created_at)
-                VALUES (%s, %s, %s, %s, NOW())
-            """, (user_id, order_id, title, body))
-            return
-    except Exception:
-        pass
-    # Try notifications
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO public.notifications (user_id, order_id, title, body, created_at)
-                VALUES (%s, %s, %s, %s, NOW())
-            """, (user_id, order_id, title, body))
-            return
-    except Exception:
-        pass
-    # Optional webhook
-    import os, urllib.request
-    url = os.getenv("NOTIFY_WEBHOOK_URL")
-    if url:
-        try:
-            req = urllib.request.Request(url, data=json.dumps({
-                "user_id": user_id,
-                "order_id": order_id,
-                "title": title,
-                "body": body
-            }).encode("utf-8"), headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=3).read()
-        except Exception:
-            pass
+app = FastAPI(title="SMM Backend", version="1.5.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"]
 )
 
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    t0 = time.time()
-    response = await call_next(request)
-    dt = int((time.time() - t0) * 1000)
-    logger.info("%s %s -> %s (%d ms)", request.method, request.url.path, response.status_code, dt)
-    return response
+# ===== Helpers =====
+def _require_admin(passwd: str):
+    if passwd != ADMIN_PASSWORD:
+        raise HTTPException(401, "bad admin password")
 
-@app.get("/")
-def root():
-    return {"ok": True, "msg": "backend running"}
-
-@app.get("/health")
-def health():
-    conn = get_conn()
+def _payload_is_jsonb(conn) -> bool:
     try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT 1")
-        return {"ok": True, "ts": int(time.time()*1000)}
-    finally:
-        put_conn(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_typeof(payload)::text FROM public.orders LIMIT 1")
+            row = cur.fetchone()
+            return bool(row and isinstance(row[0], str) and row[0].lower() == "jsonb")
+    except Exception:
+        return False
+
+async def _read_json_object(request: Request) -> Dict[str, Any]:
+    try:
+        data = await request.json()
+    except Exception:
+        raw = (await request.body()).decode("utf-8", errors="ignore").strip()
+        data = json.loads(raw) if raw else {}
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise HTTPException(400, "Body must be a JSON object")
+    return data
+
+def _notify_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
+    # Durable insert into user_notifications
+    try:
+        with conn:  # own transaction
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
+                    VALUES (%s, %s, %s, %s, 'unread', NOW())
+                """, (user_id, order_id, title, body))
+    except Exception as e:
+        logger.exception("notify failed: %s", e)
+
+def _needs_code(title: str, otype: Optional[str]) -> bool:
+    t = (title or "").lower()
+    if (otype or "").lower() == "topup_card":
+        return False
+    for k in ("itunes","ايتونز","voucher","code","card","gift","رمز","كود","بطاقة","كارت","شراء"):
+        if k in t:
+            return True
+    return False
 
 # =========================
 # نماذج API
@@ -321,7 +258,32 @@ class AsiacellSubmitIn(BaseModel):
     card: str
 
 # =========================
-# أدوات مساعدة
+# جذور عامة + صحة
+# =========================
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    t0 = time.time()
+    response = await call_next(request)
+    dt = int((time.time() - t0) * 1000)
+    logger.info("%s %s -> %s (%d ms)", request.method, request.url.path, response.status_code, dt)
+    return response
+
+@app.get("/")
+def root():
+    return {"ok": True, "msg": "backend running"}
+
+@app.get("/health")
+def health():
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return {"ok": True, "ts": int(time.time()*1000)}
+    finally:
+        put_conn(conn)
+
+# =========================
+# أدوات مساعدة داخلية
 # =========================
 def _ensure_user(cur, uid: str) -> int:
     cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
@@ -346,33 +308,6 @@ def _row_to_order_dict(row) -> Dict[str, Any]:
         "price": float(price or 0), "status": status,
         "created_at": int(created_at or 0), "link": link
     }
-
-def _require_admin(passwd: str):
-    if passwd != ADMIN_PASSWORD:
-        raise HTTPException(401, "bad admin password")
-
-async def _coerce_json(request: Request) -> Dict[str, Any]:
-    ctype = (request.headers.get("content-type") or "").lower()
-    try:
-        if "application/json" in ctype:
-            return await request.json()
-        if "application/x-www-form-urlencoded" in ctype or "multipart/form-data" in ctype:
-            form = await request.form()
-            return {k: (v if isinstance(v, str) else str(v)) for k, v in form.items()}
-        raw = (await request.body()).decode("utf-8", errors="ignore").strip()
-        if not raw:
-            return {}
-        try:
-            return json.loads(raw)
-        except Exception:
-            data = {}
-            for part in raw.split("&"):
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    data[k] = v
-            return data or {"raw": raw}
-    except Exception:
-        return {}
 
 # =========================
 # واجهات عامة للمستخدم
@@ -401,7 +336,7 @@ def wallet_balance(uid: str):
     finally:
         put_conn(conn)
 
-# --------- إنشاء طلب خدمة (اللب) ---------
+# --------- إنشاء طلب مزوّد ---------
 def _create_provider_order_core(cur, uid: str, service_id: Optional[int], service_name: str,
                                 link: Optional[str], quantity: int, price: float) -> int:
     cur.execute("SELECT id, balance, is_banned FROM public.users WHERE uid=%s", (uid,))
@@ -433,7 +368,6 @@ def _create_provider_order_core(cur, uid: str, service_id: Optional[int], servic
     oid = cur.fetchone()[0]
     return oid
 
-# نقطة رسمية
 @app.post("/api/orders/create/provider")
 def create_provider_order(body: ProviderOrderIn):
     conn = get_conn()
@@ -467,7 +401,7 @@ def _parse_provider_payload(d: Dict[str, Any]) -> Dict[str, Any]:
 for path in PROVIDER_CREATE_PATHS:
     @app.post(path)
     async def provider_create_compat(request: Request, _path=path):
-        data = await _coerce_json(request)
+        data = await _read_json_object(request)
         try:
             p = _parse_provider_payload(data)
             if not p["uid"] or p["quantity"] <= 0:
@@ -482,7 +416,7 @@ for path in PROVIDER_CREATE_PATHS:
         finally:
             put_conn(conn)
 
-# طلب يدوي (اختياري)
+# --------- طلب يدوي ---------
 @app.post("/api/orders/create/manual")
 def create_manual_order(body: ManualOrderIn):
     conn = get_conn()
@@ -538,7 +472,7 @@ def submit_asiacell(body: AsiacellSubmitIn):
 for path in ASIACELL_PATHS[1:]:
     @app.post(path)
     async def submit_asiacell_compat(request: Request, _path=path):
-        data = await _coerce_json(request)
+        data = await _read_json_object(request)
         uid = (data.get("uid") or data.get("user_id") or "").strip()
         raw = (data.get("card") or data.get("code") or data.get("voucher") or
                data.get("number") or data.get("serial") or
@@ -601,6 +535,9 @@ def orders_list(uid: str):
 def user_orders_list(uid: str):
     return {"orders": _orders_for_uid(uid)}
 
+# =========================
+# إشعارات المستخدم
+# =========================
 @app.get("/api/user/by-uid/{uid}/notifications")
 def list_user_notifications(uid: str, status: str = "unread", limit: int = 50):
     conn = get_conn()
@@ -653,7 +590,7 @@ def mark_notification_read(uid: str, nid: int):
         put_conn(conn)
 
 # =========================
-# واجهات الأدمن
+# واجهات الأدمن (قوائم الانتظار)
 # =========================
 @app.get("/api/admin/pending/services")
 def admin_pending_services(x_admin_password: str = Header(..., alias="x-admin-password")):
@@ -690,7 +627,7 @@ def admin_pending_services(x_admin_password: str = Header(..., alias="x-admin-pa
                   )
                   -- استبعاد شحن أسيا بالكارت عبر الـ type
                   AND (o.type IS NULL OR o.type <> 'topup_card')
-                  -- استبعاد شراء الكارتات (تلخيص نفس شرط balances)
+                  -- استبعاد شراء الكارتات
                   AND NOT (
                         (
                           (LOWER(o.title) LIKE '%asiacell%' OR o.title LIKE '%أسيا%' OR o.title LIKE '%اسياسيل%' OR
@@ -806,7 +743,7 @@ def admin_pending_ludo(x_admin_password: str = Header(..., alias="x-admin-passwo
     finally:
         put_conn(conn)
 
-# --------- الكروت المعلّقة (أسيا سيل) ---------
+# --------- الكروت المعلّقة (شحن أسيا عبر الكارت) ---------
 @app.get("/api/admin/pending/cards")
 def admin_pending_cards(x_admin_password: str = Header(..., alias="x-admin-password")):
     _require_admin(x_admin_password)
@@ -826,6 +763,7 @@ def admin_pending_cards(x_admin_password: str = Header(..., alias="x-admin-passw
     finally:
         put_conn(conn)
 
+# --------- طلبات شراء الكارتات (أثير/أسيا/كورك) ---------
 @app.get("/api/admin/pending/balances")
 def admin_pending_balances(x_admin_password: str = Header(..., alias="x-admin-password")):
     """
@@ -888,7 +826,11 @@ def admin_pending_balances(x_admin_password: str = Header(..., alias="x-admin-pa
             out.append(d)
         return out
     finally:
-        put_conn(conn)# --------- الموافقة/التسليم ---------
+        put_conn(conn)
+
+# =========================
+# الموافقة/التسليم/الرفض
+# =========================
 @app.post("/api/admin/orders/{oid}/approve")
 def admin_approve_order(oid: int, x_admin_password: str = Header(..., alias="x-admin-password")):
     _require_admin(x_admin_password)
@@ -953,9 +895,6 @@ def admin_approve_order(oid: int, x_admin_password: str = Header(..., alias="x-a
     finally:
         put_conn(conn)
 
-
-
-
 @app.post("/api/admin/orders/{oid}/deliver")
 async def admin_deliver(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
     _require_admin(x_admin_password)
@@ -975,8 +914,7 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
             if status in ("Done", "Rejected", "Refunded"):
                 return {"ok": True, "status": status}
 
-            t = (title or "").lower()
-            needs_code = (("itunes" in t or "ايتونز" in t or "card" in t or "كارت" in t or "voucher" in t or "code" in t or "كود" in t) and (otype.lower() != "topup_card"))
+            needs_code = _needs_code(title, otype)
             is_jsonb = _payload_is_jsonb(conn)
 
             current = {}
@@ -989,12 +927,13 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
                 current["card"] = code_val
                 current["code"] = code_val
 
-            if otype.lower() == "topup_card" and amount is not None:
+            if (otype or "").lower() == "topup_card" and amount is not None:
                 try:
                     current["amount"] = float(amount)
                 except Exception:
                     pass
 
+            # Persist order as Done
             if current:
                 if is_jsonb:
                     cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(current), order_id))
@@ -1003,8 +942,8 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
             else:
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
 
-            # credit wallet for Asiacell
-            if otype.lower() == "topup_card":
+            # Credit wallet for Asiacell
+            if (otype or "").lower() == "topup_card":
                 add = 0.0
                 try:
                     add = float(amount or 0)
@@ -1017,112 +956,19 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
                         VALUES(%s,%s,%s,%s)
                     """, (user_id, Decimal(add), "asiacell_topup", Json({"order_id": order_id, "amount": add})))
 
-        _notify_user(conn, user_id, order_id, "تم تنفيذ طلبك", (f"{title}: {code_val}" if needs_code else (f"{title} - amount: {amount}" if amount else (title or "تم التنفيذ"))))
+        # Build notification
+        title_txt = f"تم تنفيذ طلبك {title or ''}".strip()
+        if code_val:
+            body_txt = f"الكود: {code_val}"
+        elif amount is not None:
+            body_txt = f"المبلغ: {amount}"
+        else:
+            body_txt = title or "تم التنفيذ"
+
+        _notify_user(conn, user_id, order_id, title_txt, body_txt)
         return {"ok": True, "status": "Done"}
     finally:
         put_conn(conn)
-# --------- رصيد وإحصاءات ---------
-@app.post("/api/admin/wallet/topup")
-def admin_wallet_topup(body: WalletChangeIn, x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
-    amount = float(body.amount)
-    if amount <= 0:
-        raise HTTPException(422, "amount must be > 0")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT id FROM public.users WHERE uid=%s", (body.uid,))
-            r = cur.fetchone()
-            if not r:
-                raise HTTPException(404, "user not found")
-            user_id = r[0]
-            cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(amount), user_id))
-            cur.execute("""
-                INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
-                VALUES(%s,%s,%s,%s)
-            """, (user_id, Decimal(amount), "admin_topup", Json({"by": "admin"})))
-        return {"ok": True}
-    finally:
-        put_conn(conn)
-
-@app.post("/api/admin/wallet/deduct")
-def admin_wallet_deduct(body: WalletChangeIn, x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
-    amount = float(body.amount)
-    if amount <= 0:
-        raise HTTPException(422, "amount must be > 0")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT id, balance FROM public.users WHERE uid=%s", (body.uid,))
-            r = cur.fetchone()
-            if not r:
-                raise HTTPException(404, "user not found")
-            user_id, bal = r[0], float(r[1] or 0)
-            if bal < amount:
-                raise HTTPException(400, "insufficient balance")
-            cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (Decimal(amount), user_id))
-            cur.execute("""
-                INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
-                VALUES(%s,%s,%s,%s)
-            """, (user_id, Decimal(-amount), "admin_deduct", Json({"by": "admin"})))
-        return {"ok": True}
-    finally:
-        put_conn(conn)
-
-@app.get("/api/admin/users/count")
-def admin_users_count(x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM public.users")
-            n = cur.fetchone()[0]
-        return {"ok": True, "count": int(n)}
-    finally:
-        put_conn(conn)
-
-@app.get("/api/admin/users/balances")
-def admin_users_balances(x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT uid, balance, is_banned FROM public.users ORDER BY id DESC LIMIT 1000")
-            rows = cur.fetchall()
-        return [{"uid": r[0], "balance": float(r[1] or 0), "is_banned": bool(r[2])} for r in rows]
-    finally:
-        put_conn(conn)
-
-@app.get("/api/admin/provider/balance")
-def admin_provider_balance(x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
-    try:
-        resp = requests.post(PROVIDER_API_URL, data={"key": PROVIDER_API_KEY, "action": "balance"}, timeout=20)
-        if resp.status_code // 100 != 2:
-            raise HTTPException(502, "provider http error")
-        if resp.headers.get("content-type","").startswith("application/json"):
-            data = resp.json()
-            bal = data.get("balance") or (data.get("data") or {}).get("balance")
-            if bal is not None:
-                return float(bal)
-        # fallback: نص
-        txt = resp.text.strip()
-        try:
-            return float(txt)
-        except Exception:
-            raise HTTPException(502, "bad provider payload")
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(502, "provider unreachable")
-
-# =============== تشغيل محلي ===============
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
-
 
 @app.post("/api/admin/orders/{oid}/reject")
 async def admin_reject(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
@@ -1133,12 +979,12 @@ async def admin_reject(oid: int, request: Request, x_admin_password: str = Heade
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            cur.execute("SELECT id, user_id, status, payload FROM public.orders WHERE id=%s FOR UPDATE", (oid,))
+            cur.execute("SELECT id, user_id, status, payload, title FROM public.orders WHERE id=%s FOR UPDATE", (oid,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "order not found")
-            order_id, user_id, status, payload = row[0], row[1], row[2], (row[3] or {})
 
+            order_id, user_id, status, payload, title = row[0], row[1], row[2], (row[3] or {}), row[4]
             if status in ("Done", "Rejected", "Refunded"):
                 return {"ok": True, "status": status}
 
@@ -1157,15 +1003,10 @@ async def admin_reject(oid: int, request: Request, x_admin_password: str = Heade
             else:
                 cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
 
-        try:
-            _notify_user(conn, user_id, order_id, "تم رفض طلبك", reason or "عذرًا، تم رفض هذا الطلب")
-        except Exception:
-            pass
-
+        _notify_user(conn, user_id, order_id, "تم رفض طلبك", reason or "عذرًا، تم رفض هذا الطلب")
         return {"ok": True, "status": "Rejected"}
     finally:
         put_conn(conn)
-
 
 @app.post("/api/admin/topup_cards/{oid}/execute")
 async def admin_execute_topup_card(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
@@ -1190,7 +1031,10 @@ async def admin_execute_topup_card(oid: int, request: Request, x_admin_password:
             if isinstance(payload, dict):
                 current.update(payload)
             if amount is not None:
-                current["amount"] = amount
+                try:
+                    current["amount"] = float(amount)
+                except Exception:
+                    pass
 
             if current:
                 if is_jsonb:
@@ -1200,16 +1044,25 @@ async def admin_execute_topup_card(oid: int, request: Request, x_admin_password:
             else:
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
 
-        try:
-            msg = f"{title} - amount: {amount}" if amount is not None else title or "تم التنفيذ"
-            _notify_user(conn, user_id, order_id, "تم تنفيذ طلبك", msg)
-        except Exception:
-            pass
+            # Credit wallet
+            add = 0.0
+            try:
+                add = float(amount or 0)
+            except Exception:
+                add = 0.0
+            if add > 0:
+                cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(add), user_id))
+                cur.execute("""
+                    INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                    VALUES(%s,%s,%s,%s)
+                """, (user_id, Decimal(add), "asiacell_topup", Json({"order_id": order_id, "amount": add})))
 
+        title_txt = f"تم تنفيذ طلبك {title or ''}".strip()
+        body_txt  = f"المبلغ: {amount}" if amount is not None else (title or "تم التنفيذ")
+        _notify_user(conn, user_id, order_id, title_txt, body_txt)
         return {"ok": True, "status": "Done"}
     finally:
         put_conn(conn)
-
 
 @app.post("/api/admin/topup_cards/{oid}/reject")
 async def admin_reject_topup_card(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
@@ -1244,24 +1097,14 @@ async def admin_reject_topup_card(oid: int, request: Request, x_admin_password: 
             else:
                 cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
 
-        try:
-            _notify_user(conn, user_id, order_id, "تم رفض طلبك", reason or "عذرًا، تم رفض هذا الطلب")
-        except Exception:
-            pass
-
+        _notify_user(conn, user_id, order_id, "تم رفض طلبك", reason or "عذرًا، تم رفض هذا الطلب")
         return {"ok": True, "status": "Rejected"}
     finally:
         put_conn(conn)
 
-
-@app.on_event("startup")
-def _startup_hook():
-    try:
-        ensure_schema()
-    except Exception as e:
-        print("ensure_schema() failed:", e)
-
-
+# =========================
+# تعديل الرصيد (أدمن) مع إشعار تلقائي من التريغر
+# =========================
 @app.post("/api/admin/users/{uid}/wallet/adjust")
 async def admin_wallet_adjust(uid: str, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
     _require_admin(x_admin_password)
@@ -1288,7 +1131,6 @@ async def admin_wallet_adjust(uid: str, request: Request, x_admin_password: str 
                 raise HTTPException(404, "user not found")
             user_id = r[0]
 
-            from decimal import Decimal
             cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(amt), user_id))
 
             meta = {"admin": True}
@@ -1305,3 +1147,9 @@ async def admin_wallet_adjust(uid: str, request: Request, x_admin_password: str 
         return {"ok": True, "status": "adjusted", "amount": amt, "reason": reason}
     finally:
         put_conn(conn)
+
+# =============== تشغيل محلي ===============
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
