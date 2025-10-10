@@ -928,7 +928,14 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
                     """, (user_id, Decimal(add), "asiacell_topup", Json({"order_id": order_id, "amount": add})))
 
         body = (f"الكود: {code_val}" if code_val else (f"المبلغ: {amount}" if amount else (title or "تم التنفيذ"))))
-        _notify_user(conn, user_id, order_id, f"تم تنفيذ طلبك - {title}", body)
+            # Build body safely without tricky parentheses
+    if code_val:
+        body_txt = f"الكود: {code_val}"
+    elif amount:
+        body_txt = f"المبلغ: {amount}"
+    else:
+        body_txt = title or "تم التنفيذ"
+_notify_user(conn, user_id, order_id, f\"تم تنفيذ طلبك + {title}\", body)
         return {"ok": True, "status": "Done"}
     finally:
         put_conn(conn)
@@ -1133,7 +1140,12 @@ async def admin_execute_topup_card(oid: int, request: Request, x_admin_password:
                     VALUES(%s,%s,%s,%s)
                 """, (user_id, Decimal(add), "asiacell_topup", Json({"order_id": order_id, "amount": add})))
 
-        _notify_user(conn, user_id, order_id, f"تم تنفيذ طلبك - {title}", f"{title} - amount: {amount}")
+            # Build body for topup
+    if amount:
+        body_txt = f"المبلغ: {amount}"
+    else:
+        body_txt = title or "تم التنفيذ"
+_notify_user(conn, user_id, order_id, f\"تم تنفيذ طلبك + {title}\", body_txt)
         return {"ok": True, "status": "Done"}
     finally:
         put_conn(conn)
