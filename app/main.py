@@ -597,12 +597,14 @@ def mark_notification_read(uid: str, nid: int):
 async def create_manual_paid(request: Request):
     """
     Creates a manual order (iTunes / Atheer / Asiacell / Korek voucher) and atomically charges user balance.
-    Body: { uid: str, product: "itunes"|"atheer"|"asiacell"|"korek", usd: one of [5,10,15,20,25,30,40,50,100] }
+    Body: { uid: str, product: "itunes"|"atheer"|"asiacell"|"korek"|"pubg_uc"|"ludo_diamond"|"ludo_gold", usd: per product }
     Pricing:
       - itunes:   each 5$ = 9$
       - atheer:   each 5$ = 7$
       - asiacell: each 5$ = 7$
-      - korek:    each 5$ = 7$   (per latest requirement)
+      - korek:    each 5$ = 7$
+      - pubg_uc:  price = usd (allowed {2,9,15,40,55,100,185})
+      - ludo:     price = usd (allowed {5,10,20,35,85,165,475,800})
     Refund: if owner rejects later, /api/admin/orders/{id}/reject auto-refunds price>0 (already implemented).
     """
     data = await _read_json_object(request)
@@ -613,25 +615,52 @@ async def create_manual_paid(request: Request):
     except Exception:
         raise HTTPException(422, "invalid usd")
 
-    allowed = {5,10,15,20,25,30,40,50,100}
-    if not uid or usd not in allowed or usd % 5 != 0:
-        raise HTTPException(422, "invalid payload")
-    if product not in ("itunes","atheer","asiacell","korek"):
+    # Per-product allowed USD sets
+allowed_telco = {5,10,15,20,25,30,40,50,100}
+allowed_pubg = {2,9,15,40,55,100,185}
+allowed_ludo = {5,10,20,35,85,165,475,800}
+if not uid:
+    raise HTTPException(422, "invalid payload")
+if product in ("itunes","atheer","asiacell","korek"):
+    if usd not in allowed_telco:
+        raise HTTPException(422, "invalid usd for telco/itunes")
+elif product == "pubg_uc":
+    if usd not in allowed_pubg:
+        raise HTTPException(422, "invalid usd for pubg")
+elif product in ("ludo_diamond","ludo_gold"):
+    if usd not in allowed_ludo:
+        raise HTTPException(422, "invalid usd for ludo")
+else:
+    raise HTTPException(422, "invalid product")
+
+    if product not in ("itunes","atheer","asiacell","korek","pubg_uc","ludo_diamond","ludo_gold"):
         raise HTTPException(422, "invalid product")
 
     steps = usd / 5.0
     if product == "itunes":
-        price = steps * 9.0
-        title = f"شراء رصيد ايتونز {usd}$"
-    elif product == "atheer":
-        price = steps * 7.0
-        title = f"شراء رصيد اثير {usd}$"
-    elif product == "asiacell":
-        price = steps * 7.0
-        title = f"شراء رصيد اسياسيل {usd}$"
-    else:  # korek
-        price = steps * 7.0
-        title = f"شراء رصيد كورك {usd}$"
+    price = steps * 9.0
+    title = f"شراء رصيد ايتونز {usd}$"
+elif product == "atheer":
+    price = steps * 7.0
+    title = f"شراء رصيد اثير {usd}$"
+elif product == "asiacell":
+    price = steps * 7.0
+    title = f"شراء رصيد اسياسيل {usd}$"
+elif product == "korek":
+    price = steps * 7.0
+    title = f"شراء رصيد كورك {usd}$"
+elif product == "pubg_uc":
+    price = float(usd)
+    title = f"شحن شدات ببجي بسعر {usd}$"
+elif product == "ludo_diamond":
+    price = float(usd)
+    title = f"شراء الماسات لودو بسعر {usd}$"
+elif product == "ludo_gold":
+    price = float(usd)
+    title = f"شراء ذهب لودو بسعر {usd}$"
+else:
+    raise HTTPException(422, "invalid product")
+
 
     conn = get_conn()
     try:
