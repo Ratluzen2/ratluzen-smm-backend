@@ -1308,6 +1308,28 @@ def admin_users_balances(
     finally:
         put_conn(conn)
 
+
+
+@app.get("/api/admin/users/count")
+def admin_users_count(x_admin_password: str = Header(..., alias="x-admin-password"), plain: int = 0):
+    """
+    عدد المستخدمين الإجمالي.
+    - default: {"ok": true, "count": N}
+    - إذا plain=1: يرجع رقمًا فقط (N) لتوافق أوسع.
+    """
+    _require_admin(x_admin_password)
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM public.users")
+            n = int(cur.fetchone()[0])
+        if str(plain) == "1":
+            # يرجع رقمًا فقط
+            return n
+        return {"ok": True, "count": n}
+    finally:
+        put_conn(conn)
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
