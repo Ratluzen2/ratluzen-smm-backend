@@ -184,7 +184,7 @@ def _needs_code(title: str, otype):
             return True
     return False
 
-def _notify_user_if_possible(conn, user_id: int, order_id: int, title: str, body: str):
+def _notify_user(conn, user_id: int, order_id: int, title: str, body: str):
     # Try user_notifications
     try:
         with conn.cursor() as cur:
@@ -908,8 +908,9 @@ def admin_approve_order(oid: int, x_admin_password: str = Header(..., alias="x-a
 
 
 
+
 @app.post("/api/admin/orders/{oid}/deliver")
-async def admin_deliver_or_reject(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
+async def admin_deliver(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
     _require_admin(x_admin_password)
     data = await _read_json_object(request)
     code_val = (data.get("code") or "").strip()
@@ -918,7 +919,7 @@ async def admin_deliver_or_reject(oid: int, request: Request, x_admin_password: 
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            cur.execute("SELECT id, user_id, price, status, payload, title, type FROM public.orders WHERE id=%s FOR UPDATE", (oid,))
+            cur.execute("SELECT id, user_id, price, status, payload, title, COALESCE(type,'') FROM public.orders WHERE id=%s FOR UPDATE", (oid,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "order not found")
@@ -927,7 +928,8 @@ async def admin_deliver_or_reject(oid: int, request: Request, x_admin_password: 
             if status in ("Done", "Rejected", "Refunded"):
                 return {"ok": True, "status": status}
 
-            needs_code = (("itunes" in (title or "").lower()) or ("card" in (title or "").lower()) or ("كارت" in (title or "").lower()) or ("ايتونز" in (title or "").lower())) and (otype.lower() != "topup_card")
+            t = (title or "").lower()
+            needs_code = (("itunes" in t or "ايتونز" in t or "card" in t or "كارت" in t or "voucher" in t or "code" in t or "كود" in t) and (otype.lower() != "topup_card"))
             is_jsonb = _payload_is_jsonb(conn)
 
             current = {}
@@ -940,15 +942,12 @@ async def admin_deliver_or_reject(oid: int, request: Request, x_admin_password: 
                 current["card"] = code_val
                 current["code"] = code_val
 
-            if otype.lower() == "topup_card":
-                # optional amount audit on deliver
-                if amount is not None:
-                    try:
-                        current["amount"] = float(amount)
-                    except Exception:
-                        pass
+            if otype.lower() == "topup_card" and amount is not None:
+                try:
+                    current["amount"] = float(amount)
+                except Exception:
+                    pass
 
-            # write order status/payload
             if current:
                 if is_jsonb:
                     cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(current), order_id))
@@ -957,7 +956,7 @@ async def admin_deliver_or_reject(oid: int, request: Request, x_admin_password: 
             else:
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
 
-            # topup wallet if applicable
+            # credit wallet for Asiacell
             if otype.lower() == "topup_card":
                 add = 0.0
                 try:
@@ -971,13 +970,7 @@ async def admin_deliver_or_reject(oid: int, request: Request, x_admin_password: 
                         VALUES(%s,%s,%s,%s)
                     """, (user_id, Decimal(add), "asiacell_topup", Json({"order_id": order_id, "amount": add})))
 
-        # durable notification
-        body = (f"{title}: {code_val}" if needs_code else (f"{title} - amount: {amount}" if amount else (title or "تم التنفيذ")))
-        try:
-            _notify_user(conn, user_id, order_id, "تم تنفيذ طلبك", body)
-        except Exception as _e:
-            print("notify failed:", _e)
-
+        _notify_user(conn, user_id, order_id, "تم تنفيذ طلبك", (f"{title}: {code_val}" if needs_code else (f"{title} - amount: {amount}" if amount else (title or "تم التنفيذ"))))
         return {"ok": True, "status": "Done"}
     finally:
         put_conn(conn)
