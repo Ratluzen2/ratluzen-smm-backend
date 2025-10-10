@@ -909,6 +909,7 @@ def admin_approve_order(oid: int, x_admin_password: str = Header(..., alias="x-a
 
 
 
+
 @app.post("/api/admin/orders/{oid}/deliver")
 async def admin_deliver(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
     _require_admin(x_admin_password)
@@ -919,7 +920,7 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            cur.execute("SELECT id, user_id, price, status, payload, title, COALESCE(type,'') FROM public.orders WHERE id=%s FOR UPDATE", (oid,))
+            cur.execute("SELECT id, user_id, price, status, payload, title, COALESCE(type,'') AS type FROM public.orders WHERE id=%s FOR UPDATE", (oid,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "order not found")
@@ -935,6 +936,11 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
             current = {}
             if isinstance(payload, dict):
                 current.update(payload)
+            elif isinstance(payload, str) and payload.strip():
+                try:
+                    current.update(json.loads(payload))
+                except Exception:
+                    current = {}
 
             if needs_code:
                 if not code_val:
@@ -956,7 +962,7 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
             else:
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
 
-            # credit wallet for Asiacell
+            # credit wallet if topup
             if otype.lower() == "topup_card":
                 add = 0.0
                 try:
@@ -970,7 +976,8 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
                         VALUES(%s,%s,%s,%s)
                     """, (user_id, Decimal(add), "asiacell_topup", Json({"order_id": order_id, "amount": add})))
 
-        _notify_user(conn, user_id, order_id, "تم تنفيذ طلبك", (f"{title}: {code_val}" if needs_code else (f"{title} - amount: {amount}" if amount else (title or "تم التنفيذ"))))
+        body = (f"{title}: {code_val}" if needs_code else (f"{title} - amount: {amount}" if amount else (title or "تم التنفيذ")))
+        _notify_user(conn, user_id, order_id, "تم تنفيذ طلبك", body)
         return {"ok": True, "status": "Done"}
     finally:
         put_conn(conn)
@@ -1120,6 +1127,7 @@ async def admin_reject(oid: int, request: Request, x_admin_password: str = Heade
         put_conn(conn)
 
 
+
 @app.post("/api/admin/topup_cards/{oid}/execute")
 async def admin_execute_topup_card(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
     _require_admin(x_admin_password)
@@ -1142,8 +1150,16 @@ async def admin_execute_topup_card(oid: int, request: Request, x_admin_password:
             current = {}
             if isinstance(payload, dict):
                 current.update(payload)
+            elif isinstance(payload, str) and payload.strip():
+                try:
+                    current.update(json.loads(payload))
+                except Exception:
+                    current = {}
             if amount is not None:
-                current["amount"] = amount
+                try:
+                    current["amount"] = float(amount)
+                except Exception:
+                    pass
 
             if current:
                 if is_jsonb:
@@ -1153,17 +1169,23 @@ async def admin_execute_topup_card(oid: int, request: Request, x_admin_password:
             else:
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
 
-        try:
-            msg = f"{title} - amount: {amount}" if amount is not None else title or "تم التنفيذ"
-            _notify_user(conn, user_id, order_id, "تم تنفيذ طلبك", msg)
-        except Exception:
-            pass
+            # credit wallet
+            add = 0.0
+            try:
+                add = float(amount or 0)
+            except Exception:
+                add = 0.0
+            if add > 0:
+                cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(add), user_id))
+                cur.execute("""
+                    INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                    VALUES(%s,%s,%s,%s)
+                """, (user_id, Decimal(add), "asiacell_topup", Json({"order_id": order_id, "amount": add})))
 
+        _notify_user(conn, user_id, order_id, "تم تنفيذ طلبك", f"{title} - amount: {amount}")
         return {"ok": True, "status": "Done"}
     finally:
         put_conn(conn)
-
-
 @app.post("/api/admin/topup_cards/{oid}/reject")
 async def admin_reject_topup_card(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
     _require_admin(x_admin_password)
