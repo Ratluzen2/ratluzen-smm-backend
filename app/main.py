@@ -16,12 +16,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # =========================
-# إعدادات عامة
+# Settings
 # =========================
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DATABASE_URL_NEON")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is required")
-
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "2000")
 
 PROVIDER_API_URL = os.getenv("PROVIDER_API_URL", "https://kd1s.com/api/v2")
@@ -37,20 +36,19 @@ def put_conn(conn: psycopg2.extensions.connection) -> None:
     dbpool.putconn(conn)
 
 # =========================
-# لوجينغ
+# Logging
 # =========================
 logger = logging.getLogger("smm")
 logging.basicConfig(level=logging.INFO)
 
 # =========================
-# إنشاء/ترقية الجداول + التريغرات
+# Schema & Triggers
 # =========================
 def ensure_schema():
     conn = get_conn()
     try:
-        with conn:  # transaction scope
+        with conn:
             with conn.cursor() as cur:
-                # advisory lock to prevent concurrent init
                 cur.execute("SELECT pg_advisory_lock(987654321)")
                 try:
                     cur.execute("CREATE SCHEMA IF NOT EXISTS public;")
@@ -100,8 +98,7 @@ def ensure_schema():
                     """)
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON public.orders(user_id);")
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders(status);")
-
-                    # upgrade: defaults
+                    # defaults/upgrade
                     cur.execute("ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS type TEXT;")
                     cur.execute("UPDATE public.orders SET type='provider' WHERE type IS NULL;")
                     cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET DEFAULT 'provider';")
@@ -175,9 +172,9 @@ def ensure_schema():
 ensure_schema()
 
 # =========================
-# FastAPI & CORS
+# FastAPI
 # =========================
-app = FastAPI(title="SMM Backend", version="1.6.0")
+app = FastAPI(title="SMM Backend", version="1.7.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -211,9 +208,8 @@ async def _read_json_object(request: Request) -> Dict[str, Any]:
     return data
 
 def _notify_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
-    # Durable insert into user_notifications
     try:
-        with conn:  # own transaction
+        with conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
@@ -232,7 +228,7 @@ def _needs_code(title: str, otype: Optional[str]) -> bool:
     return False
 
 # =========================
-# نماذج API
+# Models
 # =========================
 class UpsertUserIn(BaseModel):
     uid: str
@@ -263,7 +259,7 @@ class WalletCompatIn(BaseModel):
     reason: Optional[str] = None
 
 # =========================
-# جذور عامة + صحة
+# Middleware logging
 # =========================
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -288,7 +284,7 @@ def health():
         put_conn(conn)
 
 # =========================
-# أدوات مساعدة داخلية
+# Internal helpers
 # =========================
 def _ensure_user(cur, uid: str) -> int:
     cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
@@ -299,7 +295,6 @@ def _ensure_user(cur, uid: str) -> int:
     return cur.fetchone()[0]
 
 def _refund_if_needed(cur, user_id: int, price: float, order_id: int):
-    """Refund helper used on provider error/explicit reject."""
     if price and price > 0:
         cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(price), user_id))
         cur.execute("""
@@ -316,7 +311,7 @@ def _row_to_order_dict(row) -> Dict[str, Any]:
     }
 
 # =========================
-# واجهات عامة للمستخدم
+# Public user APIs
 # =========================
 @app.post("/api/users/upsert")
 def upsert_user(body: UpsertUserIn):
@@ -342,7 +337,7 @@ def wallet_balance(uid: str):
     finally:
         put_conn(conn)
 
-# --------- إنشاء طلب مزوّد ---------
+# Create provider order core
 def _create_provider_order_core(cur, uid: str, service_id: Optional[int], service_name: str,
                                 link: Optional[str], quantity: int, price: float) -> int:
     cur.execute("SELECT id, balance, is_banned FROM public.users WHERE uid=%s", (uid,))
@@ -353,7 +348,7 @@ def _create_provider_order_core(cur, uid: str, service_id: Optional[int], servic
     if banned:
         raise HTTPException(403, "user banned")
 
-    # خصم الرصيد إن كان الطلب مدفوعًا
+    # charge if paid
     if price and price > 0:
         if bal < price:
             raise HTTPException(400, "insufficient balance")
@@ -364,7 +359,6 @@ def _create_provider_order_core(cur, uid: str, service_id: Optional[int], servic
         """, (user_id, Decimal(-price), "order_charge",
               Json({"service_id": service_id, "name": service_name, "qty": quantity})))
 
-    # إنشاء الطلب كمعلّق + ضبط type
     cur.execute("""
         INSERT INTO public.orders(user_id, title, service_id, link, quantity, price, status, payload, type)
         VALUES(%s,%s,%s,%s,%s,%s,'Pending',%s,%s)
@@ -387,7 +381,7 @@ def create_provider_order(body: ProviderOrderIn):
     finally:
         put_conn(conn)
 
-# نقاط توافقية متعددة (قد يرسل التطبيق عليها)
+# Compat creation paths
 PROVIDER_CREATE_PATHS = [
     "/api/orders/create", "/api/order/create",
     "/api/create/order",  "/api/orders/add",
@@ -422,7 +416,7 @@ for path in PROVIDER_CREATE_PATHS:
         finally:
             put_conn(conn)
 
-# --------- طلب يدوي ---------
+# Manual order
 @app.post("/api/orders/create/manual")
 def create_manual_order(body: ManualOrderIn):
     conn = get_conn()
@@ -439,7 +433,7 @@ def create_manual_order(body: ManualOrderIn):
     finally:
         put_conn(conn)
 
-# --------- أسيا سيل ---------
+# Asiacell submit (topup via card)
 def _asiacell_submit_core(cur, uid: str, card_digits: str) -> int:
     user_id = _ensure_user(cur, uid)
     cur.execute("""
@@ -495,7 +489,7 @@ for path in ASIACELL_PATHS[1:]:
         finally:
             put_conn(conn)
 
-# --------- أوامري ---------
+# Orders of a user
 def _orders_for_uid(uid: str) -> List[dict]:
     conn = get_conn()
     try:
@@ -542,7 +536,7 @@ def user_orders_list(uid: str):
     return {"orders": _orders_for_uid(uid)}
 
 # =========================
-# إشعارات المستخدم
+# Notifications
 # =========================
 @app.get("/api/user/by-uid/{uid}/notifications")
 def list_user_notifications(uid: str, status: str = "unread", limit: int = 50):
@@ -596,7 +590,7 @@ def mark_notification_read(uid: str, nid: int):
         put_conn(conn)
 
 # =========================
-# واجهات الأدمن (قوائم الانتظار)
+# Admin queues (pending)
 # =========================
 @app.get("/api/admin/pending/services")
 def admin_pending_services(x_admin_password: str = Header(..., alias="x-admin-password")):
@@ -725,11 +719,11 @@ def admin_pending_ludo(x_admin_password: str = Header(..., alias="x-admin-passwo
                 WHERE o.status='Pending' AND (
                 LOWER(o.title) LIKE '%ludo%' OR
                 LOWER(o.title) LIKE '%yalla%' OR
-                o.title LIKE '%يلا لودو%' OR
+                o.title LIKE '%يلا لودو%' أو
                 o.title LIKE '%لودو%'
             )
                 ORDER BY o.id DESC
-            """)
+            """.replace("أو", "or"))
             rows = cur.fetchall()
         out = []
         for (oid, title, qty, price, status, created_at, link, uid) in rows:
@@ -740,7 +734,7 @@ def admin_pending_ludo(x_admin_password: str = Header(..., alias="x-admin-passwo
     finally:
         put_conn(conn)
 
-# --------- الكروت المعلّقة (شحن أسيا عبر الكارت) ---------
+# Pending topup cards (Asiacell via card)
 @app.get("/api/admin/pending/cards")
 def admin_pending_cards(x_admin_password: str = Header(..., alias="x-admin-password")):
     _require_admin(x_admin_password)
@@ -760,7 +754,7 @@ def admin_pending_cards(x_admin_password: str = Header(..., alias="x-admin-passw
     finally:
         put_conn(conn)
 
-# --------- طلبات شراء الكارتات (أثير/أسيا/كورك) ---------
+# Pending balance purchase (Atheer/Asiacell/Korek vouchers)
 @app.get("/api/admin/pending/balances")
 def admin_pending_balances(x_admin_password: str = Header(..., alias="x-admin-password")):
     _require_admin(x_admin_password)
@@ -818,7 +812,7 @@ def admin_pending_balances(x_admin_password: str = Header(..., alias="x-admin-pa
         put_conn(conn)
 
 # =========================
-# الموافقة/التسليم/الرفض
+# Approve/Deliver/Reject
 # =========================
 @app.post("/api/admin/orders/{oid}/approve")
 def admin_approve_order(oid: int, x_admin_password: str = Header(..., alias="x-admin-password")):
@@ -840,12 +834,11 @@ def admin_approve_order(oid: int, x_admin_password: str = Header(..., alias="x-a
             if status not in ("Pending", "Processing"):
                 raise HTTPException(400, "invalid status")
 
-            # الطلبات اليدوية/الكروت لا تُرسل للمزوّد
+            # manual/topup_card doesn't call provider
             if otype in ("topup_card", "manual") or service_id is None:
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
                 return {"ok": True, "status": "Done"}
 
-            # طلب مزود: إرسال إلى KD1S
             try:
                 resp = requests.post(
                     PROVIDER_API_URL,
@@ -962,8 +955,7 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
 @app.post("/api/admin/orders/{oid}/reject")
 async def admin_reject(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
     """
-    يرفض الطلب ويُرجِع الرصيد تلقائيًا للطلبات المدفوعة (خصوصًا خدمات API / provider).
-    لا يُكرّر الاسترجاع إذا وُسِم payload.refunded = true.
+    Rejects the order and refunds balance once if order is paid.
     """
     _require_admin(x_admin_password)
     data = await _read_json_object(request)
@@ -989,7 +981,6 @@ async def admin_reject(oid: int, request: Request, x_admin_password: str = Heade
             if reason:
                 current["reject_reason"] = reason
 
-            # --- Refund wallet if this is a paid order and not already refunded ---
             already_refunded = bool(current.get("refunded")) if isinstance(current, dict) else False
             if price > 0 and not already_refunded:
                 cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(price), user_id))
@@ -1017,102 +1008,8 @@ async def admin_reject(oid: int, request: Request, x_admin_password: str = Heade
     finally:
         put_conn(conn)
 
-@app.post("/api/admin/topup_cards/{oid}/execute")
-async def admin_execute_topup_card(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
-    data = await _read_json_object(request)
-    amount = data.get("amount")
-
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT id, user_id, status, payload, title FROM public.orders WHERE id=%s FOR UPDATE", (oid,))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(404, "order not found")
-            order_id, user_id, status, payload, title = row[0], row[1], row[2], (row[3] or {}), row[4]
-
-            if status in ("Done", "Rejected", "Refunded"):
-                return {"ok": True, "status": status}
-
-            is_jsonb = _payload_is_jsonb(conn)
-            current = {}
-            if isinstance(payload, dict):
-                current.update(payload)
-            if amount is not None:
-                try:
-                    current["amount"] = float(amount)
-                except Exception:
-                    pass
-
-            if current:
-                if is_jsonb:
-                    cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(current), order_id))
-                else:
-                    cur.execute("UPDATE public.orders SET status='Done', payload=(%s)::jsonb::text WHERE id=%s", (json.dumps(current, ensure_ascii=False), order_id))
-            else:
-                cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
-
-            # Credit wallet
-            add = 0.0
-            try:
-                add = float(amount or 0)
-            except Exception:
-                add = 0.0
-            if add > 0:
-                cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(add), user_id))
-                cur.execute("""
-                    INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
-                    VALUES(%s,%s,%s,%s)
-                """, (user_id, Decimal(add), "asiacell_topup", Json({"order_id": order_id, "amount": add})))
-
-        title_txt = f"تم تنفيذ طلبك {title or ''}".strip()
-        body_txt  = f"المبلغ: {amount}" if amount is not None else (title or "تم التنفيذ")
-        _notify_user(conn, user_id, order_id, title_txt, body_txt)
-        return {"ok": True, "status": "Done"}
-    finally:
-        put_conn(conn)
-
-@app.post("/api/admin/topup_cards/{oid}/reject")
-async def admin_reject_topup_card(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
-    data = await _read_json_object(request)
-    reason = (data.get("reason") or data.get("message") or "").strip()
-
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT id, user_id, status, payload FROM public.orders WHERE id=%s FOR UPDATE", (oid,))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(404, "order not found")
-            order_id, user_id, status, payload = row[0], row[1], row[2], (row[3] or {})
-
-            if status in ("Done", "Rejected", "Refunded"):
-                return {"ok": True, "status": status}
-
-            is_jsonb = _payload_is_jsonb(conn)
-            current = {}
-            if isinstance(payload, dict):
-                current.update(payload)
-            if reason:
-                current["reject_reason"] = reason
-
-            if current:
-                if is_jsonb:
-                    cur.execute("UPDATE public.orders SET status='Rejected', payload=%s WHERE id=%s", (Json(current), order_id))
-                else:
-                    cur.execute("UPDATE public.orders SET status='Rejected', payload=(%s)::jsonb::text WHERE id=%s", (json.dumps(current, ensure_ascii=False), order_id))
-            else:
-                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
-
-        _notify_user(conn, user_id, order_id, "تم رفض طلبك", reason or "عذرًا، تم رفض هذا الطلب")
-        return {"ok": True, "status": "Rejected"}
-    finally:
-        put_conn(conn)
-
 # =========================
-# تعديل الرصيد (أدمن) + توافق الأزرار القديمة
+# Admin: wallet adjust + compatibility
 # =========================
 @app.post("/api/admin/users/{uid}/wallet/adjust")
 async def admin_wallet_adjust(uid: str, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
@@ -1227,8 +1124,22 @@ def admin_wallet_deduct(body: WalletCompatIn, x_admin_password: str = Header(...
     finally:
         put_conn(conn)
 
-# =============== تشغيل محلي ===============
-
+# =========================
+# Admin stats: users count & balances
+# =========================
+@app.get("/api/admin/users/count")
+def admin_users_count(x_admin_password: str = Header(..., alias="x-admin-password"), plain: int = 0):
+    _require_admin(x_admin_password)
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM public.users")
+            n = int(cur.fetchone()[0])
+        if str(plain) == "1":
+            return n
+        return {"ok": True, "count": n}
+    finally:
+        put_conn(conn)
 
 @app.get("/api/admin/users/balances")
 def admin_users_balances(
@@ -1236,12 +1147,10 @@ def admin_users_balances(
     q: str = "", limit: int = 100, offset: int = 0, sort: str = "balance_desc"
 ):
     """
-    قائمة أرصدة المستخدمين (لزر "أرصدة المستخدمين").
-    يدعم البحث بـ q على uid، والفرز، و limit/offset.
+    DEFAULT: returns a JSON ARRAY for UI compatibility.
     """
     _require_admin(x_admin_password)
 
-    # حراسة للمعاملات
     q = (q or "").strip()
     try:
         limit = max(1, min(int(limit), 500))
@@ -1268,11 +1177,6 @@ def admin_users_balances(
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            # total
-            cur.execute(f"SELECT COUNT(*) FROM public.users {where}", params)
-            total = int(cur.fetchone()[0])
-
-            # page
             cur.execute(
                 f"""
                 SELECT id, uid, balance, is_banned,
@@ -1295,74 +1199,82 @@ def admin_users_balances(
                 "created_at": int(r[4] or 0),
             } for r in rows
         ]
+        # Return ARRAY directly
+        return items
+    finally:
+        put_conn(conn)
 
-        # مخرجات مرنة: قائمة مباشرة + غلاف بالـ meta
+@app.get("/api/admin/users/balances_meta")
+def admin_users_balances_meta(
+    x_admin_password: str = Header(..., alias="x-admin-password"),
+    q: str = "", limit: int = 100, offset: int = 0, sort: str = "balance_desc"
+):
+    _require_admin(x_admin_password)
+
+    q = (q or "").strip()
+    try:
+        limit_val = max(1, min(int(limit), 500))
+        offset_val = max(0, int(offset))
+    except Exception:
+        limit_val, offset_val = 100, 0
+
+    sort_map = {
+        "balance_desc": "balance DESC",
+        "balance_asc": "balance ASC",
+        "created_desc": "created_at DESC",
+        "created_asc": "created_at ASC",
+        "uid_asc": "uid ASC",
+        "uid_desc": "uid DESC",
+    }
+    order_by = sort_map.get(sort, "balance DESC")
+
+    where = "WHERE TRUE"
+    params = []
+    if q:
+        where += " AND (uid ILIKE %s)"
+        params.append(f"%{q}%")
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM public.users {where}", params)
+            total = int(cur.fetchone()[0])
+            cur.execute(
+                f"""
+                SELECT id, uid, balance, is_banned,
+                       EXTRACT(EPOCH FROM created_at)*1000 AS created_at
+                FROM public.users
+                {where}
+                ORDER BY {order_by}
+                LIMIT %s OFFSET %s
+                """,
+                (*params, limit_val, offset_val)
+            )
+            rows = cur.fetchall()
+        items = [
+            {
+                "id": r[0],
+                "uid": r[1],
+                "balance": float(r[2] or 0),
+                "is_banned": bool(r[3]),
+                "created_at": int(r[4] or 0),
+            } for r in rows
+        ]
         return {
             "ok": True,
             "total": total,
-            "limit": limit,
-            "offset": offset,
+            "limit": limit_val,
+            "offset": offset_val,
             "sort": sort,
-            "items": items
+            "items": items,
+            "data": items,
+            "total_users": total
         }
     finally:
         put_conn(conn)
 
-
-
-@app.get("/api/admin/users/count")
-def admin_users_count(x_admin_password: str = Header(..., alias="x-admin-password"), plain: int = 0):
-    """
-    عدد المستخدمين الإجمالي.
-    - default: {"ok": true, "count": N}
-    - إذا plain=1: يرجع رقمًا فقط (N) لتوافق أوسع.
-    """
-    _require_admin(x_admin_password)
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM public.users")
-            n = int(cur.fetchone()[0])
-        if str(plain) == "1":
-            # يرجع رقمًا فقط
-            return n
-        return {"ok": True, "count": n}
-    finally:
-        put_conn(conn)
-
-
-
-# ---- Compatibility responses for "User Balances" button ----
-@app.get("/api/admin/users/balances/raw")
-def admin_users_balances_raw(
-    x_admin_password: str = Header(..., alias="x-admin-password"),
-    q: str = "", limit: int = 100, offset: int = 0, sort: str = "balance_desc"
-):
-    """
-    RAW array response (compat with UIs expecting a pure JSON array).
-    """
-    res = admin_users_balances(x_admin_password=x_admin_password, q=q, limit=limit, offset=offset, sort=sort)
-    # return only the array (prefer `data`, fallback to `items`)
-    arr = res.get("data") or res.get("items") or []
-    return arr
-
-# Alias some likely old paths
-@app.get("/api/admin/users/wallets")
-def admin_users_wallets_alias(
-    x_admin_password: str = Header(..., alias="x-admin-password"),
-    q: str = "", limit: int = 100, offset: int = 0, sort: str = "balance_desc"
-):
-    return admin_users_balances_raw(x_admin_password=x_admin_password, q=q, limit=limit, offset=offset, sort=sort)
-
-# Add plain=1 to /balances to return array directly (no wrapper)
-@app.get("/api/admin/users/balances_plain")
-def admin_users_balances_plain(
-    x_admin_password: str = Header(..., alias="x-admin-password"),
-    q: str = "", limit: int = 100, offset: int = 0, sort: str = "balance_desc"
-):
-    return admin_users_balances_raw(x_admin_password=x_admin_password, q=q, limit=limit, offset=offset, sort=sort)
-
+# =============== Run local ===============
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("backend_refund_fix_final:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("backend_final_balances_array:app", host="0.0.0.0", port=port, reload=False)
