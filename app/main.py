@@ -103,7 +103,7 @@ ensure_schema()
 # =========================
 app = FastAPI(title="SMM Backend", version="1.4.1")
 
-# ===== Admin actions helpers =====
+# ===== Admin actions helpers (deliver/reject/execute) =====
 def _payload_is_jsonb(conn) -> bool:
     try:
         with conn.cursor() as cur:
@@ -114,7 +114,6 @@ def _payload_is_jsonb(conn) -> bool:
         return False
 
 async def _read_json_object(request):
-    import json
     try:
         data = await request.json()
     except Exception:
@@ -128,6 +127,7 @@ async def _read_json_object(request):
 
 def _needs_code(title: str, otype):
     t = (title or "").lower()
+    # iTunes + purchase cards need a code; Asiacell topup_card does NOT
     if (otype or "").lower() == "topup_card":
         return False
     for k in ("itunes","ايتونز","voucher","code","card","gift","رمز","كود","بطاقة","كارت","شراء"):
@@ -136,6 +136,7 @@ def _needs_code(title: str, otype):
     return False
 
 def _notify_user_if_possible(conn, user_id: int, order_id: int, title: str, body: str):
+    # Try user_notifications
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -145,6 +146,7 @@ def _notify_user_if_possible(conn, user_id: int, order_id: int, title: str, body
             return
     except Exception:
         pass
+    # Try notifications
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -154,7 +156,8 @@ def _notify_user_if_possible(conn, user_id: int, order_id: int, title: str, body
             return
     except Exception:
         pass
-    import os, json, urllib.request
+    # Optional webhook
+    import os, urllib.request
     url = os.getenv("NOTIFY_WEBHOOK_URL")
     if url:
         try:
@@ -809,6 +812,7 @@ async def admin_deliver_or_reject(oid: int, request: Request, x_admin_password: 
     _require_admin(x_admin_password)
     data = await _read_json_object(request)
     code_val = (data.get("code") or "").strip()
+    amount = data.get("amount")
 
     conn = get_conn()
     try:
@@ -831,9 +835,15 @@ async def admin_deliver_or_reject(oid: int, request: Request, x_admin_password: 
             current = {}
             if isinstance(payload, dict):
                 current.update(payload)
+
+            # For iTunes / purchase cards store the code
             if code_val:
                 current["card"] = code_val
                 current["code"] = code_val
+
+            # For topup_card allow 'amount' to be stored for auditing
+            if (otype or "").lower() == "topup_card" and amount is not None:
+                current["amount"] = amount
 
             if current:
                 if is_jsonb:
@@ -843,8 +853,10 @@ async def admin_deliver_or_reject(oid: int, request: Request, x_admin_password: 
             else:
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
 
+        # Notify user (best-effort)
         try:
-            _notify_user_if_possible(conn, user_id, order_id, "تم تنفيذ طلبك", f"{title}: {code_val}" if code_val else (title or "تم التنفيذ"))
+            msg = f"{title}: {code_val}" if code_val else (f"{title} - amount: {amount}" if amount is not None else (title or "تم التنفيذ"))
+            _notify_user_if_possible(conn, user_id, order_id, "تم تنفيذ طلبك", msg)
         except Exception:
             pass
 
@@ -973,12 +985,13 @@ async def admin_reject(oid: int, request: Request, x_admin_password: str = Heade
                 return {"ok": True, "status": status}
 
             is_jsonb = _payload_is_jsonb(conn)
-
+            current = {}
+            if isinstance(payload, dict):
+                current.update(payload)
             if reason:
-                current = {}
-                if isinstance(payload, dict):
-                    current.update(payload)
                 current["reject_reason"] = reason
+
+            if current:
                 if is_jsonb:
                     cur.execute("UPDATE public.orders SET status='Rejected', payload=%s WHERE id=%s", (Json(current), order_id))
                 else:
@@ -990,6 +1003,94 @@ async def admin_reject(oid: int, request: Request, x_admin_password: str = Heade
             _notify_user_if_possible(conn, user_id, order_id, "تم رفض طلبك", reason or "عذرًا، تم رفض هذا الطلب")
         except Exception:
             pass
+
+        return {"ok": True, "status": "Rejected"}
+    finally:
+        put_conn(conn)
+
+
+@app.post("/api/admin/topup_cards/{oid}/execute")
+async def admin_execute_topup_card(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
+    _require_admin(x_admin_password)
+    data = await _read_json_object(request)
+    amount = data.get("amount")
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id, user_id, status, payload, title FROM public.orders WHERE id=%s FOR UPDATE", (oid,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "order not found")
+            order_id, user_id, status, payload, title = row[0], row[1], row[2], (row[3] or {}), row[4]
+
+            if status in ("Done", "Rejected", "Refunded"):
+                return {"ok": True, "status": status}
+
+            is_jsonb = _payload_is_jsonb(conn)
+            current = {}
+            if isinstance(payload, dict):
+                current.update(payload)
+            if amount is not None:
+                current["amount"] = amount
+
+            if current:
+                if is_jsonb:
+                    cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(current), order_id))
+                else:
+                    cur.execute("UPDATE public.orders SET status='Done', payload=(%s)::jsonb::text WHERE id=%s", (json.dumps(current, ensure_ascii=False), order_id))
+            else:
+                cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
+
+        try:
+            msg = f"{title} - amount: {amount}" if amount is not None else title or "تم التنفيذ"
+            _notify_user_if_possible(conn, user_id, order_id, "تم تنفيذ طلبك", msg)
+        except Exception:
+            pass
+
+        return {"ok": True, "status": "Done"}
+    finally:
+        put_conn(conn)
+
+
+@app.post("/api/admin/topup_cards/{oid}/reject")
+async def admin_reject_topup_card(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
+    _require_admin(x_admin_password)
+    data = await _read_json_object(request)
+    reason = (data.get("reason") or data.get("message") or "").strip()
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id, user_id, status, payload FROM public.orders WHERE id=%s FOR UPDATE", (oid,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "order not found")
+            order_id, user_id, status, payload = row[0], row[1], row[2], (row[3] or {})
+
+            if status in ("Done", "Rejected", "Refunded"):
+                return {"ok": True, "status": status}
+
+            is_jsonb = _payload_is_jsonb(conn)
+            current = {}
+            if isinstance(payload, dict):
+                current.update(payload)
+            if reason:
+                current["reject_reason"] = reason
+
+            if current:
+                if is_jsonb:
+                    cur.execute("UPDATE public.orders SET status='Rejected', payload=%s WHERE id=%s", (Json(current), order_id))
+                else:
+                    cur.execute("UPDATE public.orders SET status='Rejected', payload=(%s)::jsonb::text WHERE id=%s", (json.dumps(current, ensure_ascii=False), order_id))
+            else:
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+
+        try:
+            _notify_user_if_possible(conn, user_id, order_id, "تم رفض طلبك", reason or "عذرًا، تم رفض هذا الطلب")
+        except Exception:
+            pass
+
         return {"ok": True, "status": "Rejected"}
     finally:
         put_conn(conn)
