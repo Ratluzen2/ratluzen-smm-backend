@@ -929,7 +929,7 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
                         VALUES(%s,%s,%s,%s)
                     """, (user_id, Decimal(add), "asiacell_topup", Json({"order_id": order_id, "amount": add})))
         # Build notification
-        title_txt = f"تم تنفيذ طلبك + {title}"
+        title_txt = f"تم تنفيذ طلبك {title}"
         if code_val:
             body_txt = f"الكود: {code_val}"
         elif amount:
@@ -1143,7 +1143,7 @@ async def admin_execute_topup_card(oid: int, request: Request, x_admin_password:
                     VALUES(%s,%s,%s,%s)
                 """, (user_id, Decimal(add), "asiacell_topup", Json({"order_id": order_id, "amount": add})))
         # Notify
-        title_txt = f"تم تنفيذ طلبك + {title}"
+        title_txt = f"تم تنفيذ طلبك {title}"
         body_txt  = f"المبلغ: {amount}" if amount else (title or "تم التنفيذ")
         _notify_user(conn, user_id, order_id, title_txt, body_txt)
         return {"ok": True, "status": "Done"}
