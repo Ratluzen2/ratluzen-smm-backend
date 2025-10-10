@@ -1228,6 +1228,86 @@ def admin_wallet_deduct(body: WalletCompatIn, x_admin_password: str = Header(...
         put_conn(conn)
 
 # =============== تشغيل محلي ===============
+
+
+@app.get("/api/admin/users/balances")
+def admin_users_balances(
+    x_admin_password: str = Header(..., alias="x-admin-password"),
+    q: str = "", limit: int = 100, offset: int = 0, sort: str = "balance_desc"
+):
+    """
+    قائمة أرصدة المستخدمين (لزر "أرصدة المستخدمين").
+    يدعم البحث بـ q على uid، والفرز، و limit/offset.
+    """
+    _require_admin(x_admin_password)
+
+    # حراسة للمعاملات
+    q = (q or "").strip()
+    try:
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+    except Exception:
+        limit, offset = 100, 0
+
+    sort_map = {
+        "balance_desc": "balance DESC",
+        "balance_asc": "balance ASC",
+        "created_desc": "created_at DESC",
+        "created_asc": "created_at ASC",
+        "uid_asc": "uid ASC",
+        "uid_desc": "uid DESC",
+    }
+    order_by = sort_map.get(sort, "balance DESC")
+
+    where = "WHERE TRUE"
+    params = []
+    if q:
+        where += " AND (uid ILIKE %s)"
+        params.append(f"%{q}%")
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            # total
+            cur.execute(f"SELECT COUNT(*) FROM public.users {where}", params)
+            total = int(cur.fetchone()[0])
+
+            # page
+            cur.execute(
+                f"""
+                SELECT id, uid, balance, is_banned,
+                       EXTRACT(EPOCH FROM created_at)*1000 AS created_at
+                FROM public.users
+                {where}
+                ORDER BY {order_by}
+                LIMIT %s OFFSET %s
+                """,
+                (*params, limit, offset)
+            )
+            rows = cur.fetchall()
+
+        items = [
+            {
+                "id": r[0],
+                "uid": r[1],
+                "balance": float(r[2] or 0),
+                "is_banned": bool(r[3]),
+                "created_at": int(r[4] or 0),
+            } for r in rows
+        ]
+
+        # مخرجات مرنة: قائمة مباشرة + غلاف بالـ meta
+        return {
+            "ok": True,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "sort": sort,
+            "items": items
+        }
+    finally:
+        put_conn(conn)
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
