@@ -1149,6 +1149,104 @@ async def admin_wallet_adjust(uid: str, request: Request, x_admin_password: str 
         put_conn(conn)
 
 # =============== تشغيل محلي ===============
+
+
+# =========================
+# توافق مع الأزرار القديمة: شحن/خصم رصيد (أدمن)
+# =========================
+from fastapi import Body
+
+class WalletCompatIn(BaseModel):
+    uid: str
+    amount: float
+    reason: Optional[str] = None
+
+@app.post("/api/admin/wallet/topup")
+def admin_wallet_topup(body: WalletCompatIn, x_admin_password: str = Header(..., alias="x-admin-password")):
+    """
+    توافق: شحن رصيد للمستخدم (POST من الزر القديم).
+    Body: { "uid": "...", "amount": 5000 }
+    """
+    _require_admin(x_admin_password)
+    uid = (body.uid or "").strip()
+    if not uid:
+        raise HTTPException(400, "uid required")
+    try:
+        amt = float(body.amount)
+    except Exception:
+        raise HTTPException(400, "amount must be number")
+    if amt <= 0:
+        raise HTTPException(400, "amount must be > 0")
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            # find/create user
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                # create user on the fly
+                cur.execute("INSERT INTO public.users(uid) VALUES(%s) RETURNING id", (uid,))
+                user_id = cur.fetchone()[0]
+            else:
+                user_id = r[0]
+
+            # update balance
+            from decimal import Decimal
+            cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(amt), user_id))
+            # insert wallet txn (trigger will notify the user)
+            cur.execute(
+                """
+                INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                VALUES(%s,%s,%s,%s)
+                """,
+                (user_id, Decimal(amt), body.reason or "manual_topup", Json({"compat": "topup"}))
+            )
+
+        return {"ok": True, "status": "adjusted", "amount": amt, "direction": "topup"}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/wallet/deduct")
+def admin_wallet_deduct(body: WalletCompatIn, x_admin_password: str = Header(..., alias="x-admin-password")):
+    """
+    توافق: خصم رصيد من المستخدم (POST من الزر القديم).
+    Body: { "uid": "...", "amount": 500 }
+    """
+    _require_admin(x_admin_password)
+    uid = (body.uid or "").strip()
+    if not uid:
+        raise HTTPException(400, "uid required")
+    try:
+        amt = float(body.amount)
+    except Exception:
+        raise HTTPException(400, "amount must be number")
+    if amt <= 0:
+        raise HTTPException(400, "amount must be > 0")
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                raise HTTPException(404, "user not found")
+            user_id = r[0]
+
+            from decimal import Decimal
+            cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (Decimal(amt), user_id))
+            cur.execute(
+                """
+                INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                VALUES(%s,%s,%s,%s)
+                """,
+                (user_id, Decimal(-amt), body.reason or "manual_deduct", Json({"compat": "deduct"}))
+            )
+
+        return {"ok": True, "status": "adjusted", "amount": -amt, "direction": "deduct"}
+    finally:
+        put_conn(conn)
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
