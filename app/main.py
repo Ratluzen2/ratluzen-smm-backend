@@ -101,7 +101,7 @@ def ensure_schema():
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON public.orders(user_id);")
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders(status);")
 
-                    # upgrade: make type default/non-null & payload non-null
+                    # upgrade: defaults
                     cur.execute("ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS type TEXT;")
                     cur.execute("UPDATE public.orders SET type='provider' WHERE type IS NULL;")
                     cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET DEFAULT 'provider';")
@@ -177,7 +177,7 @@ ensure_schema()
 # =========================
 # FastAPI & CORS
 # =========================
-app = FastAPI(title="SMM Backend", version="1.5.0")
+app = FastAPI(title="SMM Backend", version="1.6.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -257,6 +257,11 @@ class AsiacellSubmitIn(BaseModel):
     uid: str
     card: str
 
+class WalletCompatIn(BaseModel):
+    uid: str
+    amount: float
+    reason: Optional[str] = None
+
 # =========================
 # جذور عامة + صحة
 # =========================
@@ -294,6 +299,7 @@ def _ensure_user(cur, uid: str) -> int:
     return cur.fetchone()[0]
 
 def _refund_if_needed(cur, user_id: int, price: float, order_id: int):
+    """Refund helper used on provider error/explicit reject."""
     if price and price > 0:
         cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(price), user_id))
         cur.execute("""
@@ -594,10 +600,6 @@ def mark_notification_read(uid: str, nid: int):
 # =========================
 @app.get("/api/admin/pending/services")
 def admin_pending_services(x_admin_password: str = Header(..., alias="x-admin-password")):
-    """
-    يعرض الطلبات المعلّقة التي لا تنتمي إلى:
-    PUBG / Ludo / شحن أسيا بالكارت (type='topup_card') / شراء الكارتات (أثير/أسيا/كورك) / iTunes.
-    """
     _require_admin(x_admin_password)
     conn = get_conn()
     try:
@@ -609,7 +611,6 @@ def admin_pending_services(x_admin_password: str = Header(..., alias="x-admin-pa
                 FROM public.orders o
                 JOIN public.users u ON u.id = o.user_id
                 WHERE o.status='Pending'
-                  -- استبعاد PUBG
                   AND NOT (
                         LOWER(o.title) LIKE '%pubg%' OR
                         LOWER(o.title) LIKE '%bgmi%' OR
@@ -618,16 +619,13 @@ def admin_pending_services(x_admin_password: str = Header(..., alias="x-admin-pa
                         o.title LIKE '%بيجي%' OR
                         o.title LIKE '%ببجي%'
                   )
-                  -- استبعاد Ludo
                   AND NOT (
                         LOWER(o.title) LIKE '%ludo%' OR
                         LOWER(o.title) LIKE '%yalla%' OR
                         o.title LIKE '%يلا لودو%' OR
                         o.title LIKE '%لودو%'
                   )
-                  -- استبعاد شحن أسيا بالكارت عبر الـ type
                   AND (o.type IS NULL OR o.type <> 'topup_card')
-                  -- استبعاد شراء الكارتات
                   AND NOT (
                         (
                           (LOWER(o.title) LIKE '%asiacell%' OR o.title LIKE '%أسيا%' OR o.title LIKE '%اسياسيل%' OR
@@ -641,7 +639,6 @@ def admin_pending_services(x_admin_password: str = Header(..., alias="x-admin-pa
                           )
                         )
                   )
-                  -- استبعاد iTunes
                   AND NOT (LOWER(o.title) LIKE '%itunes%' OR o.title LIKE '%ايتونز%')
                 ORDER BY o.id DESC
             """)
@@ -766,10 +763,6 @@ def admin_pending_cards(x_admin_password: str = Header(..., alias="x-admin-passw
 # --------- طلبات شراء الكارتات (أثير/أسيا/كورك) ---------
 @app.get("/api/admin/pending/balances")
 def admin_pending_balances(x_admin_password: str = Header(..., alias="x-admin-password")):
-    """
-    طلبات شراء الكارتات فقط (أثير/أسيا سيل/كورك) — ليست شحنًا مباشرًا — وتستبعد iTunes.
-    يعتمد على الكلمات المفتاحية في العنوان لضمان الفصل عن شحن أسيا (topup_card).
-    """
     _require_admin(x_admin_password)
     conn = get_conn()
     try:
@@ -781,7 +774,6 @@ def admin_pending_balances(x_admin_password: str = Header(..., alias="x-admin-pa
                 FROM public.orders o
                 JOIN public.users u ON u.id = o.user_id
                 WHERE o.status='Pending'
-                  -- شبكات العراق (أثير/أسيا/كورك)
                   AND (
                         LOWER(o.title) LIKE '%asiacell%' OR
                         o.title LIKE '%أسيا%' OR
@@ -790,7 +782,6 @@ def admin_pending_balances(x_admin_password: str = Header(..., alias="x-admin-pa
                         o.title LIKE '%كورك%' OR
                         o.title LIKE '%اثير%'
                   )
-                  -- شراء كارت/فاوتشر/كود (وليس شحن مباشر)
                   AND (
                         LOWER(o.title) LIKE '%voucher%' OR
                         LOWER(o.title) LIKE '%code%' OR
@@ -801,7 +792,6 @@ def admin_pending_balances(x_admin_password: str = Header(..., alias="x-admin-pa
                         o.title LIKE '%كارت%' OR
                         o.title LIKE '%شراء%'
                   )
-                  -- استبعاد أي صياغة للشحن المباشر
                   AND NOT (
                         LOWER(o.title) LIKE '%topup%' OR
                         LOWER(o.title) LIKE '%top-up%' OR
@@ -811,7 +801,6 @@ def admin_pending_balances(x_admin_password: str = Header(..., alias="x-admin-pa
                         o.title LIKE '%شحن اسيا%' OR
                         LOWER(o.title) LIKE '%direct%'
                   )
-                  -- استبعاد iTunes
                   AND NOT (
                         LOWER(o.title) LIKE '%itunes%' OR
                         o.title LIKE '%ايتونز%'
@@ -972,6 +961,10 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
 
 @app.post("/api/admin/orders/{oid}/reject")
 async def admin_reject(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
+    """
+    يرفض الطلب ويُرجِع الرصيد تلقائيًا للطلبات المدفوعة (خصوصًا خدمات API / provider).
+    لا يُكرّر الاسترجاع إذا وُسِم payload.refunded = true.
+    """
     _require_admin(x_admin_password)
     data = await _read_json_object(request)
     reason = (data.get("reason") or data.get("message") or "").strip()
@@ -979,22 +972,38 @@ async def admin_reject(oid: int, request: Request, x_admin_password: str = Heade
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            cur.execute("SELECT id, user_id, status, payload, title FROM public.orders WHERE id=%s FOR UPDATE", (oid,))
+            cur.execute("SELECT id, user_id, price, status, payload, title, COALESCE(type,'') FROM public.orders WHERE id=%s FOR UPDATE", (oid,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "order not found")
 
-            order_id, user_id, status, payload, title = row[0], row[1], row[2], (row[3] or {}), row[4]
+            order_id, user_id, price, status, payload, title, otype = row[0], row[1], float(row[2] or 0), row[3], (row[4] or {}), row[5], (row[6] or "")
             if status in ("Done", "Rejected", "Refunded"):
                 return {"ok": True, "status": status}
 
             is_jsonb = _payload_is_jsonb(conn)
-            current = {}
+            current: Dict[str, Any] = {}
             if isinstance(payload, dict):
                 current.update(payload)
+
             if reason:
                 current["reject_reason"] = reason
 
+            # --- Refund wallet if this is a paid order and not already refunded ---
+            already_refunded = bool(current.get("refunded")) if isinstance(current, dict) else False
+            if price > 0 and not already_refunded:
+                cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(price), user_id))
+                cur.execute(
+                    """
+                    INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                    VALUES(%s,%s,%s,%s)
+                    """,
+                    (user_id, Decimal(price), "order_refund", Json({"order_id": order_id, "reject": True}))
+                )
+                current["refunded"] = True
+                current["refunded_amount"] = float(price)
+
+            # Persist status & payload
             if current:
                 if is_jsonb:
                     cur.execute("UPDATE public.orders SET status='Rejected', payload=%s WHERE id=%s", (Json(current), order_id))
@@ -1103,7 +1112,7 @@ async def admin_reject_topup_card(oid: int, request: Request, x_admin_password: 
         put_conn(conn)
 
 # =========================
-# تعديل الرصيد (أدمن) مع إشعار تلقائي من التريغر
+# تعديل الرصيد (أدمن) + توافق الأزرار القديمة
 # =========================
 @app.post("/api/admin/users/{uid}/wallet/adjust")
 async def admin_wallet_adjust(uid: str, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
@@ -1148,25 +1157,8 @@ async def admin_wallet_adjust(uid: str, request: Request, x_admin_password: str 
     finally:
         put_conn(conn)
 
-# =============== تشغيل محلي ===============
-
-
-# =========================
-# توافق مع الأزرار القديمة: شحن/خصم رصيد (أدمن)
-# =========================
-from fastapi import Body
-
-class WalletCompatIn(BaseModel):
-    uid: str
-    amount: float
-    reason: Optional[str] = None
-
 @app.post("/api/admin/wallet/topup")
 def admin_wallet_topup(body: WalletCompatIn, x_admin_password: str = Header(..., alias="x-admin-password")):
-    """
-    توافق: شحن رصيد للمستخدم (POST من الزر القديم).
-    Body: { "uid": "...", "amount": 5000 }
-    """
     _require_admin(x_admin_password)
     uid = (body.uid or "").strip()
     if not uid:
@@ -1181,20 +1173,15 @@ def admin_wallet_topup(body: WalletCompatIn, x_admin_password: str = Header(...,
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            # find/create user
             cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
             r = cur.fetchone()
             if not r:
-                # create user on the fly
                 cur.execute("INSERT INTO public.users(uid) VALUES(%s) RETURNING id", (uid,))
                 user_id = cur.fetchone()[0]
             else:
                 user_id = r[0]
 
-            # update balance
-            from decimal import Decimal
             cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(amt), user_id))
-            # insert wallet txn (trigger will notify the user)
             cur.execute(
                 """
                 INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
@@ -1202,17 +1189,12 @@ def admin_wallet_topup(body: WalletCompatIn, x_admin_password: str = Header(...,
                 """,
                 (user_id, Decimal(amt), body.reason or "manual_topup", Json({"compat": "topup"}))
             )
-
         return {"ok": True, "status": "adjusted", "amount": amt, "direction": "topup"}
     finally:
         put_conn(conn)
 
 @app.post("/api/admin/wallet/deduct")
 def admin_wallet_deduct(body: WalletCompatIn, x_admin_password: str = Header(..., alias="x-admin-password")):
-    """
-    توافق: خصم رصيد من المستخدم (POST من الزر القديم).
-    Body: { "uid": "...", "amount": 500 }
-    """
     _require_admin(x_admin_password)
     uid = (body.uid or "").strip()
     if not uid:
@@ -1233,7 +1215,6 @@ def admin_wallet_deduct(body: WalletCompatIn, x_admin_password: str = Header(...
                 raise HTTPException(404, "user not found")
             user_id = r[0]
 
-            from decimal import Decimal
             cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (Decimal(amt), user_id))
             cur.execute(
                 """
@@ -1242,12 +1223,12 @@ def admin_wallet_deduct(body: WalletCompatIn, x_admin_password: str = Header(...
                 """,
                 (user_id, Decimal(-amt), body.reason or "manual_deduct", Json({"compat": "deduct"}))
             )
-
         return {"ok": True, "status": "adjusted", "amount": -amt, "direction": "deduct"}
     finally:
         put_conn(conn)
 
+# =============== تشغيل محلي ===============
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("backend_refund_fix_final:app", host="0.0.0.0", port=port, reload=False)
