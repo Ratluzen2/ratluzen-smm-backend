@@ -84,22 +84,6 @@ def ensure_schema():
             CREATE INDEX IF NOT EXISTS idx_users_uid ON public.users(uid);
             CREATE INDEX IF NOT EXISTS idx_orders_user ON public.orders(user_id);
             CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders(status);
-            
-            CREATE TABLE IF NOT EXISTS public.user_notifications(
-                id BIGSERIAL PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-                order_id INTEGER NULL REFERENCES public.orders(id) ON DELETE SET NULL,
-                title TEXT NOT NULL,
-                body  TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'unread',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                read_at    TIMESTAMPTZ NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_user_notifications_user_created
-              ON public.user_notifications(user_id, created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_user_notifications_status
-              ON public.user_notifications(status);
-            
             """)
             # ترقية: ضمان عمود type موجود وافتراضي وغير فارغ
             cur.execute("""ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS type TEXT;""")
@@ -118,6 +102,36 @@ ensure_schema()
 # FastAPI & CORS
 # =========================
 app = FastAPI(title="SMM Backend", version="1.4.1")
+
+# ===== Helpers: JSON body, JSONB detection, notifications =====
+def _payload_is_jsonb(conn) -> bool:
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_typeof(payload)::text FROM public.orders LIMIT 1")
+            row = cur.fetchone()
+            return bool(row and isinstance(row[0], str) and row[0].lower() == "jsonb")
+    except Exception:
+        return False
+
+async def _read_json_object(request):
+    try:
+        data = await request.json()
+    except Exception:
+        raw = (await request.body()).decode("utf-8", errors="ignore").strip()
+        data = json.loads(raw) if raw else {}
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise HTTPException(400, "Body must be a JSON object")
+    return data
+
+def _notify_user(conn, user_id: int, order_id: int|None, title: str, body: str):
+    """Write a durable in-app notification into public.user_notifications (no silent fallback)."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
+            VALUES (%s, %s, %s, %s, 'unread', NOW())
+        """, (user_id, order_id, title, body))
 
 # ===== Admin actions helpers (deliver/reject/execute) =====
 def _payload_is_jsonb(conn) -> bool:
@@ -547,8 +561,7 @@ def list_user_notifications(uid: str, status: str = "unread", limit: int = 50):
                 ORDER BY id DESC
                 LIMIT %s
             """, (*params, limit))
-            rows = cur.fetchall() or []
-        return rows
+            return cur.fetchall() or []
     finally:
         put_conn(conn)
 
@@ -569,7 +582,7 @@ def mark_notification_read(uid: str, nid: int):
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "notification not found")
-        return {"ok": True, "id": row["id"]}
+            return {"ok": True, "id": row["id"]}
     finally:
         put_conn(conn)
 
@@ -875,12 +888,13 @@ def admin_approve_order(oid: int, x_admin_password: str = Header(..., alias="x-a
         put_conn(conn)
 
 
+
 @app.post("/api/admin/orders/{oid}/deliver")
 async def admin_deliver_or_reject(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
     _require_admin(x_admin_password)
     data = await _read_json_object(request)
     code_val = (data.get("code") or "").strip()
-    amount = data.get("amount")
+    amount   = data.get("amount")
 
     conn = get_conn()
     try:
@@ -889,30 +903,33 @@ async def admin_deliver_or_reject(oid: int, request: Request, x_admin_password: 
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "order not found")
-            order_id, user_id, price, status, payload, title, otype = row[0], row[1], float(row[2] or 0), row[3], (row[4] or {}), row[5], row[6]
+            order_id, user_id, price, status, payload, title, otype = row[0], row[1], float(row[2] or 0), row[3], (row[4] or {}), row[5], (row[6] or "")
 
             if status in ("Done", "Rejected", "Refunded"):
                 return {"ok": True, "status": status}
 
-            needs_code = _needs_code(title, otype)
+            needs_code = (("itunes" in (title or "").lower()) or ("card" in (title or "").lower()) or ("كارت" in (title or "").lower()) or ("ايتونز" in (title or "").lower())) and (otype.lower() != "topup_card")
             is_jsonb = _payload_is_jsonb(conn)
-
-            if needs_code and not code_val:
-                raise HTTPException(400, "code is required for this order")
 
             current = {}
             if isinstance(payload, dict):
                 current.update(payload)
 
-            # For iTunes / purchase cards store the code
-            if code_val:
+            if needs_code:
+                if not code_val:
+                    raise HTTPException(400, "code is required for this order")
                 current["card"] = code_val
                 current["code"] = code_val
 
-            # For topup_card allow 'amount' to be stored for auditing
-            if (otype or "").lower() == "topup_card" and amount is not None:
-                current["amount"] = amount
+            if otype.lower() == "topup_card":
+                # optional amount audit on deliver
+                if amount is not None:
+                    try:
+                        current["amount"] = float(amount)
+                    except Exception:
+                        pass
 
+            # write order status/payload
             if current:
                 if is_jsonb:
                     cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(current), order_id))
@@ -921,12 +938,26 @@ async def admin_deliver_or_reject(oid: int, request: Request, x_admin_password: 
             else:
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
 
-        # Notify user (best-effort)
+            # topup wallet if applicable
+            if otype.lower() == "topup_card":
+                add = 0.0
+                try:
+                    add = float(amount or 0)
+                except Exception:
+                    add = 0.0
+                if add > 0:
+                    cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(add), user_id))
+                    cur.execute("""
+                        INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                        VALUES(%s,%s,%s,%s)
+                    """, (user_id, Decimal(add), "asiacell_topup", Json({"order_id": order_id, "amount": add})))
+
+        # durable notification
+        body = (f"{title}: {code_val}" if needs_code else (f"{title} - amount: {amount}" if amount else (title or "تم التنفيذ")))
         try:
-            msg = f"{title}: {code_val}" if code_val else (f"{title} - amount: {amount}" if amount is not None else (title or "تم التنفيذ"))
-            _notify_user_if_possible(conn, user_id, order_id, "تم تنفيذ طلبك", msg)
-        except Exception:
-            pass
+            _notify_user(conn, user_id, order_id, "تم تنفيذ طلبك", body)
+        except Exception as _e:
+            print("notify failed:", _e)
 
         return {"ok": True, "status": "Done"}
     finally:
@@ -1116,19 +1147,6 @@ async def admin_execute_topup_card(oid: int, request: Request, x_admin_password:
         except Exception:
             pass
 
-        
-            # Add to user's wallet if amount > 0
-            added = 0.0
-            try:
-                added = float(amount or 0)
-            except Exception:
-                added = 0.0
-            if added > 0:
-                cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(added), user_id))
-                cur.execute("""
-                    INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
-                    VALUES(%s,%s,%s,%s)
-                """, (user_id, Decimal(added), "asiacell_topup", Json({"order_id": order_id, "amount": added})))
         return {"ok": True, "status": "Done"}
     finally:
         put_conn(conn)
@@ -1175,3 +1193,11 @@ async def admin_reject_topup_card(oid: int, request: Request, x_admin_password: 
         return {"ok": True, "status": "Rejected"}
     finally:
         put_conn(conn)
+
+
+@app.on_event("startup")
+def _startup_hook():
+    try:
+        ensure_schema()
+    except Exception as e:
+        print("ensure_schema() failed:", e)
