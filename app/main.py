@@ -889,7 +889,8 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
                 current.update(payload)
             elif isinstance(payload, str) and payload.strip():
                 try:
-                    current.update(json.loads(payload))
+                    import json as _json
+                    current.update(_json.loads(payload))
                 except Exception:
                     current = {}
 
@@ -909,7 +910,8 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
                 if is_jsonb:
                     cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(current), order_id))
                 else:
-                    cur.execute("UPDATE public.orders SET status='Done', payload=(%s)::jsonb::text WHERE id=%s", (json.dumps(current, ensure_ascii=False), order_id))
+                    import json as _json
+                    cur.execute("UPDATE public.orders SET status='Done', payload=(%s)::jsonb::text WHERE id=%s", (_json.dumps(current, ensure_ascii=False), order_id))
             else:
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
 
@@ -926,16 +928,15 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
                         INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
                         VALUES(%s,%s,%s,%s)
                     """, (user_id, Decimal(add), "asiacell_topup", Json({"order_id": order_id, "amount": add})))
-
-        body = (f"الكود: {code_val}" if code_val else (f"المبلغ: {amount}" if amount else (title or "تم التنفيذ"))))
-            # Build body safely without tricky parentheses
-    if code_val:
-        body_txt = f"الكود: {code_val}"
-    elif amount:
-        body_txt = f"المبلغ: {amount}"
-    else:
-        body_txt = title or "تم التنفيذ"
-_notify_user(conn, user_id, order_id, f\"تم تنفيذ طلبك + {title}\", body)
+        # Build notification
+        title_txt = f"تم تنفيذ طلبك + {title}"
+        if code_val:
+            body_txt = f"الكود: {code_val}"
+        elif amount:
+            body_txt = f"المبلغ: {amount}"
+        else:
+            body_txt = title or "تم التنفيذ"
+        _notify_user(conn, user_id, order_id, title_txt, body_txt)
         return {"ok": True, "status": "Done"}
     finally:
         put_conn(conn)
@@ -1110,7 +1111,8 @@ async def admin_execute_topup_card(oid: int, request: Request, x_admin_password:
                 current.update(payload)
             elif isinstance(payload, str) and payload.strip():
                 try:
-                    current.update(json.loads(payload))
+                    import json as _json
+                    current.update(_json.loads(payload))
                 except Exception:
                     current = {}
             if amount is not None:
@@ -1123,7 +1125,8 @@ async def admin_execute_topup_card(oid: int, request: Request, x_admin_password:
                 if is_jsonb:
                     cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(current), order_id))
                 else:
-                    cur.execute("UPDATE public.orders SET status='Done', payload=(%s)::jsonb::text WHERE id=%s", (json.dumps(current, ensure_ascii=False), order_id))
+                    import json as _json
+                    cur.execute("UPDATE public.orders SET status='Done', payload=(%s)::jsonb::text WHERE id=%s", (_json.dumps(current, ensure_ascii=False), order_id))
             else:
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
 
@@ -1139,13 +1142,10 @@ async def admin_execute_topup_card(oid: int, request: Request, x_admin_password:
                     INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
                     VALUES(%s,%s,%s,%s)
                 """, (user_id, Decimal(add), "asiacell_topup", Json({"order_id": order_id, "amount": add})))
-
-            # Build body for topup
-    if amount:
-        body_txt = f"المبلغ: {amount}"
-    else:
-        body_txt = title or "تم التنفيذ"
-_notify_user(conn, user_id, order_id, f\"تم تنفيذ طلبك + {title}\", body_txt)
+        # Notify
+        title_txt = f"تم تنفيذ طلبك + {title}"
+        body_txt  = f"المبلغ: {amount}" if amount else (title or "تم التنفيذ")
+        _notify_user(conn, user_id, order_id, title_txt, body_txt)
         return {"ok": True, "status": "Done"}
     finally:
         put_conn(conn)
