@@ -589,6 +589,91 @@ def mark_notification_read(uid: str, nid: int):
     finally:
         put_conn(conn)
 
+
+# =========================
+# Manual PAID orders (charge now, refund on reject)
+# =========================
+@app.post("/api/orders/create/manual_paid")
+async def create_manual_paid(request: Request):
+    """
+    Creates a manual order (iTunes / Atheer / Asiacell / Korek voucher) and atomically charges user balance.
+    Body: { uid: str, product: "itunes"|"atheer"|"asiacell"|"korek", usd: one of [5,10,15,20,25,30,40,50,100] }
+    Pricing:
+      - itunes:   each 5$ = 9$
+      - atheer:   each 5$ = 7$
+      - asiacell: each 5$ = 7$
+      - korek:    each 5$ = 7$   (per latest requirement)
+    Refund: if owner rejects later, /api/admin/orders/{id}/reject auto-refunds price>0 (already implemented).
+    """
+    data = await _read_json_object(request)
+    uid = (data.get("uid") or "").strip()
+    product = (data.get("product") or "").strip().lower()
+    try:
+        usd = int(data.get("usd") or 0)
+    except Exception:
+        raise HTTPException(422, "invalid usd")
+
+    allowed = {5,10,15,20,25,30,40,50,100}
+    if not uid or usd not in allowed or usd % 5 != 0:
+        raise HTTPException(422, "invalid payload")
+    if product not in ("itunes","atheer","asiacell","korek"):
+        raise HTTPException(422, "invalid product")
+
+    steps = usd / 5.0
+    if product == "itunes":
+        price = steps * 9.0
+        title = f"شراء رصيد ايتونز {usd}$"
+    elif product == "atheer":
+        price = steps * 7.0
+        title = f"شراء رصيد اثير {usd}$"
+    elif product == "asiacell":
+        price = steps * 7.0
+        title = f"شراء رصيد اسياسيل {usd}$"
+    else:  # korek
+        price = steps * 7.0
+        title = f"شراء رصيد كورك {usd}$"
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            # ensure user & balance
+            cur.execute("SELECT id, balance, is_banned FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                cur.execute("INSERT INTO public.users(uid) VALUES(%s) RETURNING id, 0.0, FALSE", (uid,))
+                r = cur.fetchone()
+            user_id, bal, banned = int(r[0]), float(r[1] or 0), bool(r[2])
+            if banned:
+                raise HTTPException(403, "user banned")
+            if bal < price:
+                raise HTTPException(400, "insufficient balance")
+
+            # charge
+            cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (Decimal(price), user_id))
+            cur.execute(
+                "INSERT INTO public.wallet_txns(user_id, amount, reason, meta) VALUES(%s,%s,%s,%s)",
+                (user_id, Decimal(-price), "order_charge", Json({"product": product, "usd": usd}))
+            )
+
+            # create pending manual order carrying the price for future refund if rejected
+            cur.execute(
+                """
+                INSERT INTO public.orders(user_id, title, quantity, price, status, payload, type)
+                VALUES(%s,%s,%s,%s,'Pending',%s,'manual')
+                RETURNING id
+                """,
+                (user_id, title, usd, float(price),
+                 Json({"product": product, "usd": usd, "charged": float(price)}))
+            )
+            oid = cur.fetchone()[0]
+
+        # optional: immediate user notification (order received)
+        _notify_user(conn, user_id, oid, "تم استلام طلبك", title)
+
+        return {"ok": True, "order_id": oid, "charged": float(price)}
+    finally:
+        put_conn(conn)
+
 # =========================
 # Admin queues (pending)
 # =========================
@@ -1277,4 +1362,4 @@ def admin_users_balances_meta(
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("backend_final_balances_array:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
