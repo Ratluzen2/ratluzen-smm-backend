@@ -112,6 +112,53 @@ def ensure_schema():
               ON public.user_notifications(status);
             """)
         
+
+        # Notification trigger for wallet_txns
+        cur.execute("""
+        CREATE OR REPLACE FUNCTION public.wallet_txns_notify()
+        RETURNS trigger AS $$
+        DECLARE
+            t TEXT := 'تم تعديل رصيدك';
+            b TEXT;
+        BEGIN
+            -- Skip notifications for specific reasons or when meta.no_notify=true
+            IF NEW.reason = 'asiacell_topup' THEN
+                RETURN NEW;
+            END IF;
+            IF NEW.meta IS NOT NULL AND (NEW.meta ? 'no_notify') AND (NEW.meta->>'no_notify')::boolean IS TRUE THEN
+                RETURN NEW;
+            END IF;
+
+            IF NEW.amount > 0 THEN
+                b := 'تم إضافة ' || NEW.amount::text;
+            ELSIF NEW.amount < 0 THEN
+                b := 'تم خصم ' || ABS(NEW.amount)::text;
+            ELSE
+                RETURN NEW;
+            END IF;
+
+            INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
+            VALUES (NEW.user_id, NULL, t, b, 'unread', NOW());
+
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        """)
+
+        cur.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_trigger WHERE tgname = 'wallet_txns_notify_ai'
+            ) THEN
+                CREATE TRIGGER wallet_txns_notify_ai
+                AFTER INSERT ON public.wallet_txns
+                FOR EACH ROW
+                EXECUTE FUNCTION public.wallet_txns_notify();
+            END IF;
+        END $$;
+        """)
+
     finally:
         put_conn(conn)
 
@@ -121,25 +168,6 @@ ensure_schema()
 # FastAPI & CORS
 # =========================
 app = FastAPI(title="SMM Backend", version="1.4.1")
-
-def _notify_user(conn, user_id: int, order_id: int | None, title: str, body: str):
-    """Durable in-app notification that always COMMITs to public.user_notifications."""
-    try:
-        with conn:  # start/commit a transaction
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
-                    VALUES (%s, %s, %s, %s, 'unread', NOW())
-                    """,
-                    (user_id, order_id, title, body)
-                )
-    except Exception as e:
-        # As a last resort, avoid crashing admin actions; but log the error to server logs
-        try:
-            print("[notify][ERROR]", e)
-        except Exception:
-            pass
 
 # ===== Helpers: JSON body, JSONB detection, notifications =====
 def _payload_is_jsonb(conn) -> bool:
@@ -163,7 +191,35 @@ async def _read_json_object(request):
         raise HTTPException(400, "Body must be a JSON object")
     return data
 
+def _notify_user(conn, user_id: int, order_id: int|None, title: str, body: str):
+    """Write a durable in-app notification into public.user_notifications (no silent fallback)."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
+            VALUES (%s, %s, %s, %s, 'unread', NOW())
+        """, (user_id, order_id, title, body))
 
+# ===== Admin actions helpers (deliver/reject/execute) =====
+def _payload_is_jsonb(conn) -> bool:
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_typeof(payload)::text FROM public.orders LIMIT 1")
+            row = cur.fetchone()
+            return bool(row and isinstance(row[0], str) and row[0].lower() == "jsonb")
+    except Exception:
+        return False
+
+async def _read_json_object(request):
+    try:
+        data = await request.json()
+    except Exception:
+        raw = (await request.body()).decode("utf-8", errors="ignore").strip()
+        data = json.loads(raw) if raw else {}
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise HTTPException(400, "Body must be a JSON object")
+    return data
 
 def _needs_code(title: str, otype):
     t = (title or "").lower()
@@ -175,6 +231,46 @@ def _needs_code(title: str, otype):
             return True
     return False
 
+def _notify_user(conn, user_id: int, order_id: int, title: str, body: str):
+    # Try user_notifications
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO public.user_notifications (user_id, order_id, title, body, created_at)
+                VALUES (%s, %s, %s, %s, NOW())
+            """, (user_id, order_id, title, body))
+            return
+    except Exception:
+        pass
+    # Try notifications
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO public.notifications (user_id, order_id, title, body, created_at)
+                VALUES (%s, %s, %s, %s, NOW())
+            """, (user_id, order_id, title, body))
+            return
+    except Exception:
+        pass
+    # Optional webhook
+    import os, urllib.request
+    url = os.getenv("NOTIFY_WEBHOOK_URL")
+    if url:
+        try:
+            req = urllib.request.Request(url, data=json.dumps({
+                "user_id": user_id,
+                "order_id": order_id,
+                "title": title,
+                "body": body
+            }).encode("utf-8"), headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=3).read()
+        except Exception:
+            pass
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"]
+)
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -860,7 +956,6 @@ def admin_approve_order(oid: int, x_admin_password: str = Header(..., alias="x-a
 
 
 
-
 @app.post("/api/admin/orders/{oid}/deliver")
 async def admin_deliver(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
     _require_admin(x_admin_password)
@@ -871,7 +966,7 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            cur.execute("SELECT id, user_id, price, status, payload, title, COALESCE(type,'') AS type FROM public.orders WHERE id=%s FOR UPDATE", (oid,))
+            cur.execute("SELECT id, user_id, price, status, payload, title, COALESCE(type,'') FROM public.orders WHERE id=%s FOR UPDATE", (oid,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "order not found")
@@ -887,12 +982,6 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
             current = {}
             if isinstance(payload, dict):
                 current.update(payload)
-            elif isinstance(payload, str) and payload.strip():
-                try:
-                    import json as _json
-                    current.update(_json.loads(payload))
-                except Exception:
-                    current = {}
 
             if needs_code:
                 if not code_val:
@@ -910,12 +999,11 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
                 if is_jsonb:
                     cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(current), order_id))
                 else:
-                    import json as _json
-                    cur.execute("UPDATE public.orders SET status='Done', payload=(%s)::jsonb::text WHERE id=%s", (_json.dumps(current, ensure_ascii=False), order_id))
+                    cur.execute("UPDATE public.orders SET status='Done', payload=(%s)::jsonb::text WHERE id=%s", (json.dumps(current, ensure_ascii=False), order_id))
             else:
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
 
-            # credit wallet if topup
+            # credit wallet for Asiacell
             if otype.lower() == "topup_card":
                 add = 0.0
                 try:
@@ -928,15 +1016,8 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
                         INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
                         VALUES(%s,%s,%s,%s)
                     """, (user_id, Decimal(add), "asiacell_topup", Json({"order_id": order_id, "amount": add})))
-        # Build notification
-        title_txt = f"تم تنفيذ طلبك {title}"
-        if code_val:
-            body_txt = f"الكود: {code_val}"
-        elif amount:
-            body_txt = f"المبلغ: {amount}"
-        else:
-            body_txt = title or "تم التنفيذ"
-        _notify_user(conn, user_id, order_id, title_txt, body_txt)
+
+        _notify_user(conn, user_id, order_id, "تم تنفيذ طلبك", (f"{title}: {code_val}" if needs_code else (f"{title} - amount: {amount}" if amount else (title or "تم التنفيذ"))))
         return {"ok": True, "status": "Done"}
     finally:
         put_conn(conn)
@@ -1086,7 +1167,6 @@ async def admin_reject(oid: int, request: Request, x_admin_password: str = Heade
         put_conn(conn)
 
 
-
 @app.post("/api/admin/topup_cards/{oid}/execute")
 async def admin_execute_topup_card(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
     _require_admin(x_admin_password)
@@ -1109,46 +1189,28 @@ async def admin_execute_topup_card(oid: int, request: Request, x_admin_password:
             current = {}
             if isinstance(payload, dict):
                 current.update(payload)
-            elif isinstance(payload, str) and payload.strip():
-                try:
-                    import json as _json
-                    current.update(_json.loads(payload))
-                except Exception:
-                    current = {}
             if amount is not None:
-                try:
-                    current["amount"] = float(amount)
-                except Exception:
-                    pass
+                current["amount"] = amount
 
             if current:
                 if is_jsonb:
                     cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(current), order_id))
                 else:
-                    import json as _json
-                    cur.execute("UPDATE public.orders SET status='Done', payload=(%s)::jsonb::text WHERE id=%s", (_json.dumps(current, ensure_ascii=False), order_id))
+                    cur.execute("UPDATE public.orders SET status='Done', payload=(%s)::jsonb::text WHERE id=%s", (json.dumps(current, ensure_ascii=False), order_id))
             else:
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
 
-            # credit wallet
-            add = 0.0
-            try:
-                add = float(amount or 0)
-            except Exception:
-                add = 0.0
-            if add > 0:
-                cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(add), user_id))
-                cur.execute("""
-                    INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
-                    VALUES(%s,%s,%s,%s)
-                """, (user_id, Decimal(add), "asiacell_topup", Json({"order_id": order_id, "amount": add})))
-        # Notify
-        title_txt = f"تم تنفيذ طلبك {title}"
-        body_txt  = f"المبلغ: {amount}" if amount else (title or "تم التنفيذ")
-        _notify_user(conn, user_id, order_id, title_txt, body_txt)
+        try:
+            msg = f"{title} - amount: {amount}" if amount is not None else title or "تم التنفيذ"
+            _notify_user(conn, user_id, order_id, "تم تنفيذ طلبك", msg)
+        except Exception:
+            pass
+
         return {"ok": True, "status": "Done"}
     finally:
         put_conn(conn)
+
+
 @app.post("/api/admin/topup_cards/{oid}/reject")
 async def admin_reject_topup_card(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
     _require_admin(x_admin_password)
@@ -1198,3 +1260,48 @@ def _startup_hook():
         ensure_schema()
     except Exception as e:
         print("ensure_schema() failed:", e)
+
+
+@app.post("/api/admin/users/{uid}/wallet/adjust")
+async def admin_wallet_adjust(uid: str, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
+    _require_admin(x_admin_password)
+    data = await _read_json_object(request)
+    amount = data.get("amount")
+    reason = (data.get("reason") or "manual_adjust").strip()
+    no_notify = bool(data.get("no_notify") or False)
+
+    if amount is None:
+        raise HTTPException(400, "amount is required")
+    try:
+        amt = float(amount)
+    except Exception:
+        raise HTTPException(400, "amount must be a number")
+    if amt == 0:
+        return {"ok": True, "status": "noop"}
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                raise HTTPException(404, "user not found")
+            user_id = r[0]
+
+            from decimal import Decimal
+            cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(amt), user_id))
+
+            meta = {"admin": True}
+            if no_notify:
+                meta["no_notify"] = True
+            cur.execute(
+                """
+                INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                VALUES(%s,%s,%s,%s)
+                """,
+                (user_id, Decimal(amt), reason, Json(meta))
+            )
+
+        return {"ok": True, "status": "adjusted", "amount": amt, "reason": reason}
+    finally:
+        put_conn(conn)
