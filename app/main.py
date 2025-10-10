@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 import requests
 import psycopg2
 from psycopg2 import pool
-from psycopg2.extras import Json
+from psycopg2.extras import RealDictCursor, Json
 
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -84,6 +84,22 @@ def ensure_schema():
             CREATE INDEX IF NOT EXISTS idx_users_uid ON public.users(uid);
             CREATE INDEX IF NOT EXISTS idx_orders_user ON public.orders(user_id);
             CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders(status);
+            
+            CREATE TABLE IF NOT EXISTS public.user_notifications(
+                id BIGSERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                order_id INTEGER NULL REFERENCES public.orders(id) ON DELETE SET NULL,
+                title TEXT NOT NULL,
+                body  TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'unread',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                read_at    TIMESTAMPTZ NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_notifications_user_created
+              ON public.user_notifications(user_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_user_notifications_status
+              ON public.user_notifications(status);
+            
             """)
             # ترقية: ضمان عمود type موجود وافتراضي وغير فارغ
             cur.execute("""ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS type TEXT;""")
@@ -504,6 +520,58 @@ def orders_list(uid: str):
 @app.get("/api/user/orders/list")
 def user_orders_list(uid: str):
     return {"orders": _orders_for_uid(uid)}
+
+@app.get("/api/user/by-uid/{uid}/notifications")
+def list_user_notifications(uid: str, status: str = "unread", limit: int = 50):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                return []
+            user_id = r["id"]
+            where = "WHERE user_id=%s"
+            params = [user_id]
+            if status not in ("unread","read","all"):
+                status = "unread"
+            if status != "all":
+                where += " AND status=%s"
+                params.append(status)
+            cur.execute(f"""
+                SELECT id, user_id, order_id, title, body, status,
+                       EXTRACT(EPOCH FROM created_at)*1000 AS created_at,
+                       EXTRACT(EPOCH FROM read_at)*1000   AS read_at
+                FROM public.user_notifications
+                {where}
+                ORDER BY id DESC
+                LIMIT %s
+            """, (*params, limit))
+            rows = cur.fetchall() or []
+        return rows
+    finally:
+        put_conn(conn)
+
+@app.post("/api/user/{uid}/notifications/{nid}/read")
+def mark_notification_read(uid: str, nid: int):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                raise HTTPException(404, "user not found")
+            user_id = r["id"]
+            cur.execute(
+                "UPDATE public.user_notifications SET status='read', read_at=NOW() WHERE id=%s AND user_id=%s RETURNING id",
+                (nid, user_id)
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "notification not found")
+        return {"ok": True, "id": row["id"]}
+    finally:
+        put_conn(conn)
 
 # =========================
 # واجهات الأدمن
@@ -1048,6 +1116,19 @@ async def admin_execute_topup_card(oid: int, request: Request, x_admin_password:
         except Exception:
             pass
 
+        
+            # Add to user's wallet if amount > 0
+            added = 0.0
+            try:
+                added = float(amount or 0)
+            except Exception:
+                added = 0.0
+            if added > 0:
+                cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(added), user_id))
+                cur.execute("""
+                    INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                    VALUES(%s,%s,%s,%s)
+                """, (user_id, Decimal(added), "asiacell_topup", Json({"order_id": order_id, "amount": added})))
         return {"ok": True, "status": "Done"}
     finally:
         put_conn(conn)
