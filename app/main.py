@@ -1330,6 +1330,38 @@ def admin_users_count(x_admin_password: str = Header(..., alias="x-admin-passwor
     finally:
         put_conn(conn)
 
+
+
+# ---- Compatibility responses for "User Balances" button ----
+@app.get("/api/admin/users/balances/raw")
+def admin_users_balances_raw(
+    x_admin_password: str = Header(..., alias="x-admin-password"),
+    q: str = "", limit: int = 100, offset: int = 0, sort: str = "balance_desc"
+):
+    """
+    RAW array response (compat with UIs expecting a pure JSON array).
+    """
+    res = admin_users_balances(x_admin_password=x_admin_password, q=q, limit=limit, offset=offset, sort=sort)
+    # return only the array (prefer `data`, fallback to `items`)
+    arr = res.get("data") or res.get("items") or []
+    return arr
+
+# Alias some likely old paths
+@app.get("/api/admin/users/wallets")
+def admin_users_wallets_alias(
+    x_admin_password: str = Header(..., alias="x-admin-password"),
+    q: str = "", limit: int = 100, offset: int = 0, sort: str = "balance_desc"
+):
+    return admin_users_balances_raw(x_admin_password=x_admin_password, q=q, limit=limit, offset=offset, sort=sort)
+
+# Add plain=1 to /balances to return array directly (no wrapper)
+@app.get("/api/admin/users/balances_plain")
+def admin_users_balances_plain(
+    x_admin_password: str = Header(..., alias="x-admin-password"),
+    q: str = "", limit: int = 100, offset: int = 0, sort: str = "balance_desc"
+):
+    return admin_users_balances_raw(x_admin_password=x_admin_password, q=q, limit=limit, offset=offset, sort=sort)
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
