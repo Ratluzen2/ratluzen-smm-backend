@@ -515,8 +515,8 @@ def _asiacell_submit_core(cur, uid: str, card_digits: str) -> int:
 
 def _extract_digits(raw: Any) -> str:
     return "".join(ch for ch in str(raw) if ch.isdigit())
-
-ASIACELL_PATHS = [
+# 
+ASIACELL_PATHS = [  # commented out (undefined)
     "/api/wallet/asiacell/submit",
     "/api/topup/asiacell/submit",
     "/api/asiacell/submit",
@@ -974,7 +974,7 @@ def admin_pending_cards(x_admin_password: Optional[str] = Header(None, alias="x-
                        EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at
                 FROM public.orders o
                 JOIN public.users u ON u.id = o.user_id
-                WHERE o.status='Pending' AND o.type='topup_card'
+                WHERE o.status='Pending' AND o.type='asiacell_topup'
                 ORDER BY o.id DESC
             """)
             rows = cur.fetchall()
@@ -1554,3 +1554,31 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
+
+
+
+# --- Alias endpoints for admin actions (Asiacell Topup) ---
+from fastapi import Header
+
+@app.post("/api/admin/asiacell/{oid}/execute")
+async def admin_execute_asiacell(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    """Alias for executing Asiacell topup orders.
+    The app may call this path; we simply forward to admin_deliver.
+    """
+    return await admin_deliver(oid, request, x_admin_password, password)
+
+@app.post("/api/admin/asiacell/{oid}/reject")
+async def admin_reject_asiacell(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    """Alias for rejecting Asiacell topup orders.
+    The app may call this path; we forward to admin_reject which refunds wallet if needed and notifies the user.
+    """
+    return await admin_reject(oid, request, x_admin_password, password)
+
+# Also provide neutral topup alias if the client uses '/api/admin/topup/{oid}/...'
+@app.post("/api/admin/topup/{oid}/execute")
+async def admin_execute_topup_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return await admin_deliver(oid, request, x_admin_password, password)
+
+@app.post("/api/admin/topup/{oid}/reject")
+async def admin_reject_topup_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return await admin_reject(oid, request, x_admin_password, password)
