@@ -743,7 +743,7 @@ async def create_manual_paid(request: Request):
     
     if account_id:
         title = f"{title} | ID: {account_id}"
-conn = get_conn()
+    conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             # ensure user & balance
@@ -983,7 +983,7 @@ def admin_pending_cards(x_admin_password: Optional[str] = Header(None, alias="x-
                        EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at
                 FROM public.orders o
                 JOIN public.users u ON u.id = o.user_id
-                WHERE o.status='Pending' AND o.type='asiacell_topup'
+                WHERE o.status='Pending' AND o.type='topup_card'
                 ORDER BY o.id DESC
             """)
             rows = cur.fetchall()
@@ -1567,7 +1567,6 @@ if __name__ == "__main__":
 
 
 # --- Alias endpoints for admin actions (Asiacell Topup) ---
-from fastapi import Header
 
 @app.post("/api/admin/asiacell/{oid}/execute")
 async def admin_execute_asiacell(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
