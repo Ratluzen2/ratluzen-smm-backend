@@ -823,7 +823,6 @@ async def create_manual_paid(request: Request):
         return {"ok": True, "order_id": oid, "charged": float(price)}
     finally:
         put_conn(conn)
-
 # Additional compat aliases for manual_paid (covering multiple potential paths from the app)
 @app.post("/api/create/manual_paid")
 async def create_manual_paid_alias1(request: Request):
@@ -860,8 +859,6 @@ async def create_manual_paid_alias8(request: Request):
 # =========================
 # Admin pending buckets
 # =========================
-    finally:
-        put_conn(conn)
 
 @app.get("/api/admin/pending/itunes")
 def admin_pending_itunes(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
