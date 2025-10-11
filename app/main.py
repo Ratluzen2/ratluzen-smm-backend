@@ -1,3 +1,4 @@
+
 import os
 import json
 import time
@@ -173,7 +174,7 @@ ensure_schema()
 # =========================
 # FastAPI
 # =========================
-app = FastAPI(title="SMM Backend", version="1.9.0")
+app = FastAPI(title="SMM Backend", version="1.9.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -225,6 +226,13 @@ def _needs_code(title: str, otype: Optional[str]) -> bool:
         if k in t:
             return True
     return False
+
+# Admin auth compatibility helper
+def _pick_admin_password(header_val: Optional[str], password_qs: Optional[str], body: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    cand = header_val or password_qs
+    if not cand and body:
+        cand = body.get("password") or body.get("admin_password") or body.get("x-admin-password")
+    return cand
 
 # New helpers (compatibility)
 def _normalize_product(raw: str, fallback_title: str = "") -> str:
@@ -813,8 +821,8 @@ async def create_manual_paid_alias8(request: Request):
 # Admin pending buckets
 # =========================
 @app.get("/api/admin/pending/services")
-def admin_pending_services(x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
+def admin_pending_services(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -846,7 +854,7 @@ def admin_pending_services(x_admin_password: str = Header(..., alias="x-admin-pa
                            LOWER(o.title) LIKE '%korek%' OR o.title LIKE '%كورك%' OR o.title LIKE '%اثير%')
                           AND
                           (LOWER(o.title) LIKE '%voucher%' OR LOWER(o.title) LIKE '%code%' OR LOWER(o.title) LIKE '%card%' OR
-                           o.title LIKE '%رمز%' OR o.title LIKE '%كود%' Or o.title LIKE '%بطاقة%' Or o.title LIKE '%كارت%' Or o.title LIKE '%شراء%')
+                           o.title LIKE '%رمز%' OR o.title LIKE '%كود%' OR o.title LIKE '%بطاقة%' OR o.title LIKE '%كارت%' OR o.title LIKE '%شراء%')
                           AND NOT (
                                 LOWER(o.title) LIKE '%topup%' OR LOWER(o.title) LIKE '%top-up%' OR LOWER(o.title) LIKE '%recharge%' OR
                                 o.title LIKE '%شحن%' OR o.title LIKE '%شحن عبر%' OR o.title LIKE '%شحن اسيا%' OR LOWER(o.title) LIKE '%direct%'
@@ -867,8 +875,8 @@ def admin_pending_services(x_admin_password: str = Header(..., alias="x-admin-pa
         put_conn(conn)
 
 @app.get("/api/admin/pending/itunes")
-def admin_pending_itunes(x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
+def admin_pending_itunes(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -893,8 +901,8 @@ def admin_pending_itunes(x_admin_password: str = Header(..., alias="x-admin-pass
         put_conn(conn)
 
 @app.get("/api/admin/pending/pubg")
-def admin_pending_pubg(x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
+def admin_pending_pubg(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -908,8 +916,8 @@ def admin_pending_pubg(x_admin_password: str = Header(..., alias="x-admin-passwo
                 LOWER(o.title) LIKE '%pubg%' OR
                 LOWER(o.title) LIKE '%bgmi%' OR
                 LOWER(o.title) LIKE '%uc%' OR
-                o.title LIKE '%شدات%' Or
-                o.title LIKE '%بيجي%' Or
+                o.title LIKE '%شدات%' OR
+                o.title LIKE '%بيجي%' OR
                 o.title LIKE '%ببجي%'
             )
                 ORDER BY o.id DESC
@@ -925,8 +933,8 @@ def admin_pending_pubg(x_admin_password: str = Header(..., alias="x-admin-passwo
         put_conn(conn)
 
 @app.get("/api/admin/pending/ludo")
-def admin_pending_ludo(x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
+def admin_pending_ludo(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -939,7 +947,7 @@ def admin_pending_ludo(x_admin_password: str = Header(..., alias="x-admin-passwo
                 WHERE o.status='Pending' AND (
                 LOWER(o.title) LIKE '%ludo%' OR
                 LOWER(o.title) LIKE '%yalla%' OR
-                o.title LIKE '%يلا لودو%' Or
+                o.title LIKE '%يلا لودو%' OR
                 o.title LIKE '%لودو%'
             )
                 ORDER BY o.id DESC
@@ -956,8 +964,8 @@ def admin_pending_ludo(x_admin_password: str = Header(..., alias="x-admin-passwo
 
 # Pending topup cards (Asiacell via card)
 @app.get("/api/admin/pending/cards")
-def admin_pending_cards(x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
+def admin_pending_cards(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -976,8 +984,8 @@ def admin_pending_cards(x_admin_password: str = Header(..., alias="x-admin-passw
 
 # Pending balance purchase (Atheer/Asiacell/Korek vouchers)
 @app.get("/api/admin/pending/balances")
-def admin_pending_balances(x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
+def admin_pending_balances(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -1001,22 +1009,23 @@ def admin_pending_balances(x_admin_password: str = Header(..., alias="x-admin-pa
                         LOWER(o.title) LIKE '%code%' OR
                         LOWER(o.title) LIKE '%card%' OR
                         o.title LIKE '%رمز%' OR
-                        o.title LIKE '%كود%' Or
-                        o.title LIKE '%بطاقة%' Or
-                        o.title LIKE '%كارت%' Or
+                        o.title LIKE '%كود%' OR
+                        o.title LIKE '%بطاقة%' OR
+                        o.title LIKE '%كارت%' OR
                         o.title LIKE '%شراء%'
                   )
+                  AND (o.type IS NULL OR o.type <> 'topup_card')
                   AND NOT (
                         LOWER(o.title) LIKE '%topup%' OR
                         LOWER(o.title) LIKE '%top-up%' OR
                         LOWER(o.title) LIKE '%recharge%' OR
-                        o.title LIKE '%شحن%' Or
+                        o.title LIKE '%شحن%' OR
                         o.title LIKE '%شحن عبر%' Or
-                        o.title LIKE '%شحن اسيا%' Or
+                        o.title LIKE '%شحن اسيا%' OR
                         LOWER(o.title) LIKE '%direct%'
                   )
                   AND NOT (
-                        LOWER(o.title) LIKE '%itunes%' Or
+                        LOWER(o.title) LIKE '%itunes%' OR
                         o.title LIKE '%ايتونز%'
                   )
                 ORDER BY o.id DESC
@@ -1035,8 +1044,16 @@ def admin_pending_balances(x_admin_password: str = Header(..., alias="x-admin-pa
 # Approve/Deliver/Reject
 # =========================
 @app.post("/api/admin/orders/{oid}/approve")
-def admin_approve_order(oid: int, x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
+def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    body = {}
+    try:
+        body = json.loads(request._body.decode()) if hasattr(request, "_body") and request._body else {}
+    except Exception:
+        try:
+            body = request._json  # type: ignore
+        except Exception:
+            body = {}
+    _require_admin(_pick_admin_password(x_admin_password, password, body) or "")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -1098,9 +1115,10 @@ def admin_approve_order(oid: int, x_admin_password: str = Header(..., alias="x-a
         put_conn(conn)
 
 @app.post("/api/admin/orders/{oid}/deliver")
-async def admin_deliver(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
+async def admin_deliver(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     data = await _read_json_object(request)
+    _require_admin(_pick_admin_password(x_admin_password, password, data) or "")
+
     code_val = (data.get("code") or "").strip()
     amount   = data.get("amount")
 
@@ -1144,7 +1162,7 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
             else:
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
 
-            # Credit wallet for Asiacell
+            # Credit wallet for Asiacell direct topup (topup_card type)
             if (otype or "").lower() == "topup_card":
                 add = 0.0
                 try:
@@ -1174,20 +1192,20 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
 
 # Aliases for deliver / reject to match various admin clients
 @app.post("/api/admin/orders/{oid}/execute")
-async def admin_execute_alias(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
-    return await admin_deliver(oid, request, x_admin_password)
+async def admin_execute_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return await admin_deliver(oid, request, x_admin_password, password)
 
 @app.post("/api/admin/card/{oid}/execute")
-async def admin_card_execute_alias(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
-    return await admin_deliver(oid, request, x_admin_password)
+async def admin_card_execute_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return await admin_deliver(oid, request, x_admin_password, password)
 
 @app.post("/api/admin/orders/{oid}/reject")
-async def admin_reject(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
+async def admin_reject(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     """
     Rejects the order and refunds balance once if order is paid.
     """
-    _require_admin(x_admin_password)
     data = await _read_json_object(request)
+    _require_admin(_pick_admin_password(x_admin_password, password, data) or "")
     reason = (data.get("reason") or data.get("message") or "").strip()
 
     conn = get_conn()
@@ -1238,16 +1256,17 @@ async def admin_reject(oid: int, request: Request, x_admin_password: str = Heade
         put_conn(conn)
 
 @app.post("/api/admin/card/{oid}/reject")
-async def admin_card_reject_alias(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
-    return await admin_reject(oid, request, x_admin_password)
+async def admin_card_reject_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return await admin_reject(oid, request, x_admin_password, password)
 
 # =========================
 # Admin: wallet adjust + compatibility
 # =========================
 @app.post("/api/admin/users/{uid}/wallet/adjust")
-async def admin_wallet_adjust(uid: str, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
+async def admin_wallet_adjust(uid: str, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     data = await _read_json_object(request)
+    _require_admin(_pick_admin_password(x_admin_password, password, data) or "")
+
     amount = data.get("amount")
     reason = (data.get("reason") or "manual_adjust").strip()
     no_notify = bool(data.get("no_notify") or False)
@@ -1289,9 +1308,9 @@ async def admin_wallet_adjust(uid: str, request: Request, x_admin_password: str 
 
 # Single "change" endpoint (positive = topup, negative = deduct) to match older apps
 @app.post("/api/admin/wallet/change")
-async def admin_wallet_change(request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
+async def admin_wallet_change(request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     data = await _read_json_object(request)
+    _require_admin(_pick_admin_password(x_admin_password, password, data) or "")
     uid = (data.get("uid") or "").strip()
     if not uid:
         raise HTTPException(400, "uid required")
@@ -1304,14 +1323,14 @@ async def admin_wallet_change(request: Request, x_admin_password: str = Header(.
     if direction == "deduct":
         # call deduct
         body = WalletCompatIn(uid=uid, amount=abs(amount), reason=data.get("reason"))
-        return admin_wallet_deduct(body, x_admin_password)
+        return admin_wallet_deduct(body, x_admin_password or password or "")
     else:
         body = WalletCompatIn(uid=uid, amount=amount, reason=data.get("reason"))
-        return admin_wallet_topup(body, x_admin_password)
+        return admin_wallet_topup(body, x_admin_password or password or "")
 
 @app.post("/api/admin/wallet/topup")
-def admin_wallet_topup(body: WalletCompatIn, x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
+def admin_wallet_topup(body: WalletCompatIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
     uid = (body.uid or "").strip()
     if not uid:
         raise HTTPException(400, "uid required")
@@ -1346,8 +1365,8 @@ def admin_wallet_topup(body: WalletCompatIn, x_admin_password: str = Header(...,
         put_conn(conn)
 
 @app.post("/api/admin/wallet/deduct")
-def admin_wallet_deduct(body: WalletCompatIn, x_admin_password: str = Header(..., alias="x-admin-password")):
-    _require_admin(x_admin_password)
+def admin_wallet_deduct(body: WalletCompatIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
     uid = (body.uid or "").strip()
     if not uid:
         raise HTTPException(400, "uid required")
@@ -1383,8 +1402,8 @@ def admin_wallet_deduct(body: WalletCompatIn, x_admin_password: str = Header(...
 # Admin stats: users count & balances
 # =========================
 @app.get("/api/admin/users/count")
-def admin_users_count(x_admin_password: str = Header(..., alias="x-admin-password"), plain: int = 0):
-    _require_admin(x_admin_password)
+def admin_users_count(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None, plain: int = 0):
+    _require_admin(x_admin_password or password or "")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -1398,13 +1417,14 @@ def admin_users_count(x_admin_password: str = Header(..., alias="x-admin-passwor
 
 @app.get("/api/admin/users/balances")
 def admin_users_balances(
-    x_admin_password: str = Header(..., alias="x-admin-password"),
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None,
     q: str = "", limit: int = 100, offset: int = 0, sort: str = "balance_desc"
 ):
     """
     DEFAULT: returns a JSON ARRAY for UI compatibility.
     """
-    _require_admin(x_admin_password)
+    _require_admin(x_admin_password or password or "")
 
     q = (q or "").strip()
     try:
@@ -1461,10 +1481,11 @@ def admin_users_balances(
 
 @app.get("/api/admin/users/balances_meta")
 def admin_users_balances_meta(
-    x_admin_password: str = Header(..., alias="x-admin-password"),
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None,
     q: str = "", limit: int = 100, offset: int = 0, sort: str = "balance_desc"
 ):
-    _require_admin(x_admin_password)
+    _require_admin(x_admin_password or password or "")
 
     q = (q or "").strip()
     try:
