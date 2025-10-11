@@ -187,6 +187,23 @@ def _require_admin(passwd: str):
         raise HTTPException(401, "bad admin password")
 
 def _payload_is_jsonb(conn) -> bool:
+
+
+# ===== Service ID overrides (server-level) =====
+def _ensure_overrides_table(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.service_id_overrides(
+            ui_key TEXT PRIMARY KEY,
+            service_id BIGINT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
+
+def _get_override_service_id(cur, ui_key: str):
+    _ensure_overrides_table(cur)
+    cur.execute("SELECT service_id FROM public.service_id_overrides WHERE ui_key=%s", (ui_key,))
+    r = cur.fetchone()
+    return int(r[0]) if r else None
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT pg_typeof(payload)::text FROM public.orders LIMIT 1")
@@ -430,10 +447,22 @@ def _create_provider_order_core(cur, uid: str, service_id: Optional[int], servic
               Json({"service_id": service_id, "name": service_name, "qty": quantity})))
 
     cur.execute("""
-        INSERT INTO public.orders(user_id, title, service_id, link, quantity, price, status, payload, type)
+        
+    # apply override if exists (by service_name/ui_key)
+    if service_name:
+        cur.execute("SELECT 1")  # ensure cursor valid
+        eff = _get_override_service_id(cur, service_name)
+        if eff and eff > 0:
+            # keep both ids (provided vs effective) in payload for audit
+            _effective_service_id = eff
+        else:
+            _effective_service_id = service_id
+    else:
+        _effective_service_id = service_id
+INSERT INTO public.orders(user_id, title, service_id, link, quantity, price, status, payload, type)
         VALUES(%s,%s,%s,%s,%s,%s,'Pending',%s,%s)
         RETURNING id
-    """, (user_id, service_name, service_id, link, quantity, Decimal(price or 0),
+    """, (user_id, service_name, _effective_service_id, link, quantity, Decimal(price or 0),
           Json({"source": "provider_form"}), 'provider'))
     oid = cur.fetchone()[0]
     return oid
@@ -1592,14 +1621,54 @@ async def admin_reject_topup_alias(oid: int, request: Request, x_admin_password:
     return await admin_reject(oid, request, x_admin_password, password)
 
 
-# --- Extra alias endpoints for admin actions (Asiacell Topup: "topup_cards" path used by some clients) ---
+# =========================
+# Admin: Service ID overrides
+# =========================
+@app.get("/api/admin/service_ids/list")
+def admin_list_service_ids(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_overrides_table(cur)
+            cur.execute("SELECT ui_key, service_id FROM public.service_id_overrides ORDER BY ui_key")
+            rows = cur.fetchall()
+            return {"list": [{"ui_key": r[0], "service_id": int(r[1])} for r in rows]}
+    finally:
+        put_conn(conn)
 
-@app.post("/api/admin/topup_cards/{oid}/execute")
-async def admin_execute_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    # Forward to the main deliver handler (credits wallet if type='topup_card', notifies user)
-    return await admin_deliver(oid, request, x_admin_password, password)
+class SvcOverrideIn(BaseModel):
+    ui_key: str
+    service_id: Optional[int] = None
 
-@app.post("/api/admin/topup_cards/{oid}/reject")
-async def admin_reject_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    # Forward to the main reject handler (refunds if charged, writes reason, notifies user)
-    return await admin_reject(oid, request, x_admin_password, password)
+@app.post("/api/admin/service_ids/set")
+def admin_set_service_id(body: SvcOverrideIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    if not body.ui_key or not body.service_id or body.service_id <= 0:
+        raise HTTPException(422, "invalid payload")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_overrides_table(cur)
+            cur.execute("""
+                INSERT INTO public.service_id_overrides(ui_key, service_id)
+                VALUES(%s,%s)
+                ON CONFLICT (ui_key) DO UPDATE SET service_id=EXCLUDED.service_id, created_at=now()
+            """, (body.ui_key, int(body.service_id)))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/service_ids/clear")
+def admin_clear_service_id(body: SvcOverrideIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    if not body.ui_key:
+        raise HTTPException(422, "invalid payload")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_overrides_table(cur)
+            cur.execute("DELETE FROM public.service_id_overrides WHERE ui_key=%s", (body.ui_key,))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
