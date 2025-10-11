@@ -207,31 +207,6 @@ async def _read_json_object(request: Request) -> Dict[str, Any]:
         raise HTTPException(400, "Body must be a JSON object")
     return data
 
-# ===== Service ID overrides (server-level) =====
-def _ensure_overrides_table(cur):
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS public.service_id_overrides(
-            ui_key TEXT PRIMARY KEY,
-            service_id BIGINT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-    """)
-
-def _get_override_service_id(cur, ui_key: str):
-    _ensure_overrides_table(cur)
-    cur.execute("SELECT service_id FROM public.service_id_overrides WHERE ui_key=%s", (ui_key,))
-    r = cur.fetchone()
-    return int(r[0]) if r else None
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT pg_typeof(payload)::text FROM public.orders LIMIT 1")
-            row = cur.fetchone()
-            return bool(row and isinstance(row[0], str) and row[0].lower() == "jsonb")
-    except Exception:
-        return False
-
-
-
 def _notify_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
     try:
         with conn:
@@ -455,22 +430,10 @@ def _create_provider_order_core(cur, uid: str, service_id: Optional[int], servic
               Json({"service_id": service_id, "name": service_name, "qty": quantity})))
 
     cur.execute("""
-        
-    # apply override if exists (by service_name/ui_key)
-    if service_name:
-        cur.execute("SELECT 1")  # ensure cursor valid
-        eff = _get_override_service_id(cur, service_name)
-        if eff and eff > 0:
-            # keep both ids (provided vs effective) in payload for audit
-            _effective_service_id = eff
-        else:
-            _effective_service_id = service_id
-    else:
-        _effective_service_id = service_id
-INSERT INTO public.orders(user_id, title, service_id, link, quantity, price, status, payload, type)
+        INSERT INTO public.orders(user_id, title, service_id, link, quantity, price, status, payload, type)
         VALUES(%s,%s,%s,%s,%s,%s,'Pending',%s,%s)
         RETURNING id
-    """, (user_id, service_name, _effective_service_id, link, quantity, Decimal(price or 0),
+    """, (user_id, service_name, service_id, link, quantity, Decimal(price or 0),
           Json({"source": "provider_form"}), 'provider'))
     oid = cur.fetchone()[0]
     return oid
@@ -823,6 +786,7 @@ async def create_manual_paid(request: Request):
         return {"ok": True, "order_id": oid, "charged": float(price)}
     finally:
         put_conn(conn)
+
 # Additional compat aliases for manual_paid (covering multiple potential paths from the app)
 @app.post("/api/create/manual_paid")
 async def create_manual_paid_alias1(request: Request):
@@ -859,6 +823,58 @@ async def create_manual_paid_alias8(request: Request):
 # =========================
 # Admin pending buckets
 # =========================
+def admin_pending_services(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(r"""
+                SELECT o.id, o.title, o.quantity, o.price, o.status,
+                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
+                       o.link, u.uid
+                FROM public.orders o
+                JOIN public.users u ON u.id = o.user_id
+                WHERE o.status='Pending'
+                  AND NOT (
+                        LOWER(o.title) LIKE '%pubg%' OR
+                        LOWER(o.title) LIKE '%bgmi%' OR
+                        LOWER(o.title) LIKE '%uc%' OR
+                        o.title LIKE '%شدات%' OR
+                        o.title LIKE '%بيجي%' OR
+                        o.title LIKE '%ببجي%'
+                  )
+                  AND NOT (
+                        LOWER(o.title) LIKE '%ludo%' OR
+                        LOWER(o.title) LIKE '%yalla%' OR
+                        o.title LIKE '%يلا لودو%' OR
+                        o.title LIKE '%لودو%'
+                  )
+                  AND (o.type IS NULL OR o.type <> 'topup_card')
+                  AND NOT (
+                        (
+                          (LOWER(o.title) LIKE '%asiacell%' OR o.title LIKE '%أسيا%' OR o.title LIKE '%اسياسيل%' OR
+                           LOWER(o.title) LIKE '%korek%' OR o.title LIKE '%كورك%' OR o.title LIKE '%اثير%')
+                          AND
+                          (LOWER(o.title) LIKE '%voucher%' OR LOWER(o.title) LIKE '%code%' OR LOWER(o.title) LIKE '%card%' OR
+                           o.title LIKE '%رمز%' OR o.title LIKE '%كود%' OR o.title LIKE '%بطاقة%' OR o.title LIKE '%كارت%' OR o.title LIKE '%شراء%')
+                          AND NOT (
+                                LOWER(o.title) LIKE '%topup%' OR LOWER(o.title) LIKE '%top-up%' OR LOWER(o.title) LIKE '%recharge%' OR
+                                o.title LIKE '%شحن%' OR o.title LIKE '%شحن عبر%' OR o.title LIKE '%شحن اسيا%' OR LOWER(o.title) LIKE '%direct%'
+                          )
+                        )
+                  )
+                  AND NOT (LOWER(o.title) LIKE '%itunes%' OR o.title LIKE '%ايتونز%')
+                ORDER BY o.id DESC
+            """)
+            rows = cur.fetchall()
+        out = []
+        for (oid, title, qty, price, status, created_at, link, uid) in rows:
+            d = _row_to_order_dict((oid, title, qty, price, status, created_at, link))
+            d["uid"] = uid
+            out.append(d)
+        return out
+    finally:
+        put_conn(conn)
 
 @app.get("/api/admin/pending/itunes")
 def admin_pending_itunes(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
@@ -1576,156 +1592,74 @@ async def admin_reject_topup_alias(oid: int, request: Request, x_admin_password:
 
 
 # =========================
-# Admin: Service ID overrides
+# Admin: Pending API services (robust)
 # =========================
-@app.get("/api/admin/service_ids/list")
-def admin_list_service_ids(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    _require_admin(x_admin_password or password or "")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            _ensure_overrides_table(cur)
-            cur.execute("SELECT ui_key, service_id FROM public.service_id_overrides ORDER BY ui_key")
-            rows = cur.fetchall()
-            return {"list": [{"ui_key": r[0], "service_id": int(r[1])} for r in rows]}
-    finally:
-        put_conn(conn)
-
-class SvcOverrideIn(BaseModel):
-    ui_key: str
-    service_id: Optional[int] = None
-
-@app.post("/api/admin/service_ids/set")
-def admin_set_service_id(body: SvcOverrideIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    _require_admin(x_admin_password or password or "")
-    if not body.ui_key or not body.service_id or body.service_id <= 0:
-        raise HTTPException(422, "invalid payload")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            _ensure_overrides_table(cur)
-            cur.execute("""
-                INSERT INTO public.service_id_overrides(ui_key, service_id)
-                VALUES(%s,%s)
-                ON CONFLICT (ui_key) DO UPDATE SET service_id=EXCLUDED.service_id, created_at=now()
-            """, (body.ui_key, int(body.service_id)))
-        return {"ok": True}
-    finally:
-        put_conn(conn)
-
-@app.post("/api/admin/service_ids/clear")
-def admin_clear_service_id(body: SvcOverrideIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    _require_admin(x_admin_password or password or "")
-    if not body.ui_key:
-        raise HTTPException(422, "invalid payload")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            _ensure_overrides_table(cur)
-            cur.execute("DELETE FROM public.service_id_overrides WHERE ui_key=%s", (body.ui_key,))
-        return {"ok": True}
-    finally:
-        put_conn(conn)
-
-
-@app.post("/api/admin/topup_cards/{oid}/execute")
-async def admin_execute_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    _require_admin(x_admin_password or password or "")
-    # reuse main deliver/execute handler
-    return await admin_deliver(oid, request, x_admin_password, password)
-
-@app.post("/api/admin/topup_cards/{oid}/reject")
-async def admin_reject_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    _require_admin(x_admin_password or password or "")
-    # reuse main reject handler
-    return await admin_reject(oid, request, x_admin_password, password)
-
-
 @app.get("/api/admin/pending/services")
-def admin_pending_services(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None, limit: int = 100):
+def admin_pending_services(
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None,
+    limit: int = 100
+):
     _require_admin(x_admin_password or password or "")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            # Include both Pending and Processing for API/provider orders (exclude topup_card)
-            cur.execute("""
-                SELECT id, user_id, service_name, service_id, link, quantity, price, status, created_at
-                FROM public.orders
-                WHERE status IN ('Pending','Processing')
-                  AND COALESCE(type, '') IN ('provider','service','api','smm')
-                ORDER BY created_at DESC
-                LIMIT %s
-            """, (int(limit),))
-            rows = cur.fetchall()
-            out = []
-            for r in rows:
-                out.append({
-                    "id": int(r[0]),
-                    "user_id": r[1],
-                    "service_name": r[2],
-                    "service_id": int(r[3]) if r[3] is not None else None,
-                    "link": r[4],
-                    "quantity": int(r[5]) if r[5] is not None else None,
-                    "price": float(r[6]) if r[6] is not None else 0.0,
-                    "status": r[7],
-                    "created_at": r[8].isoformat() if r[8] is not None else None
-                })
-            return {"list": out}
-    finally:
-        put_conn(conn)
-
-@app.get("/api/admin/pending/services")
-def admin_pending_services(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None, limit: int = 100):
-    _require_admin(x_admin_password or password or "")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            # Avoid referencing columns that might not exist (e.g., service_name)
-            # Fetch minimal guaranteed columns and a full JSON snapshot of the row.
+            # Try preferred query with status/created_at if available
             try:
-                cur.execute(f"""
-                    SELECT id,
-                           created_at,
-                           status,
-                           to_jsonb(orders) AS data
-                    FROM public.orders
-                    WHERE status IN ('Pending','Processing')
-                    ORDER BY created_at DESC
+                cur.execute("""
+                    SELECT
+                        o.id,
+                        o.created_at,
+                        o.status,
+                        to_jsonb(o) AS data
+                    FROM public.orders o
+                    WHERE o.status IN ('Pending','Processing')
+                    ORDER BY o.created_at DESC
                     LIMIT %s
                 """, (int(limit),))
             except Exception:
-                # Fallback if status/created_at don't exist for some reason
-                cur.execute(f"""
-                    SELECT id,
-                           NOW() AS created_at,
-                           'Pending'::text AS status,
-                           to_jsonb(orders) AS data
-                    FROM public.orders
-                    ORDER BY id DESC
+                # Fallback if some columns are missing
+                cur.execute("""
+                    SELECT
+                        o.id,
+                        NOW() AS created_at,
+                        COALESCE(o.status, 'Pending') AS status,
+                        to_jsonb(o) AS data
+                    FROM public.orders o
+                    ORDER BY o.id DESC
                     LIMIT %s
                 """, (int(limit),))
             rows = cur.fetchall()
 
             out = []
-            for r in rows:
-                oid, created_at, status, data = r[0], r[1], r[2], r[3] or {}
-                # 'data' is a dict of all columns; extract common aliases safely
+            for oid, created_at, status, data in rows:
+                # Convert 'data' to a dict safely
+                d = {}
                 if isinstance(data, dict):
-                    _get = data.get
+                    d = data
                 else:
-                    # psycopg2 may return as Json
                     try:
-                        _get = dict(data).get
+                        d = dict(data)
                     except Exception:
-                        _get = (lambda k, default=None: None)
+                        try:
+                            d = json.loads(data)
+                        except Exception:
+                            d = {}
 
-                service_name = _get('service_name') or _get('pkg_label') or _get('title') or _get('name') or _get('service') or '—'
-                service_id = _get('service_id') or _get('sid') or _get('package_id')
-                link = _get('link') or _get('url') or _get('target')
-                quantity = _get('quantity') or _get('qty') or _get('count')
-                price = _get('price') or _get('amount') or _get('cost') or 0
+                def pick(*keys, default=None):
+                    for k in keys:
+                        v = d.get(k)
+                        if v is not None and v != "":
+                            return v
+                    return default
 
-                uid = _get('user_id') or _get('uid') or _get('user')
+                service_name = pick('service_name','pkg_label','title','name','service','platform', default='—')
+                service_id   = pick('service_id','sid','package_id')
+                link         = pick('link','url','target')
+                quantity     = pick('quantity','qty','count')
+                price        = pick('price','amount','cost', default=0)
+                uid          = pick('user_id','uid','user')
+
                 try:
                     quantity = int(quantity) if quantity is not None else None
                 except Exception:
@@ -1744,9 +1678,20 @@ def admin_pending_services(x_admin_password: Optional[str] = Header(None, alias=
                     "quantity": quantity,
                     "price": price,
                     "status": status,
-                    "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at)
+                    "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at),
                 })
 
             return {"list": out}
     finally:
         put_conn(conn)
+
+
+@app.post("/api/admin/topup_cards/{oid}/execute")
+async def admin_execute_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    return await admin_deliver(oid, request, x_admin_password, password)
+
+@app.post("/api/admin/topup_cards/{oid}/reject")
+async def admin_reject_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    return await admin_reject(oid, request, x_admin_password, password)
