@@ -1,9 +1,10 @@
+
 import os
 import json
 import time
 import logging
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import psycopg2
@@ -173,7 +174,7 @@ ensure_schema()
 # =========================
 # FastAPI
 # =========================
-app = FastAPI(title="SMM Backend", version="1.8.0")
+app = FastAPI(title="SMM Backend", version="1.9.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -225,6 +226,47 @@ def _needs_code(title: str, otype: Optional[str]) -> bool:
         if k in t:
             return True
     return False
+
+# New helpers (compatibility)
+def _normalize_product(raw: str, fallback_title: str = "") -> str:
+    t = (raw or "").strip().lower()
+    ft = (fallback_title or "").strip().lower()
+    def has_any(s: str, keys: Tuple[str, ...]) -> bool:
+        s = s or ""
+        return any(k in s for k in keys)
+
+    # PUBG UC
+    if has_any(t, ("pubg","bgmi","uc","ببجي","شدات")) or has_any(ft, ("pubg","bgmi","uc","ببجي","شدات")):
+        return "pubg_uc"
+    # Ludo Diamonds
+    if has_any(t, ("ludo_diamond","ludo-diamond","diamonds","الماس","الماسات","لودو")) and not has_any(t, ("gold","ذهب")):
+        return "ludo_diamond"
+    if has_any(ft, ("الماس","الماسات","diamonds","لودو")) and not has_any(ft, ("gold","ذهب")):
+        return "ludo_diamond"
+    # Ludo Gold
+    if has_any(t, ("ludo_gold","gold","ذهب")) or has_any(ft, ("gold","ذهب")):
+        return "ludo_gold"
+    # iTunes
+    if has_any(t, ("itunes","ايتونز")) or has_any(ft, ("itunes","ايتونز")):
+        return "itunes"
+    # Atheer / Asiacell / Korek balance vouchers
+    if has_any(t, ("atheer","اثير")) or has_any(ft, ("atheer","اثير")):
+        return "atheer"
+    if has_any(t, ("asiacell","اسياسيل","أسيا")) or has_any(ft, ("asiacell","اسياسيل","أسيا")):
+        return "asiacell"
+    if has_any(t, ("korek","كورك")) or has_any(ft, ("korek","كورك")):
+        return "korek"
+    return t or "itunes"
+
+def _parse_usd(d: Dict[str, Any]) -> int:
+    for k in ("usd","price_usd","priceUsd","price","amount","amt","usd_amount"):
+        if k in d and d[k] not in (None, ""):
+            try:
+                val = int(float(d[k]))
+                return val
+            except Exception:
+                pass
+    return 0
 
 # =========================
 # Models
@@ -619,7 +661,14 @@ def mark_notification_read(uid: str, nid: int):
 async def create_manual_paid(request: Request):
     """
     Creates a manual order (iTunes / Atheer / Asiacell / Korek / PUBG / Ludo) and atomically charges user balance.
-    Body: { uid: str, product: "itunes"|"atheer"|"asiacell"|"korek"|"pubg_uc"|"ludo_diamond"|"ludo_gold", usd: per product, account_id?: str }
+    Body (flexible):
+      {
+        uid: str,
+        product: "itunes"|"atheer"|"asiacell"|"korek"|"pubg_uc"|"ludo_diamond"|"ludo_gold" | Arabic labels,
+        usd|price|priceUsd|price_usd|amount: int,
+        account_id|accountId|game_id?: str
+      }
+
     Pricing:
       - itunes:   each 5$ = 9$
       - atheer:   each 5$ = 7$
@@ -627,26 +676,24 @@ async def create_manual_paid(request: Request):
       - korek:    each 5$ = 7$
       - pubg_uc:  price = usd (allowed {2,9,15,40,55,100,185})
       - ludo_*:   price = usd (allowed {5,10,20,35,85,165,475,800})
+
     Refund: if owner rejects later, /api/admin/orders/{id}/reject auto-refunds price>0.
     """
     data = await _read_json_object(request)
     uid = (data.get("uid") or "").strip()
-    product = (data.get("product") or "").strip().lower()
-    try:
-        usd = int(data.get("usd") or 0)
-    except Exception:
-        raise HTTPException(422, "invalid usd")
+    product_raw = (data.get("product") or data.get("type") or data.get("category") or data.get("title") or "").strip()
+    usd = _parse_usd(data)
 
     # Player account / game id (optional but stored)
     account_id = (data.get("account_id") or data.get("accountId") or data.get("game_id") or "").strip()
 
-    # Validation per product
+    if not uid:
+        raise HTTPException(422, "invalid payload")
+
+    product = _normalize_product(product_raw, fallback_title=data.get("title") or "")
     allowed_telco = {5,10,15,20,25,30,40,50,100}
     allowed_pubg = {2,9,15,40,55,100,185}
     allowed_ludo = {5,10,20,35,85,165,475,800}
-
-    if not uid:
-        raise HTTPException(422, "invalid payload")
 
     if product in ("itunes","atheer","asiacell","korek"):
         if usd not in allowed_telco:
@@ -730,7 +777,7 @@ async def create_manual_paid(request: Request):
     finally:
         put_conn(conn)
 
-# Additional compat aliases for manual_paid
+# Additional compat aliases for manual_paid (covering multiple potential paths from the app)
 @app.post("/api/create/manual_paid")
 async def create_manual_paid_alias1(request: Request):
     return await create_manual_paid(request)
@@ -743,6 +790,29 @@ async def create_manual_paid_alias2(request: Request):
 async def create_manual_paid_alias3(request: Request):
     return await create_manual_paid(request)
 
+@app.post("/api/createManualPaidOrder")
+async def create_manual_paid_alias4(request: Request):
+    return await create_manual_paid(request)
+
+@app.post("/api/orders/createManualPaid")
+async def create_manual_paid_alias5(request: Request):
+    return await create_manual_paid(request)
+
+@app.post("/api/orders/createManualPaidOrder")
+async def create_manual_paid_alias6(request: Request):
+    return await create_manual_paid(request)
+
+@app.post("/api/manual_paid")
+async def create_manual_paid_alias7(request: Request):
+    return await create_manual_paid(request)
+
+@app.post("/api/orders/manualPaid")
+async def create_manual_paid_alias8(request: Request):
+    return await create_manual_paid(request)
+
+# =========================
+# Admin pending buckets
+# =========================
 @app.get("/api/admin/pending/services")
 def admin_pending_services(x_admin_password: str = Header(..., alias="x-admin-password")):
     _require_admin(x_admin_password)
@@ -1103,6 +1173,15 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: str = Head
     finally:
         put_conn(conn)
 
+# Aliases for deliver / reject to match various admin clients
+@app.post("/api/admin/orders/{oid}/execute")
+async def admin_execute_alias(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
+    return await admin_deliver(oid, request, x_admin_password)
+
+@app.post("/api/admin/card/{oid}/execute")
+async def admin_card_execute_alias(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
+    return await admin_deliver(oid, request, x_admin_password)
+
 @app.post("/api/admin/orders/{oid}/reject")
 async def admin_reject(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
     """
@@ -1158,6 +1237,10 @@ async def admin_reject(oid: int, request: Request, x_admin_password: str = Heade
         return {"ok": True, "status": "Rejected"}
     finally:
         put_conn(conn)
+
+@app.post("/api/admin/card/{oid}/reject")
+async def admin_card_reject_alias(oid: int, request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
+    return await admin_reject(oid, request, x_admin_password)
 
 # =========================
 # Admin: wallet adjust + compatibility
@@ -1219,7 +1302,6 @@ async def admin_wallet_change(request: Request, x_admin_password: str = Header(.
         raise HTTPException(400, "amount must be number")
 
     direction = "topup" if amount >= 0 else "deduct"
-    req = {"amount": abs(amount), "reason": data.get("reason")}
     if direction == "deduct":
         # call deduct
         body = WalletCompatIn(uid=uid, amount=abs(amount), reason=data.get("reason"))
