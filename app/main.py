@@ -187,7 +187,25 @@ def _require_admin(passwd: str):
         raise HTTPException(401, "bad admin password")
 
 def _payload_is_jsonb(conn) -> bool:
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_typeof(payload)::text FROM public.orders LIMIT 1")
+            row = cur.fetchone()
+            return bool(row and isinstance(row[0], str) and row[0].lower() == "jsonb")
+    except Exception:
+        return False
 
+async def _read_json_object(request: Request) -> Dict[str, Any]:
+    try:
+        data = await request.json()
+    except Exception:
+        raw = (await request.body()).decode("utf-8", errors="ignore").strip()
+        data = json.loads(raw) if raw else {}
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise HTTPException(400, "Body must be a JSON object")
+    return data
 
 # ===== Service ID overrides (server-level) =====
 def _ensure_overrides_table(cur):
@@ -212,17 +230,7 @@ def _get_override_service_id(cur, ui_key: str):
     except Exception:
         return False
 
-async def _read_json_object(request: Request) -> Dict[str, Any]:
-    try:
-        data = await request.json()
-    except Exception:
-        raw = (await request.body()).decode("utf-8", errors="ignore").strip()
-        data = json.loads(raw) if raw else {}
-    if data is None:
-        return {}
-    if not isinstance(data, dict):
-        raise HTTPException(400, "Body must be a JSON object")
-    return data
+
 
 def _notify_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
     try:
