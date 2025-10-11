@@ -860,57 +860,6 @@ async def create_manual_paid_alias8(request: Request):
 # =========================
 # Admin pending buckets
 # =========================
-@app.get("/api/admin/pending/services")
-def admin_pending_services(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    _require_admin(x_admin_password or password or "")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute(r"""
-                SELECT o.id, o.title, o.quantity, o.price, o.status,
-                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
-                       o.link, u.uid
-                FROM public.orders o
-                JOIN public.users u ON u.id = o.user_id
-                WHERE o.status='Pending'
-                  AND NOT (
-                        LOWER(o.title) LIKE '%pubg%' OR
-                        LOWER(o.title) LIKE '%bgmi%' OR
-                        LOWER(o.title) LIKE '%uc%' OR
-                        o.title LIKE '%شدات%' OR
-                        o.title LIKE '%بيجي%' OR
-                        o.title LIKE '%ببجي%'
-                  )
-                  AND NOT (
-                        LOWER(o.title) LIKE '%ludo%' OR
-                        LOWER(o.title) LIKE '%yalla%' OR
-                        o.title LIKE '%يلا لودو%' OR
-                        o.title LIKE '%لودو%'
-                  )
-                  AND (o.type IS NULL OR o.type <> 'topup_card')
-                  AND NOT (
-                        (
-                          (LOWER(o.title) LIKE '%asiacell%' OR o.title LIKE '%أسيا%' OR o.title LIKE '%اسياسيل%' OR
-                           LOWER(o.title) LIKE '%korek%' OR o.title LIKE '%كورك%' OR o.title LIKE '%اثير%')
-                          AND
-                          (LOWER(o.title) LIKE '%voucher%' OR LOWER(o.title) LIKE '%code%' OR LOWER(o.title) LIKE '%card%' OR
-                           o.title LIKE '%رمز%' OR o.title LIKE '%كود%' OR o.title LIKE '%بطاقة%' OR o.title LIKE '%كارت%' OR o.title LIKE '%شراء%')
-                          AND NOT (
-                                LOWER(o.title) LIKE '%topup%' OR LOWER(o.title) LIKE '%top-up%' OR LOWER(o.title) LIKE '%recharge%' OR
-                                o.title LIKE '%شحن%' OR o.title LIKE '%شحن عبر%' OR o.title LIKE '%شحن اسيا%' OR LOWER(o.title) LIKE '%direct%'
-                          )
-                        )
-                  )
-                  AND NOT (LOWER(o.title) LIKE '%itunes%' OR o.title LIKE '%ايتونز%')
-                ORDER BY o.id DESC
-            """)
-            rows = cur.fetchall()
-        out = []
-        for (oid, title, qty, price, status, created_at, link, uid) in rows:
-            d = _row_to_order_dict((oid, title, qty, price, status, created_at, link))
-            d["uid"] = uid
-            out.append(d)
-        return out
     finally:
         put_conn(conn)
 
@@ -1678,5 +1627,52 @@ def admin_clear_service_id(body: SvcOverrideIn, x_admin_password: Optional[str] 
             _ensure_overrides_table(cur)
             cur.execute("DELETE FROM public.service_id_overrides WHERE ui_key=%s", (body.ui_key,))
         return {"ok": True}
+    finally:
+        put_conn(conn)
+
+
+@app.post("/api/admin/topup_cards/{oid}/execute")
+def admin_execute_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    # reuse main deliver/execute handler
+    return admin_deliver(oid, request, x_admin_password, password)
+
+@app.post("/api/admin/topup_cards/{oid}/reject")
+def admin_reject_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    # reuse main reject handler
+    return admin_reject(oid, request, x_admin_password, password)
+
+
+@app.get("/api/admin/pending/services")
+def admin_pending_services(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None, limit: int = 100):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            # Include both Pending and Processing for API/provider orders (exclude topup_card)
+            cur.execute("""
+                SELECT id, user_id, service_name, service_id, link, quantity, price, status, created_at
+                FROM public.orders
+                WHERE status IN ('Pending','Processing')
+                  AND COALESCE(type, '') IN ('provider','service','api','smm')
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, (int(limit),))
+            rows = cur.fetchall()
+            out = []
+            for r in rows:
+                out.append({
+                    "id": int(r[0]),
+                    "user_id": r[1],
+                    "service_name": r[2],
+                    "service_id": int(r[3]) if r[3] is not None else None,
+                    "link": r[4],
+                    "quantity": int(r[5]) if r[5] is not None else None,
+                    "price": float(r[6]) if r[6] is not None else 0.0,
+                    "status": r[7],
+                    "created_at": r[8].isoformat() if r[8] is not None else None
+                })
+            return {"list": out}
     finally:
         put_conn(conn)
