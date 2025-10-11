@@ -1590,3 +1590,16 @@ async def admin_execute_topup_alias(oid: int, request: Request, x_admin_password
 @app.post("/api/admin/topup/{oid}/reject")
 async def admin_reject_topup_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     return await admin_reject(oid, request, x_admin_password, password)
+
+
+# --- Extra alias endpoints for admin actions (Asiacell Topup: "topup_cards" path used by some clients) ---
+
+@app.post("/api/admin/topup_cards/{oid}/execute")
+async def admin_execute_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    # Forward to the main deliver handler (credits wallet if type='topup_card', notifies user)
+    return await admin_deliver(oid, request, x_admin_password, password)
+
+@app.post("/api/admin/topup_cards/{oid}/reject")
+async def admin_reject_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    # Forward to the main reject handler (refunds if charged, writes reason, notifies user)
+    return await admin_reject(oid, request, x_admin_password, password)
