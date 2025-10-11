@@ -740,7 +740,10 @@ async def create_manual_paid(request: Request):
     else:
         raise HTTPException(422, "invalid product")
 
-    conn = get_conn()
+    
+    if account_id:
+        title = f"{title} | ID: {account_id}"
+conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             # ensure user & balance
@@ -909,7 +912,8 @@ def admin_pending_pubg(x_admin_password: Optional[str] = Header(None, alias="x-a
             cur.execute("""
                 SELECT o.id, o.title, o.quantity, o.price, o.status,
                        EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
-                       o.link, u.uid
+                       o.link, u.uid,
+                       COALESCE((COALESCE(NULLIF(o.payload,''),'{}')::jsonb->>'account_id'),'') AS account_id
                 FROM public.orders o
                 JOIN public.users u ON u.id = o.user_id
                 WHERE o.status='Pending' AND (
@@ -924,9 +928,11 @@ def admin_pending_pubg(x_admin_password: Optional[str] = Header(None, alias="x-a
             """)
             rows = cur.fetchall()
         out = []
-        for (oid, title, qty, price, status, created_at, link, uid) in rows:
+        for (oid, title, qty, price, status, created_at, link, uid, account_id) in rows:
             d = _row_to_order_dict((oid, title, qty, price, status, created_at, link))
             d["uid"] = uid
+            if account_id:
+                d["account_id"] = account_id
             out.append(d)
         return out
     finally:
@@ -941,7 +947,8 @@ def admin_pending_ludo(x_admin_password: Optional[str] = Header(None, alias="x-a
             cur.execute("""
                 SELECT o.id, o.title, o.quantity, o.price, o.status,
                        EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
-                       o.link, u.uid
+                       o.link, u.uid,
+                       COALESCE((COALESCE(NULLIF(o.payload,''),'{}')::jsonb->>'account_id'),'') AS account_id
                 FROM public.orders o
                 JOIN public.users u ON u.id = o.user_id
                 WHERE o.status='Pending' AND (
@@ -954,9 +961,11 @@ def admin_pending_ludo(x_admin_password: Optional[str] = Header(None, alias="x-a
             """)
             rows = cur.fetchall()
         out = []
-        for (oid, title, qty, price, status, created_at, link, uid) in rows:
+        for (oid, title, qty, price, status, created_at, link, uid, account_id) in rows:
             d = _row_to_order_dict((oid, title, qty, price, status, created_at, link))
             d["uid"] = uid
+            if account_id:
+                d["account_id"] = account_id
             out.append(d)
         return out
     finally:
