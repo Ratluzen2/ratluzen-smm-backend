@@ -1,4 +1,3 @@
-
 import os
 import json
 import time
@@ -174,7 +173,7 @@ ensure_schema()
 # =========================
 # FastAPI
 # =========================
-app = FastAPI(title="SMM Backend", version="1.7.0")
+app = FastAPI(title="SMM Backend", version="1.8.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -326,6 +325,7 @@ def upsert_user(body: UpsertUserIn):
     finally:
         put_conn(conn)
 
+# ---- Wallet balance (with several aliases to match the app) ----
 @app.get("/api/wallet/balance")
 def wallet_balance(uid: str):
     conn = get_conn()
@@ -336,6 +336,27 @@ def wallet_balance(uid: str):
         return {"ok": True, "balance": float(r[0] if r else 0.0)}
     finally:
         put_conn(conn)
+
+# aliases
+@app.get("/api/get_balance")
+def wallet_balance_alias1(uid: str):
+    return wallet_balance(uid)
+
+@app.get("/api/balance")
+def wallet_balance_alias2(uid: str):
+    return wallet_balance(uid)
+
+@app.get("/api/wallet/get")
+def wallet_balance_alias3(uid: str):
+    return wallet_balance(uid)
+
+@app.get("/api/wallet/get_balance")
+def wallet_balance_alias4(uid: str):
+    return wallet_balance(uid)
+
+@app.get("/api/users/{uid}/balance")
+def wallet_balance_alias5(uid: str):
+    return wallet_balance(uid)
 
 # Create provider order core
 def _create_provider_order_core(cur, uid: str, service_id: Optional[int], service_name: str,
@@ -515,6 +536,7 @@ def _orders_for_uid(uid: str) -> List[dict]:
 def my_orders(uid: str):
     return _orders_for_uid(uid)
 
+# more aliases for safety
 @app.get("/api/orders")
 def orders_alias(uid: str):
     return _orders_for_uid(uid)
@@ -597,7 +619,7 @@ def mark_notification_read(uid: str, nid: int):
 async def create_manual_paid(request: Request):
     """
     Creates a manual order (iTunes / Atheer / Asiacell / Korek / PUBG / Ludo) and atomically charges user balance.
-    Body: { uid: str, product: "itunes"|"atheer"|"asiacell"|"korek"|"pubg_uc"|"ludo_diamond"|"ludo_gold", usd: per product }
+    Body: { uid: str, product: "itunes"|"atheer"|"asiacell"|"korek"|"pubg_uc"|"ludo_diamond"|"ludo_gold", usd: per product, account_id?: str }
     Pricing:
       - itunes:   each 5$ = 9$
       - atheer:   each 5$ = 7$
@@ -614,6 +636,9 @@ async def create_manual_paid(request: Request):
         usd = int(data.get("usd") or 0)
     except Exception:
         raise HTTPException(422, "invalid usd")
+
+    # Player account / game id (optional but stored)
+    account_id = (data.get("account_id") or data.get("accountId") or data.get("game_id") or "").strip()
 
     # Validation per product
     allowed_telco = {5,10,15,20,25,30,40,50,100}
@@ -680,27 +705,43 @@ async def create_manual_paid(request: Request):
             cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (Decimal(price), user_id))
             cur.execute(
                 "INSERT INTO public.wallet_txns(user_id, amount, reason, meta) VALUES(%s,%s,%s,%s)",
-                (user_id, Decimal(-price), "order_charge", Json({"product": product, "usd": usd}))
+                (user_id, Decimal(-price), "order_charge", Json({"product": product, "usd": usd, "account_id": account_id}))
             )
 
             # create pending manual order carrying the price for future refund if rejected
+            payload = {"product": product, "usd": usd, "charged": float(price)}
+            if account_id:
+                payload["account_id"] = account_id
             cur.execute(
                 """
                 INSERT INTO public.orders(user_id, title, quantity, price, status, payload, type)
                 VALUES(%s,%s,%s,%s,'Pending',%s,'manual')
                 RETURNING id
                 """,
-                (user_id, title, usd, float(price),
-                 Json({"product": product, "usd": usd, "charged": float(price)}))
+                (user_id, title, usd, float(price), Json(payload))
             )
             oid = cur.fetchone()[0]
 
         # optional: immediate user notification (order received)
-        _notify_user(conn, user_id, oid, "تم استلام طلبك", title)
+        body = title + (f" | ID: {account_id}" if account_id else "")
+        _notify_user(conn, user_id, oid, "تم استلام طلبك", body)
 
         return {"ok": True, "order_id": oid, "charged": float(price)}
     finally:
         put_conn(conn)
+
+# Additional compat aliases for manual_paid
+@app.post("/api/create/manual_paid")
+async def create_manual_paid_alias1(request: Request):
+    return await create_manual_paid(request)
+
+@app.post("/api/orders/manual_paid/create")
+async def create_manual_paid_alias2(request: Request):
+    return await create_manual_paid(request)
+
+@app.post("/api/orders/create/manual-paid")
+async def create_manual_paid_alias3(request: Request):
+    return await create_manual_paid(request)
 
 @app.get("/api/admin/pending/services")
 def admin_pending_services(x_admin_password: str = Header(..., alias="x-admin-password")):
@@ -829,11 +870,11 @@ def admin_pending_ludo(x_admin_password: str = Header(..., alias="x-admin-passwo
                 WHERE o.status='Pending' AND (
                 LOWER(o.title) LIKE '%ludo%' OR
                 LOWER(o.title) LIKE '%yalla%' OR
-                o.title LIKE '%يلا لودو%' أو
+                o.title LIKE '%يلا لودو%' OR
                 o.title LIKE '%لودو%'
             )
                 ORDER BY o.id DESC
-            """.replace("أو", "or"))
+            """)
             rows = cur.fetchall()
         out = []
         for (oid, title, qty, price, status, created_at, link, uid) in rows:
@@ -901,7 +942,7 @@ def admin_pending_balances(x_admin_password: str = Header(..., alias="x-admin-pa
                         LOWER(o.title) LIKE '%top-up%' OR
                         LOWER(o.title) LIKE '%recharge%' OR
                         o.title LIKE '%شحن%' OR
-                        o.title LIKE '%شحن عبر%' OR
+                        o.title LIKE '%شحن عبر%' Or
                         o.title LIKE '%شحن اسيا%' OR
                         LOWER(o.title) LIKE '%direct%'
                   )
@@ -910,7 +951,7 @@ def admin_pending_balances(x_admin_password: str = Header(..., alias="x-admin-pa
                         o.title LIKE '%ايتونز%'
                   )
                 ORDER BY o.id DESC
-            """)
+            """.replace("Or", "OR"))
             rows = cur.fetchall()
         out = []
         for (oid, title, qty, price, status, created_at, link, uid) in rows:
@@ -1163,6 +1204,29 @@ async def admin_wallet_adjust(uid: str, request: Request, x_admin_password: str 
         return {"ok": True, "status": "adjusted", "amount": amt, "reason": reason}
     finally:
         put_conn(conn)
+
+# Single "change" endpoint (positive = topup, negative = deduct) to match older apps
+@app.post("/api/admin/wallet/change")
+async def admin_wallet_change(request: Request, x_admin_password: str = Header(..., alias="x-admin-password")):
+    _require_admin(x_admin_password)
+    data = await _read_json_object(request)
+    uid = (data.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(400, "uid required")
+    try:
+        amount = float(data.get("amount"))
+    except Exception:
+        raise HTTPException(400, "amount must be number")
+
+    direction = "topup" if amount >= 0 else "deduct"
+    req = {"amount": abs(amount), "reason": data.get("reason")}
+    if direction == "deduct":
+        # call deduct
+        body = WalletCompatIn(uid=uid, amount=abs(amount), reason=data.get("reason"))
+        return admin_wallet_deduct(body, x_admin_password)
+    else:
+        body = WalletCompatIn(uid=uid, amount=amount, reason=data.get("reason"))
+        return admin_wallet_topup(body, x_admin_password)
 
 @app.post("/api/admin/wallet/topup")
 def admin_wallet_topup(body: WalletCompatIn, x_admin_password: str = Header(..., alias="x-admin-password")):
