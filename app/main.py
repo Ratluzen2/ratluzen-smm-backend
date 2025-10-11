@@ -1629,16 +1629,16 @@ def admin_clear_service_id(body: SvcOverrideIn, x_admin_password: Optional[str] 
 
 
 @app.post("/api/admin/topup_cards/{oid}/execute")
-def admin_execute_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+async def admin_execute_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(x_admin_password or password or "")
     # reuse main deliver/execute handler
-    return admin_deliver(oid, request, x_admin_password, password)
+    return await admin_deliver(oid, request, x_admin_password, password)
 
 @app.post("/api/admin/topup_cards/{oid}/reject")
-def admin_reject_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+async def admin_reject_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(x_admin_password or password or "")
     # reuse main reject handler
-    return admin_reject(oid, request, x_admin_password, password)
+    return await admin_reject(oid, request, x_admin_password, password)
 
 
 @app.get("/api/admin/pending/services")
@@ -1670,6 +1670,83 @@ def admin_pending_services(x_admin_password: Optional[str] = Header(None, alias=
                     "status": r[7],
                     "created_at": r[8].isoformat() if r[8] is not None else None
                 })
+            return {"list": out}
+    finally:
+        put_conn(conn)
+
+@app.get("/api/admin/pending/services")
+def admin_pending_services(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None, limit: int = 100):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            # Avoid referencing columns that might not exist (e.g., service_name)
+            # Fetch minimal guaranteed columns and a full JSON snapshot of the row.
+            try:
+                cur.execute(f"""
+                    SELECT id,
+                           created_at,
+                           status,
+                           to_jsonb(orders) AS data
+                    FROM public.orders
+                    WHERE status IN ('Pending','Processing')
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, (int(limit),))
+            except Exception:
+                # Fallback if status/created_at don't exist for some reason
+                cur.execute(f"""
+                    SELECT id,
+                           NOW() AS created_at,
+                           'Pending'::text AS status,
+                           to_jsonb(orders) AS data
+                    FROM public.orders
+                    ORDER BY id DESC
+                    LIMIT %s
+                """, (int(limit),))
+            rows = cur.fetchall()
+
+            out = []
+            for r in rows:
+                oid, created_at, status, data = r[0], r[1], r[2], r[3] or {}
+                # 'data' is a dict of all columns; extract common aliases safely
+                if isinstance(data, dict):
+                    _get = data.get
+                else:
+                    # psycopg2 may return as Json
+                    try:
+                        _get = dict(data).get
+                    except Exception:
+                        _get = (lambda k, default=None: None)
+
+                service_name = _get('service_name') or _get('pkg_label') or _get('title') or _get('name') or _get('service') or '—'
+                service_id = _get('service_id') or _get('sid') or _get('package_id')
+                link = _get('link') or _get('url') or _get('target')
+                quantity = _get('quantity') or _get('qty') or _get('count')
+                price = _get('price') or _get('amount') or _get('cost') or 0
+
+                uid = _get('user_id') or _get('uid') or _get('user')
+                try:
+                    quantity = int(quantity) if quantity is not None else None
+                except Exception:
+                    pass
+                try:
+                    price = float(price) if price is not None else 0.0
+                except Exception:
+                    price = 0.0
+
+                out.append({
+                    "id": int(oid),
+                    "user_id": uid,
+                    "service_name": service_name,
+                    "service_id": service_id,
+                    "link": link,
+                    "quantity": quantity,
+                    "price": price,
+                    "status": status,
+                    "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at)
+                })
+
             return {"list": out}
     finally:
         put_conn(conn)
