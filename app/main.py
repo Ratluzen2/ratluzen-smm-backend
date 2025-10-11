@@ -823,6 +823,7 @@ async def create_manual_paid_alias8(request: Request):
 # =========================
 # Admin pending buckets
 # =========================
+
 def admin_pending_services(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(x_admin_password or password or "")
     conn = get_conn()
@@ -1591,8 +1592,13 @@ async def admin_reject_topup_alias(oid: int, request: Request, x_admin_password:
     return await admin_reject(oid, request, x_admin_password, password)
 
 
+from typing import Optional
+import json, time
+
+# --- assume the rest of your app (imports, app instance, get_conn, put_conn, _require_admin, admin_deliver, admin_reject, etc.) already exists above ---
+
 # =========================
-# Admin: Pending API services (robust)
+# Admin: Pending API services (compact response for app UI)
 # =========================
 @app.get("/api/admin/pending/services")
 def admin_pending_services(
@@ -1604,7 +1610,7 @@ def admin_pending_services(
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            # Try preferred query with status/created_at if available
+            # Prefer rows that are still Pending only (so تختفي مباشرة بعد الموافقة)
             try:
                 cur.execute("""
                     SELECT
@@ -1613,12 +1619,12 @@ def admin_pending_services(
                         o.status,
                         to_jsonb(o) AS data
                     FROM public.orders o
-                    WHERE o.status IN ('Pending','Processing')
+                    WHERE o.status = 'Pending'
                     ORDER BY o.created_at DESC
                     LIMIT %s
                 """, (int(limit),))
             except Exception:
-                # Fallback if some columns are missing
+                # Fallback if created_at/status missing
                 cur.execute("""
                     SELECT
                         o.id,
@@ -1626,6 +1632,7 @@ def admin_pending_services(
                         COALESCE(o.status, 'Pending') AS status,
                         to_jsonb(o) AS data
                     FROM public.orders o
+                    WHERE COALESCE(o.status, 'Pending') = 'Pending'
                     ORDER BY o.id DESC
                     LIMIT %s
                 """, (int(limit),))
@@ -1633,7 +1640,7 @@ def admin_pending_services(
 
             out = []
             for oid, created_at, status, data in rows:
-                # Convert 'data' to a dict safely
+                # Convert 'data' to a dict
                 d = {}
                 if isinstance(data, dict):
                     d = data
@@ -1649,43 +1656,58 @@ def admin_pending_services(
                 def pick(*keys, default=None):
                     for k in keys:
                         v = d.get(k)
-                        if v is not None and v != "":
+                        if v not in (None, ""):
                             return v
                     return default
 
-                service_name = pick('service_name','pkg_label','title','name','service','platform', default='—')
-                service_id   = pick('service_id','sid','package_id')
-                link         = pick('link','url','target')
-                quantity     = pick('quantity','qty','count')
-                price        = pick('price','amount','cost', default=0)
-                uid          = pick('user_id','uid','user')
+                # Map to the exact keys expected by the Android UI
+                title = pick('service_name','pkg_label','title','name','service','platform')
+                if not title:
+                    sid = pick('service_id','sid','package_id')
+                    title = f"Service #{sid}" if sid else "—"
 
+                q = pick('quantity','qty','count', default=0)
                 try:
-                    quantity = int(quantity) if quantity is not None else None
+                    q = int(q) if q is not None else 0
                 except Exception:
-                    pass
+                    q = 0
+
+                price = pick('price','amount','cost', default=0)
                 try:
                     price = float(price) if price is not None else 0.0
                 except Exception:
                     price = 0.0
 
+                link = pick('link','url','target','payload','username','account_id') or ""
+
+                uid = pick('user_id','uid','user') or ""
+                account_id = pick('account_id','game_id','player_id','pubg_id','ludo_id','instagram_id','telegram_username') or ""
+
+                # created_at as milliseconds (Android expects Long)
+                try:
+                    created_ms = int(created_at.timestamp() * 1000)
+                except Exception:
+                    created_ms = int(time.time() * 1000)
+
                 out.append({
                     "id": int(oid),
-                    "user_id": uid,
-                    "service_name": service_name,
-                    "service_id": service_id,
-                    "link": link,
-                    "quantity": quantity,
+                    "title": str(title),
+                    "quantity": q,
                     "price": price,
-                    "status": status,
-                    "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at),
+                    "link": link,
+                    "status": "Pending",
+                    "created_at": created_ms,
+                    "uid": uid,
+                    "account_id": account_id
                 })
 
             return {"list": out}
     finally:
         put_conn(conn)
 
-
+# =========================
+# Admin: Topup cards aliases (execute / reject)
+# =========================
 @app.post("/api/admin/topup_cards/{oid}/execute")
 async def admin_execute_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(x_admin_password or password or "")
@@ -1695,3 +1717,4 @@ async def admin_execute_topup_cards_alias(oid: int, request: Request, x_admin_pa
 async def admin_reject_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(x_admin_password or password or "")
     return await admin_reject(oid, request, x_admin_password, password)
+
