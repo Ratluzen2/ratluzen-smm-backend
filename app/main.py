@@ -98,12 +98,38 @@ def ensure_schema():
                     """)
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON public.orders(user_id);")
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders(status);")
-                    # defaults/upgrade
                     cur.execute("ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS type TEXT;")
                     cur.execute("UPDATE public.orders SET type='provider' WHERE type IS NULL;")
                     cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET DEFAULT 'provider';")
                     cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET NOT NULL;")
                     cur.execute("UPDATE public.orders SET payload='{}'::jsonb WHERE payload IS NULL;")
+
+                    # service overrides tables
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.service_id_overrides(
+                            ui_key TEXT PRIMARY KEY,
+                            service_id BIGINT NOT NULL,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                    """)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.service_pricing_overrides(
+                            ui_key TEXT PRIMARY KEY,
+                            price_per_k NUMERIC(18,6) NOT NULL,
+                            min_qty INTEGER NOT NULL,
+                            max_qty INTEGER NOT NULL,
+                            mode TEXT NOT NULL DEFAULT 'per_k',
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                    """)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.order_pricing_overrides(
+                            order_id BIGINT PRIMARY KEY,
+                            price NUMERIC(18,6) NOT NULL,
+                            mode TEXT NOT NULL DEFAULT 'flat',
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                    """)
 
                     # user_notifications
                     cur.execute("""
@@ -174,7 +200,7 @@ ensure_schema()
 # =========================
 # FastAPI
 # =========================
-app = FastAPI(title="SMM Backend", version="1.9.1")
+app = FastAPI(title="SMM Backend", version="1.9.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -283,11 +309,11 @@ class UpsertUserIn(BaseModel):
 
 class ProviderOrderIn(BaseModel):
     uid: str
-    service_id: int
+    service_id: Optional[int] = None
     service_name: str
-    link: str
-    quantity: int = Field(ge=1)
-    price: float = Field(ge=0)
+    link: Optional[str] = None
+    quantity: int = Field(ge=1, default=1)
+    price: float = Field(ge=0, default=0)
 
 class ManualOrderIn(BaseModel):
     uid: str
@@ -343,7 +369,8 @@ def _ensure_user(cur, uid: str) -> int:
     return cur.fetchone()[0]
 
 def _refund_if_needed(cur, user_id: int, price: float, order_id: int):
-    if eff_price and eff_price > 0:
+    # Correctly use the price parameter (eff_price might be used elsewhere).
+    if price and price > 0:
         cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(price), user_id))
         cur.execute("""
             INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
@@ -436,55 +463,56 @@ def _create_provider_order_core(cur, uid: str, service_id: Optional[int], servic
     except Exception:
         pass
 
-    
-# apply pricing override by service_name (ui_key)
-eff_price = price
-try:
-    if service_name:
-        cur.execute("SELECT price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (service_name,))
-        rowp = cur.fetchone()
+    # apply pricing override by service_name (ui_key)
+    eff_price = price
+    try:
+        rowp = None
+        if service_name:
+            cur.execute("SELECT price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (service_name,))
+            rowp = cur.fetchone()
 
-# compute price based on mode
-if rowp:
-    ppk = float(rowp[0]); mn = int(rowp[1]); mx = int(rowp[2]); mode = (rowp[3] or 'per_k')
-    if mode == 'flat':
-        eff_price = float(ppk)
-    else:
-        if quantity < mn or quantity > mx:
-            raise HTTPException(400, f"quantity out of allowed range [{mn}-{mx}]")
-        eff_price = float(Decimal(quantity) * Decimal(ppk) / Decimal(1000))
-
-if not rowp:
-    # category-level fallback for PUBG/Ludo
-    key = None
-    sname = (service_name or "").lower()
-    if any(w in sname for w in ["pubg","ببجي","uc"]):
-        key = "cat.pubg"
-    elif any(w in sname for w in ["ludo","لودو"]):
-        key = "cat.ludo"
-    if key:
-        cur.execute("SELECT price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (key,))
-        rowp = cur.fetchone()
-
+        # compute price based on mode
         if rowp:
-            ppk = float(rowp[0]); mn = int(rowp[1]); mx = int(rowp[2])
-            # validate quantity
-            if quantity < mn or quantity > mx:
-                raise HTTPException(400, f"quantity out of allowed range [{mn}-{mx}]")
-            eff_price = float(Decimal(quantity) * Decimal(ppk) / Decimal(1000))
-except Exception as _e:
-    # keep original price if anything fails
-    pass
+            ppk = float(rowp[0]); mn = int(rowp[1]); mx = int(rowp[2]); mode = (rowp[3] or 'per_k')
+            if mode == 'flat':
+                eff_price = float(ppk)
+            else:
+                if quantity < mn or quantity > mx:
+                    raise HTTPException(400, f"quantity out of allowed range [{mn}-{mx}]")
+                eff_price = float(Decimal(quantity) * Decimal(ppk) / Decimal(1000))
 
-# charge if paid
+        if not rowp:
+            # category-level fallback for PUBG/Ludo
+            key = None
+            sname = (service_name or "").lower()
+            if any(w in sname for w in ["pubg","ببجي","uc"]):
+                key = "cat.pubg"
+            elif any(w in sname for w in ["ludo","لودو"]):
+                key = "cat.ludo"
+            if key:
+                cur.execute("SELECT price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (key,))
+                rowp = cur.fetchone()
+                if rowp:
+                    ppk = float(rowp[0]); mn = int(rowp[1]); mx = int(rowp[2]); mode = (rowp[3] or 'per_k')
+                    if mode == 'flat':
+                        eff_price = float(ppk)
+                    else:
+                        if quantity < mn or quantity > mx:
+                            raise HTTPException(400, f"quantity out of allowed range [{mn}-{mx}]")
+                        eff_price = float(Decimal(quantity) * Decimal(ppk) / Decimal(1000))
+    except Exception:
+        # keep original price if anything fails
+        pass
+
+    # charge if paid (use effective price)
     if eff_price and eff_price > 0:
-        if bal < price:
+        if bal < eff_price:
             raise HTTPException(400, "insufficient balance")
-        cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (Decimal(price), user_id))
+        cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (Decimal(eff_price), user_id))
         cur.execute("""
             INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
             VALUES(%s,%s,%s,%s)
-        """, (user_id, Decimal(-price), "order_charge",
+        """, (user_id, Decimal(-eff_price), "order_charge",
               Json({"service_id": service_id, "name": service_name, "qty": quantity, "price_effective": eff_price})))
 
     cur.execute("""
@@ -573,8 +601,8 @@ def _asiacell_submit_core(cur, uid: str, card_digits: str) -> int:
 
 def _extract_digits(raw: Any) -> str:
     return "".join(ch for ch in str(raw) if ch.isdigit())
-# 
-ASIACELL_PATHS = [  # commented out (undefined)
+
+ASIACELL_PATHS = [
     "/api/wallet/asiacell/submit",
     "/api/topup/asiacell/submit",
     "/api/asiacell/submit",
@@ -718,7 +746,6 @@ def mark_notification_read(uid: str, nid: int):
     finally:
         put_conn(conn)
 
-
 # =========================
 # Manual PAID orders (charge now, refund on reject)
 # =========================
@@ -798,7 +825,6 @@ async def create_manual_paid(request: Request):
     else:
         raise HTTPException(422, "invalid product")
 
-    
     if account_id:
         title = f"{title} | ID: {account_id}"
     conn = get_conn()
@@ -877,235 +903,6 @@ async def create_manual_paid_alias7(request: Request):
 @app.post("/api/orders/manualPaid")
 async def create_manual_paid_alias8(request: Request):
     return await create_manual_paid(request)
-
-# =========================
-# Admin pending buckets
-# =========================
-
-def admin_pending_services(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    _require_admin(x_admin_password or password or "")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute(r"""
-                SELECT o.id, o.title, o.quantity, o.price, o.status,
-                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
-                       o.link, u.uid
-                FROM public.orders o
-                JOIN public.users u ON u.id = o.user_id
-                WHERE o.status='Pending'
-                  AND NOT (
-                        LOWER(o.title) LIKE '%pubg%' OR
-                        LOWER(o.title) LIKE '%bgmi%' OR
-                        LOWER(o.title) LIKE '%uc%' OR
-                        o.title LIKE '%شدات%' OR
-                        o.title LIKE '%بيجي%' OR
-                        o.title LIKE '%ببجي%'
-                  )
-                  AND NOT (
-                        LOWER(o.title) LIKE '%ludo%' OR
-                        LOWER(o.title) LIKE '%yalla%' OR
-                        o.title LIKE '%يلا لودو%' OR
-                        o.title LIKE '%لودو%'
-                  )
-                  AND (o.type IS NULL OR o.type <> 'topup_card')
-                  AND NOT (
-                        (
-                          (LOWER(o.title) LIKE '%asiacell%' OR o.title LIKE '%أسيا%' OR o.title LIKE '%اسياسيل%' OR
-                           LOWER(o.title) LIKE '%korek%' OR o.title LIKE '%كورك%' OR o.title LIKE '%اثير%')
-                          AND
-                          (LOWER(o.title) LIKE '%voucher%' OR LOWER(o.title) LIKE '%code%' OR LOWER(o.title) LIKE '%card%' OR
-                           o.title LIKE '%رمز%' OR o.title LIKE '%كود%' OR o.title LIKE '%بطاقة%' OR o.title LIKE '%كارت%' OR o.title LIKE '%شراء%')
-                          AND NOT (
-                                LOWER(o.title) LIKE '%topup%' OR LOWER(o.title) LIKE '%top-up%' OR LOWER(o.title) LIKE '%recharge%' OR
-                                o.title LIKE '%شحن%' OR o.title LIKE '%شحن عبر%' OR o.title LIKE '%شحن اسيا%' OR LOWER(o.title) LIKE '%direct%'
-                          )
-                        )
-                  )
-                  AND NOT (LOWER(o.title) LIKE '%itunes%' OR o.title LIKE '%ايتونز%')
-                ORDER BY o.id DESC
-            """)
-            rows = cur.fetchall()
-        out = []
-        for (oid, title, qty, price, status, created_at, link, uid) in rows:
-            d = _row_to_order_dict((oid, title, qty, price, status, created_at, link))
-            d["uid"] = uid
-            out.append(d)
-        return out
-    finally:
-        put_conn(conn)
-
-@app.get("/api/admin/pending/itunes")
-def admin_pending_itunes(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    _require_admin(x_admin_password or password or "")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT o.id, o.title, o.quantity, o.price, o.status,
-                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
-                       o.link, u.uid
-                FROM public.orders o
-                JOIN public.users u ON u.id = o.user_id
-                WHERE o.status='Pending'
-                  AND (LOWER(o.title) LIKE '%itunes%' OR o.title LIKE '%ايتونز%')
-                ORDER BY o.id DESC
-            """)
-            rows = cur.fetchall()
-        out = []
-        for (oid, title, qty, price, status, created_at, link, uid) in rows:
-            d = _row_to_order_dict((oid, title, qty, price, status, created_at, link))
-            d["uid"] = uid
-            out.append(d)
-        return out
-    finally:
-        put_conn(conn)
-
-@app.get("/api/admin/pending/pubg")
-def admin_pending_pubg(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    _require_admin(x_admin_password or password or "")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT o.id, o.title, o.quantity, o.price, o.status,
-                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
-                       o.link, u.uid,
-                       COALESCE((COALESCE(NULLIF(o.payload,''),'{}')::jsonb->>'account_id'),'') AS account_id
-                FROM public.orders o
-                JOIN public.users u ON u.id = o.user_id
-                WHERE o.status='Pending' AND (
-                LOWER(o.title) LIKE '%pubg%' OR
-                LOWER(o.title) LIKE '%bgmi%' OR
-                LOWER(o.title) LIKE '%uc%' OR
-                o.title LIKE '%شدات%' OR
-                o.title LIKE '%بيجي%' OR
-                o.title LIKE '%ببجي%'
-            )
-                ORDER BY o.id DESC
-            """)
-            rows = cur.fetchall()
-        out = []
-        for (oid, title, qty, price, status, created_at, link, uid, account_id) in rows:
-            d = _row_to_order_dict((oid, title, qty, price, status, created_at, link))
-            d["uid"] = uid
-            if account_id:
-                d["account_id"] = account_id
-            out.append(d)
-        return out
-    finally:
-        put_conn(conn)
-
-@app.get("/api/admin/pending/ludo")
-def admin_pending_ludo(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    _require_admin(x_admin_password or password or "")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT o.id, o.title, o.quantity, o.price, o.status,
-                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
-                       o.link, u.uid,
-                       COALESCE((COALESCE(NULLIF(o.payload,''),'{}')::jsonb->>'account_id'),'') AS account_id
-                FROM public.orders o
-                JOIN public.users u ON u.id = o.user_id
-                WHERE o.status='Pending' AND (
-                LOWER(o.title) LIKE '%ludo%' OR
-                LOWER(o.title) LIKE '%yalla%' OR
-                o.title LIKE '%يلا لودو%' OR
-                o.title LIKE '%لودو%'
-            )
-                ORDER BY o.id DESC
-            """)
-            rows = cur.fetchall()
-        out = []
-        for (oid, title, qty, price, status, created_at, link, uid, account_id) in rows:
-            d = _row_to_order_dict((oid, title, qty, price, status, created_at, link))
-            d["uid"] = uid
-            if account_id:
-                d["account_id"] = account_id
-            out.append(d)
-        return out
-    finally:
-        put_conn(conn)
-
-# Pending topup cards (Asiacell via card)
-@app.get("/api/admin/pending/cards")
-def admin_pending_cards(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    _require_admin(x_admin_password or password or "")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT o.id, u.uid, COALESCE((COALESCE(NULLIF(o.payload,''),'{}')::jsonb->>'card'), '') AS card,
-                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at
-                FROM public.orders o
-                JOIN public.users u ON u.id = o.user_id
-                WHERE o.status='Pending' AND o.type='topup_card'
-                ORDER BY o.id DESC
-            """)
-            rows = cur.fetchall()
-        return [{"id": r[0], "uid": r[1], "card": r[2], "created_at": int(r[3] or 0)} for r in rows]
-    finally:
-        put_conn(conn)
-
-# Pending balance purchase (Atheer/Asiacell/Korek vouchers)
-@app.get("/api/admin/pending/balances")
-def admin_pending_balances(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    _require_admin(x_admin_password or password or "")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute(r"""
-                SELECT o.id, o.title, o.quantity, o.price, o.status,
-                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
-                       o.link, u.uid
-                FROM public.orders o
-                JOIN public.users u ON u.id = o.user_id
-                WHERE o.status='Pending'
-                  AND (
-                        LOWER(o.title) LIKE '%asiacell%' OR
-                        o.title LIKE '%أسيا%' OR
-                        o.title LIKE '%اسياسيل%' OR
-                        LOWER(o.title) LIKE '%korek%' OR
-                        o.title LIKE '%كورك%' OR
-                        o.title LIKE '%اثير%'
-                  )
-                  AND (
-                        LOWER(o.title) LIKE '%voucher%' OR
-                        LOWER(o.title) LIKE '%code%' OR
-                        LOWER(o.title) LIKE '%card%' OR
-                        o.title LIKE '%رمز%' OR
-                        o.title LIKE '%كود%' OR
-                        o.title LIKE '%بطاقة%' OR
-                        o.title LIKE '%كارت%' OR
-                        o.title LIKE '%شراء%'
-                  )
-                  AND (o.type IS NULL OR o.type <> 'topup_card')
-                  AND NOT (
-                        LOWER(o.title) LIKE '%topup%' OR
-                        LOWER(o.title) LIKE '%top-up%' OR
-                        LOWER(o.title) LIKE '%recharge%' OR
-                        o.title LIKE '%شحن%' OR
-                        o.title LIKE '%شحن عبر%' Or
-                        o.title LIKE '%شحن اسيا%' OR
-                        LOWER(o.title) LIKE '%direct%'
-                  )
-                  AND NOT (
-                        LOWER(o.title) LIKE '%itunes%' OR
-                        o.title LIKE '%ايتونز%'
-                  )
-                ORDER BY o.id DESC
-            """.replace("Or", "OR"))
-            rows = cur.fetchall()
-        out = []
-        for (oid, title, qty, price, status, created_at, link, uid) in rows:
-            d = _row_to_order_dict((oid, title, qty, price, status, created_at, link))
-            d["uid"] = uid
-            out.append(d)
-        return out
-    finally:
-        put_conn(conn)
 
 # =========================
 # Approve/Deliver/Reject
@@ -1327,6 +1124,242 @@ async def admin_card_reject_alias(oid: int, request: Request, x_admin_password: 
     return await admin_reject(oid, request, x_admin_password, password)
 
 # =========================
+# Admin pending buckets
+# =========================
+
+@app.get("/api/admin/pending/itunes")
+def admin_pending_itunes(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT o.id, o.title, o.quantity, o.price, o.status,
+                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
+                       o.link, u.uid
+                FROM public.orders o
+                JOIN public.users u ON u.id = o.user_id
+                WHERE o.status='Pending'
+                  AND (LOWER(o.title) LIKE '%itunes%' OR o.title LIKE '%ايتونز%')
+                ORDER BY o.id DESC
+            """)
+            rows = cur.fetchall()
+        out = []
+        for (oid, title, qty, price, status, created_at, link, uid) in rows:
+            d = _row_to_order_dict((oid, title, qty, price, status, created_at, link))
+            d["uid"] = uid
+            out.append(d)
+        return out
+    finally:
+        put_conn(conn)
+
+@app.get("/api/admin/pending/pubg")
+def admin_pending_pubg(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT o.id, o.title, o.quantity, o.price, o.status,
+                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
+                       o.link, u.uid,
+                       COALESCE((COALESCE(NULLIF(o.payload,''),'{}')::jsonb->>'account_id'),'') AS account_id
+                FROM public.orders o
+                JOIN public.users u ON u.id = o.user_id
+                WHERE o.status='Pending' AND (
+                LOWER(o.title) LIKE '%pubg%' OR
+                LOWER(o.title) LIKE '%bgmi%' OR
+                LOWER(o.title) LIKE '%uc%' OR
+                o.title LIKE '%شدات%' OR
+                o.title LIKE '%بيجي%' OR
+                o.title LIKE '%ببجي%'
+            )
+                ORDER BY o.id DESC
+            """)
+            rows = cur.fetchall()
+        out = []
+        for (oid, title, qty, price, status, created_at, link, uid, account_id) in rows:
+            d = _row_to_order_dict((oid, title, qty, price, status, created_at, link))
+            d["uid"] = uid
+            if account_id:
+                d["account_id"] = account_id
+            out.append(d)
+        return out
+    finally:
+        put_conn(conn)
+
+@app.get("/api/admin/pending/ludo")
+def admin_pending_ludo(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT o.id, o.title, o.quantity, o.price, o.status,
+                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
+                       o.link, u.uid,
+                       COALESCE((COALESCE(NULLIF(o.payload,''),'{}')::jsonb->>'account_id'),'') AS account_id
+                FROM public.orders o
+                JOIN public.users u ON u.id = o.user_id
+                WHERE o.status='Pending' AND (
+                LOWER(o.title) LIKE '%ludo%' OR
+                LOWER(o.title) LIKE '%yalla%' OR
+                o.title LIKE '%يلا لودو%' OR
+                o.title LIKE '%لودو%'
+            )
+                ORDER BY o.id DESC
+            """)
+            rows = cur.fetchall()
+        out = []
+        for (oid, title, qty, price, status, created_at, link, uid, account_id) in rows:
+            d = _row_to_order_dict((oid, title, qty, price, status, created_at, link))
+            d["uid"] = uid
+            if account_id:
+                d["account_id"] = account_id
+            out.append(d)
+        return out
+    finally:
+        put_conn(conn)
+
+# Pending topup cards (Asiacell via card)
+@app.get("/api/admin/pending/cards")
+def admin_pending_cards(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT o.id, u.uid, COALESCE((COALESCE(NULLIF(o.payload,''),'{}')::jsonb->>'card'), '') AS card,
+                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at
+                FROM public.orders o
+                JOIN public.users u ON u.id = o.user_id
+                WHERE o.status='Pending' AND o.type='topup_card'
+                ORDER BY o.id DESC
+            """)
+            rows = cur.fetchall()
+        return [{"id": r[0], "uid": r[1], "card": r[2], "created_at": int(r[3] or 0)} for r in rows]
+    finally:
+        put_conn(conn)
+
+# Pending balance purchase (Atheer/Asiacell/Korek vouchers)
+@app.get("/api/admin/pending/balances")
+def admin_pending_balances(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(r"""
+                SELECT o.id, o.title, o.quantity, o.price, o.status,
+                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
+                       o.link, u.uid
+                FROM public.orders o
+                JOIN public.users u ON u.id = o.user_id
+                WHERE o.status='Pending'
+                  AND (
+                        LOWER(o.title) LIKE '%asiacell%' OR
+                        o.title LIKE '%أسيا%' OR
+                        o.title LIKE '%اسياسيل%' OR
+                        LOWER(o.title) LIKE '%korek%' OR
+                        o.title LIKE '%كورك%' OR
+                        o.title LIKE '%اثير%'
+                  )
+                  AND (
+                        LOWER(o.title) LIKE '%voucher%' OR
+                        LOWER(o.title) LIKE '%code%' OR
+                        LOWER(o.title) LIKE '%card%' OR
+                        o.title LIKE '%رمز%' OR
+                        o.title LIKE '%كود%' OR
+                        o.title LIKE '%بطاقة%' OR
+                        o.title LIKE '%كارت%' OR
+                        o.title LIKE '%شراء%'
+                  )
+                  AND (o.type IS NULL OR o.type <> 'topup_card')
+                  AND NOT (
+                        LOWER(o.title) LIKE '%topup%' OR
+                        LOWER(o.title) LIKE '%top-up%' OR
+                        LOWER(o.title) LIKE '%recharge%' OR
+                        o.title LIKE '%شحن%' OR
+                        o.title LIKE '%شحن عبر%' OR
+                        o.title LIKE '%شحن اسيا%' OR
+                        LOWER(o.title) LIKE '%direct%'
+                  )
+                  AND NOT (
+                        LOWER(o.title) LIKE '%itunes%' OR
+                        o.title LIKE '%ايتونز%'
+                  )
+                ORDER BY o.id DESC
+            """)
+            rows = cur.fetchall()
+        out = []
+        for (oid, title, qty, price, status, created_at, link, uid) in rows:
+            d = _row_to_order_dict((oid, title, qty, price, status, created_at, link))
+            d["uid"] = uid
+            out.append(d)
+        return out
+    finally:
+        put_conn(conn)
+
+# =========================
+# Admin: pending API services (compact list for Android UI)
+# =========================
+@app.get("/api/admin/pending/services")
+def admin_pending_services_endpoint(
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None,
+    limit: int = 100
+):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    o.id,
+                    o.created_at,
+                    COALESCE(o.status, 'Pending') AS status,
+                    o.title,
+                    o.quantity,
+                    o.price,
+                    o.link,
+                    u.uid,
+                    o.service_id,
+                    o.type,
+                    o.payload
+                FROM public.orders o
+                JOIN public.users u ON u.id = o.user_id
+                WHERE COALESCE(o.status, 'Pending') = 'Pending'
+                ORDER BY COALESCE(o.created_at, NOW()) DESC
+                LIMIT %s
+            """, (int(limit),))
+            rows = cur.fetchall()
+
+        out: List[Dict[str, Any]] = []
+        for (oid, created_at, status, title, qty, price, link, uid, service_id, otype, payload) in rows:
+            # Only API/provider-like
+            typ = str(otype or "").lower()
+            is_api = typ in ("provider","api","smm","service") or (isinstance(payload, dict) and str(payload.get("source","")).lower()=="provider_form") or (service_id is not None)
+            if not is_api:
+                continue
+            try:
+                created_ms = int(created_at.timestamp() * 1000)
+            except Exception:
+                created_ms = int(time.time() * 1000)
+            out.append({
+                "id": int(oid),
+                "title": str(title or "—"),
+                "quantity": int(qty or 0),
+                "price": float(price or 0),
+                "link": link or "",
+                "status": "Pending",
+                "created_at": created_ms,
+                "uid": uid or "",
+                "account_id": (payload or {}).get("account_id") if isinstance(payload, dict) else ""
+            })
+        return {"list": out}
+    finally:
+        put_conn(conn)
+
+# =========================
 # Admin: wallet adjust + compatibility
 # =========================
 @app.post("/api/admin/users/{uid}/wallet/adjust")
@@ -1388,7 +1421,6 @@ async def admin_wallet_change(request: Request, x_admin_password: Optional[str] 
 
     direction = "topup" if amount >= 0 else "deduct"
     if direction == "deduct":
-        # call deduct
         body = WalletCompatIn(uid=uid, amount=abs(amount), reason=data.get("reason"))
         return admin_wallet_deduct(body, x_admin_password or password or "")
     else:
@@ -1616,174 +1648,12 @@ def admin_users_balances_meta(
     finally:
         put_conn(conn)
 
-# =============== Run local ===============
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
-
-
-
-# --- Alias endpoints for admin actions (Asiacell Topup) ---
-
-@app.post("/api/admin/asiacell/{oid}/execute")
-async def admin_execute_asiacell(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    """Alias for executing Asiacell topup orders.
-    The app may call this path; we simply forward to admin_deliver.
-    """
-    return await admin_deliver(oid, request, x_admin_password, password)
-
-@app.post("/api/admin/asiacell/{oid}/reject")
-async def admin_reject_asiacell(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    """Alias for rejecting Asiacell topup orders.
-    The app may call this path; we forward to admin_reject which refunds wallet if needed and notifies the user.
-    """
-    return await admin_reject(oid, request, x_admin_password, password)
-
-# Also provide neutral topup alias if the client uses '/api/admin/topup/{oid}/...'
-@app.post("/api/admin/topup/{oid}/execute")
-async def admin_execute_topup_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    return await admin_deliver(oid, request, x_admin_password, password)
-
-@app.post("/api/admin/topup/{oid}/reject")
-async def admin_reject_topup_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    return await admin_reject(oid, request, x_admin_password, password)
-
-
-# =========================
-# Admin: Pending API services (compact for Android UI)
-# =========================
-
-@app.get("/api/admin/pending/services")
-def admin_pending_services(
-    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
-    password: Optional[str] = None,
-    limit: int = 100
-):
-    _require_admin(x_admin_password or password or "")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            rows = []
-            # 1) مفضّل: اعتماد عمود النوع إن كان موجودًا (نريد فقط طلبات API/Provider)
-            try:
-                cur.execute("""
-                    SELECT
-                        o.id,
-                        o.created_at,
-                        o.status,
-                        to_jsonb(o) AS data
-                    FROM public.orders o
-                    WHERE o.status = 'Pending'
-                      AND COALESCE(o.type, '') IN ('provider','api','smm','service')
-                    ORDER BY o.created_at DESC
-                    LIMIT %s
-                """, (int(limit),))
-                rows = cur.fetchall()
-            except Exception:
-                # 2) احتياط: رجّع كل الـ Pending ثم رشّح في بايثون حسب payload/source أو دلالات الخدمة
-                try:
-                    cur.execute("""
-                        SELECT
-                            o.id,
-                            COALESCE(o.created_at, NOW()) AS created_at,
-                            COALESCE(o.status, 'Pending') AS status,
-                            to_jsonb(o) AS data
-                        FROM public.orders o
-                        WHERE COALESCE(o.status, 'Pending') = 'Pending'
-                        ORDER BY COALESCE(o.created_at, NOW()) DESC
-                        LIMIT %s
-                    """, (int(limit),))
-                    rows = cur.fetchall()
-                except Exception:
-                    rows = []
-
-            # تحويل النتيجة إلى قائمة قياسية ثم فلترة API فقط إن لزم
-            api_rows = []
-            for oid, created_at, status, data in rows:
-                d = {}
-                if isinstance(data, dict):
-                    d = data
-                else:
-                    try:
-                        d = dict(data)
-                    except Exception:
-                        try:
-                            import json as _json
-                            d = _json.loads(data)
-                        except Exception:
-                            d = {}
-
-                # شرط كاشف لطلبات API: نوع = provider/api/smm/service أو payload.source = provider_form
-                typ = str(d.get('type') or '').lower()
-                payload = d.get('payload') if isinstance(d.get('payload'), dict) else {}
-                source = str(payload.get('source') or '').lower() if isinstance(payload, dict) else ''
-
-                is_api = (typ in ('provider','api','smm','service')) or (source == 'provider_form') or ('service_id' in d)
-                if not is_api:
-                    continue
-
-                api_rows.append((oid, created_at, status, d))
-
-            out = []
-            for oid, created_at, status, d in api_rows:
-                def pick(*keys, default=None):
-                    for k in keys:
-                        v = d.get(k)
-                        if v not in (None, ""):
-                            return v
-                    return default
-
-                title = pick('service_name','pkg_label','title','name','service','platform')
-                if not title:
-                    sid = pick('service_id','sid','package_id')
-                    title = f"Service #{sid}" if sid else "—"
-
-                q = pick('quantity','qty','count', default=0)
-                try:
-                    q = int(q) if q is not None else 0
-                except Exception:
-                    q = 0
-
-                price = pick('price','amount','cost', default=0)
-                try:
-                    price = float(price) if price is not None else 0.0
-                except Exception:
-                    price = 0.0
-
-                link = pick('link','url','target','payload','username','account_id') or ""
-
-                uid = pick('user_id','uid','user') or ""
-                account_id = pick('account_id','game_id','player_id','pubg_id','ludo_id','instagram_id','telegram_username') or ""
-
-                try:
-                    created_ms = int(created_at.timestamp() * 1000)
-                except Exception:
-                    import time as _t
-                    created_ms = int(_t.time() * 1000)
-
-                out.append({
-                    "id": int(oid),
-                    "title": str(title),
-                    "quantity": q,
-                    "price": price,
-                    "link": link,
-                    "status": "Pending",
-                    "created_at": created_ms,
-                    "uid": uid,
-                    "account_id": account_id
-                })
-
-            return {"list": out}
-    finally:
-        put_conn(conn)
-
-
-
 # =========================
 # Service ID overrides (server-level)
 # =========================
-from pydantic import BaseModel
+class SvcOverrideIn(BaseModel):
+    ui_key: str
+    service_id: Optional[int] = None
 
 def _ensure_overrides_table(cur):
     cur.execute("""
@@ -1793,10 +1663,6 @@ def _ensure_overrides_table(cur):
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
     """)
-
-class SvcOverrideIn(BaseModel):
-    ui_key: str
-    service_id: Optional[int] = None
 
 @app.get("/api/admin/service_ids/list")
 def admin_list_service_ids(
@@ -1837,38 +1703,51 @@ def admin_set_service_id(
         put_conn(conn)
 
 @app.post("/api/admin/service_ids/clear")
-
+def admin_clear_service_id(
+    body: SvcOverrideIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.ui_key:
+        raise HTTPException(422, "invalid payload")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_overrides_table(cur)
+            cur.execute("DELETE FROM public.service_id_overrides WHERE ui_key=%s", (body.ui_key,))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
 
 # =========================
 # Pricing overrides (server-level)
 # =========================
 class PricingIn(BaseModel):
-        ui_key: str
-        price_per_k: Optional[float] = None
-        min_qty: Optional[int] = None
-        max_qty: Optional[int] = None
-        mode: Optional[str] = None  # 'per_k' (default) or 'flat'
+    ui_key: str
+    price_per_k: Optional[float] = None
+    min_qty: Optional[int] = None
+    max_qty: Optional[int] = None
+    mode: Optional[str] = None  # 'per_k' (default) or 'flat'
 
 def _ensure_pricing_table(cur):
     cur.execute("""
         CREATE TABLE IF NOT EXISTS public.service_pricing_overrides(
-                ui_key TEXT PRIMARY KEY,
-                price_per_k NUMERIC(18,6) NOT NULL,
-                min_qty INTEGER NOT NULL,
-                max_qty INTEGER NOT NULL,
-                mode TEXT NOT NULL DEFAULT 'per_k',
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
+            ui_key TEXT PRIMARY KEY,
+            price_per_k NUMERIC(18,6) NOT NULL,
+            min_qty INTEGER NOT NULL,
+            max_qty INTEGER NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'per_k',
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
     """)
 
-
-
-# Ensure pricing table has 'mode' column (per_k | flat)
 def _ensure_pricing_mode_column(cur):
     try:
         cur.execute("ALTER TABLE public.service_pricing_overrides ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'per_k'")
     except Exception:
         pass
+
 @app.get("/api/admin/pricing/list")
 def admin_list_pricing(
     x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
@@ -1901,17 +1780,34 @@ def admin_set_pricing(
     try:
         with conn, conn.cursor() as cur:
             _ensure_pricing_table(cur)
+            _ensure_pricing_mode_column(cur)
             cur.execute("""
-                INSERT INTO public.service_pricing_overrides(ui_key, price_per_k, min_qty, max_qty)
-                VALUES(%s,%s,%s,%s)
-                ON CONFLICT (ui_key) DO UPDATE SET price_per_k=EXCLUDED.price_per_k, min_qty=EXCLUDED.min_qty, max_qty=EXCLUDED.max_qty, updated_at=now()
-            """, (body.ui_key, Decimal(body.price_per_k), int(body.min_qty), int(body.max_qty)))
+                INSERT INTO public.service_pricing_overrides(ui_key, price_per_k, min_qty, max_qty, mode, updated_at)
+                VALUES(%s,%s,%s,%s,COALESCE(%s,'per_k'), now())
+                ON CONFLICT (ui_key) DO UPDATE SET price_per_k=EXCLUDED.price_per_k, min_qty=EXCLUDED.min_qty, max_qty=EXCLUDED.max_qty, mode=COALESCE(EXCLUDED.mode,'per_k'), updated_at=now()
+            """, (body.ui_key, Decimal(body.price_per_k), int(body.min_qty), int(body.max_qty), (body.mode or 'per_k')))
         return {"ok": True}
     finally:
         put_conn(conn)
 
 @app.post("/api/admin/pricing/clear")
-
+def admin_clear_pricing(
+    body: PricingIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.ui_key:
+        raise HTTPException(422, "invalid payload")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table(cur)
+            _ensure_pricing_mode_column(cur)
+            cur.execute("DELETE FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
 
 # =========================
 # Per-order pricing override (PUBG/Ludo only)
@@ -1945,7 +1841,7 @@ def admin_set_order_pricing(
         with conn, conn.cursor() as cur:
             _ensure_order_pricing_table(cur)
             # fetch order to validate status and category
-            cur.execute("SELECT id, service_name, status FROM public.orders WHERE id=%s", (int(body.order_id),))
+            cur.execute("SELECT id, title, status FROM public.orders WHERE id=%s", (int(body.order_id),))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "order not found")
@@ -1957,8 +1853,8 @@ def admin_set_order_pricing(
             if not (("pubg" in sname) or ("ببجي" in sname) or ("uc" in sname) or ("ludo" in sname) or ("لودو" in sname)):
                 raise HTTPException(422, "not pubg/ludo order")
             cur.execute("""
-                INSERT INTO public.order_pricing_overrides(order_id, price, mode)
-                VALUES(%s,%s,'flat')
+                INSERT INTO public.order_pricing_overrides(order_id, price, mode, updated_at)
+                VALUES(%s,%s,'flat', now())
                 ON CONFLICT (order_id) DO UPDATE SET price=EXCLUDED.price, updated_at=now()
             """, (oid, Decimal(body.price)))
             # reflect immediately on orders.price for UI consistency
@@ -1968,7 +1864,22 @@ def admin_set_order_pricing(
         put_conn(conn)
 
 @app.post("/api/admin/pricing/order/clear")
-
+def admin_clear_order_pricing(
+    body: OrderPricingIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.order_id:
+        raise HTTPException(422, "invalid payload")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_order_pricing_table(cur)
+            cur.execute("DELETE FROM public.order_pricing_overrides WHERE order_id=%s", (int(body.order_id),))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
 
 # =========================
 # Per-order quantity setter (PUBG/Ludo only)
@@ -1993,7 +1904,7 @@ def admin_set_order_quantity(
     try:
         with conn, conn.cursor() as cur:
             # Validate order
-            cur.execute("SELECT id, service_name, status FROM public.orders WHERE id=%s", (int(body.order_id),))
+            cur.execute("SELECT id, title, status FROM public.orders WHERE id=%s", (int(body.order_id),))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "order not found")
@@ -2031,66 +1942,37 @@ def admin_set_order_quantity(
         return {"ok": True}
     finally:
         put_conn(conn)
-def admin_clear_order_pricing(
-    body: OrderPricingIn,
-    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
-    password: Optional[str] = None
-):
-    _require_admin(x_admin_password or password or "")
-    if not body.order_id:
-        raise HTTPException(422, "invalid payload")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            _ensure_order_pricing_table(cur)
-            cur.execute("DELETE FROM public.order_pricing_overrides WHERE order_id=%s", (int(body.order_id),))
-        return {"ok": True}
-    finally:
-        put_conn(conn)
-def admin_clear_pricing(
-    body: PricingIn,
-    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
-    password: Optional[str] = None
-):
-    _require_admin(x_admin_password or password or "")
-    if not body.ui_key:
-        raise HTTPException(422, "invalid payload")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            _ensure_pricing_table(cur)
-                _ensure_pricing_mode_column(cur)
-                cur.execute("DELETE FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
-        return {"ok": True}
-    finally:
-        put_conn(conn)
-def admin_clear_service_id(
-    body: SvcOverrideIn,
-    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
-    password: Optional[str] = None
-):
-    _require_admin(x_admin_password or password or "")
-    if not body.ui_key:
-        raise HTTPException(422, "invalid payload")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            _ensure_overrides_table(cur)
-            cur.execute("DELETE FROM public.service_id_overrides WHERE ui_key=%s", (body.ui_key,))
-        return {"ok": True}
-    finally:
-        put_conn(conn)
-
 
 # =========================
-# Admin: Topup cards aliases (execute / reject)
+# Topup cards alias routes (execute / reject) to match the app
 # =========================
+@app.post("/api/admin/topup/{oid}/execute")
+async def admin_execute_topup_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return await admin_deliver(oid, request, x_admin_password, password)
+
+@app.post("/api/admin/topup/{oid}/reject")
+async def admin_reject_topup_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return await admin_reject(oid, request, x_admin_password, password)
+
 @app.post("/api/admin/topup_cards/{oid}/execute")
 async def admin_execute_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    _require_admin(x_admin_password or password or "")
     return await admin_deliver(oid, request, x_admin_password, password)
 
 @app.post("/api/admin/topup_cards/{oid}/reject")
 async def admin_reject_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    _require_admin(x_admin_password or password or "")
     return await admin_reject(oid, request, x_admin_password, password)
+
+# --- Asiacell aliases (execute / reject) ---
+@app.post("/api/admin/asiacell/{oid}/execute")
+async def admin_execute_asiacell(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return await admin_deliver(oid, request, x_admin_password, password)
+
+@app.post("/api/admin/asiacell/{oid}/reject")
+async def admin_reject_asiacell(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return await admin_reject(oid, request, x_admin_password, password)
+
+# =============== Run local ===============
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
