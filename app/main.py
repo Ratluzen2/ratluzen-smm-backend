@@ -1613,6 +1613,7 @@ async def admin_reject_topup_alias(oid: int, request: Request, x_admin_password:
 # =========================
 # Admin: Pending API services (compact for Android UI)
 # =========================
+
 @app.get("/api/admin/pending/services")
 def admin_pending_services(
     x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
@@ -1623,6 +1624,8 @@ def admin_pending_services(
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
+            rows = []
+            # 1) مفضّل: اعتماد عمود النوع إن كان موجودًا (نريد فقط طلبات API/Provider)
             try:
                 cur.execute("""
                     SELECT
@@ -1632,24 +1635,31 @@ def admin_pending_services(
                         to_jsonb(o) AS data
                     FROM public.orders o
                     WHERE o.status = 'Pending'
+                      AND COALESCE(o.type, '') IN ('provider','api','smm','service')
                     ORDER BY o.created_at DESC
                     LIMIT %s
                 """, (int(limit),))
+                rows = cur.fetchall()
             except Exception:
-                cur.execute("""
-                    SELECT
-                        o.id,
-                        NOW() AS created_at,
-                        COALESCE(o.status, 'Pending') AS status,
-                        to_jsonb(o) AS data
-                    FROM public.orders o
-                    WHERE COALESCE(o.status, 'Pending') = 'Pending'
-                    ORDER BY o.id DESC
-                    LIMIT %s
-                """, (int(limit),))
-            rows = cur.fetchall()
+                # 2) احتياط: رجّع كل الـ Pending ثم رشّح في بايثون حسب payload/source أو دلالات الخدمة
+                try:
+                    cur.execute("""
+                        SELECT
+                            o.id,
+                            COALESCE(o.created_at, NOW()) AS created_at,
+                            COALESCE(o.status, 'Pending') AS status,
+                            to_jsonb(o) AS data
+                        FROM public.orders o
+                        WHERE COALESCE(o.status, 'Pending') = 'Pending'
+                        ORDER BY COALESCE(o.created_at, NOW()) DESC
+                        LIMIT %s
+                    """, (int(limit),))
+                    rows = cur.fetchall()
+                except Exception:
+                    rows = []
 
-            out = []
+            # تحويل النتيجة إلى قائمة قياسية ثم فلترة API فقط إن لزم
+            api_rows = []
             for oid, created_at, status, data in rows:
                 d = {}
                 if isinstance(data, dict):
@@ -1664,6 +1674,19 @@ def admin_pending_services(
                         except Exception:
                             d = {}
 
+                # شرط كاشف لطلبات API: نوع = provider/api/smm/service أو payload.source = provider_form
+                typ = str(d.get('type') or '').lower()
+                payload = d.get('payload') if isinstance(d.get('payload'), dict) else {}
+                source = str(payload.get('source') or '').lower() if isinstance(payload, dict) else ''
+
+                is_api = (typ in ('provider','api','smm','service')) or (source == 'provider_form') or ('service_id' in d)
+                if not is_api:
+                    continue
+
+                api_rows.append((oid, created_at, status, d))
+
+            out = []
+            for oid, created_at, status, d in api_rows:
                 def pick(*keys, default=None):
                     for k in keys:
                         v = d.get(k)
@@ -1714,6 +1737,7 @@ def admin_pending_services(
             return {"list": out}
     finally:
         put_conn(conn)
+
 
 
 # =========================
