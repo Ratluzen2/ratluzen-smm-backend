@@ -1806,6 +1806,67 @@ def admin_clear_pricing(
             _ensure_pricing_mode_column(cur)
             cur.execute("DELETE FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
         return {"ok": True}
+
+
+# ------------------------------
+# Public pricing (read-only)
+# ------------------------------
+@app.get("/api/public/pricing/get")
+def public_get_pricing(ui_key: str):
+    """
+    Return effective pricing override for a specific ui_key if present.
+    Response: {"ui_key": "...", "price_per_k": 1.5, "min_qty": 100, "max_qty": 10000, "mode": "per_k"} or {"ui_key": "...", "not_found": true}
+    """
+    if not ui_key:
+        raise HTTPException(422, "ui_key required")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table(cur)
+            try:
+                _ensure_pricing_mode_column(cur)
+            except Exception:
+                pass
+            cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (ui_key,))
+            row = cur.fetchone()
+            if not row:
+                return {"ui_key": ui_key, "not_found": True}
+            return {"ui_key": row[0], "price_per_k": float(row[1]), "min_qty": int(row[2]), "max_qty": int(row[3]), "mode": (row[4] or "per_k")}
+    finally:
+        put_conn(conn)
+
+@app.get("/api/public/pricing/bulk")
+def public_bulk_pricing(keys: str):
+    """
+    Comma-separated list of ui_keys. Returns a map keyed by ui_key.
+    Response: {"map": {"key": {"price_per_k":..., "min_qty":..., "max_qty":..., "mode":"per_k"}}}
+    """
+    if not keys:
+        return {"map": {}}
+    key_list = [k.strip() for k in keys.split(",") if k.strip()]
+    if not key_list:
+        return {"map": {}}
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table(cur)
+            try:
+                _ensure_pricing_mode_column(cur)
+            except Exception:
+                pass
+            cur.execute(
+                "SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key = ANY(%s)",
+                (key_list,)
+            )
+            rows = cur.fetchall()
+            out = {}
+            for r in rows:
+                out[r[0]] = {"price_per_k": float(r[1]), "min_qty": int(r[2]), "max_qty": int(r[3]), "mode": (r[4] or "per_k")}
+            return {"map": out, "keys": key_list}
+    finally:
+        put_conn(conn)
+
+
     finally:
         put_conn(conn)
 
