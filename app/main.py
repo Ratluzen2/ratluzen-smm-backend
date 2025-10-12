@@ -1976,3 +1976,88 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
+
+# ======================================================================
+# Extra compatibility routes to match the app's newer paths
+# (added by ChatGPT on 2025-10-12)
+# ======================================================================
+
+# ---- Pending buckets aliases ----
+@app.get("/api/admin/pending/pubg_orders")
+def _alias_pending_pubg(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_pending_pubg(x_admin_password, password)
+
+@app.get("/api/admin/pending/ludo_orders")
+def _alias_pending_ludo(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_pending_ludo(x_admin_password, password)
+
+@app.get("/api/admin/pending/api")
+@app.get("/api/admin/api/pending")
+@app.get("/api/admin/pending/services_list")
+@app.get("/api/admin/pending/provider")
+def _alias_pending_services(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None, limit: int = 100):
+    return admin_pending_services_endpoint(x_admin_password=x_admin_password, password=password, limit=limit)
+
+# ---- Per-order pricing & quantity setters (PUBG/Ludo) ----
+@app.post("/api/admin/orders/{oid}/set_price")
+async def _alias_set_price(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    data = await _read_json_object(request)
+    if "price" not in data:
+        raise HTTPException(422, "price required")
+    body = OrderPricingIn(order_id=oid, price=float(data["price"]))
+    return admin_set_order_pricing(body, x_admin_password, password)
+
+@app.post("/api/admin/orders/{oid}/set_quantity")
+async def _alias_set_qty(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    data = await _read_json_object(request)
+    if "quantity" not in data:
+        raise HTTPException(422, "quantity required")
+    body = OrderQtyIn(order_id=oid, quantity=int(data["quantity"]), reprice=bool(data.get("reprice", False)))
+    return admin_set_order_quantity(body, x_admin_password, password)
+
+@app.post("/api/admin/order/set_price")
+async def _alias_set_price2(request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    data = await _read_json_object(request)
+    oid = int(data.get("order_id", 0))
+    price = data.get("price")
+    if not oid or price is None:
+        raise HTTPException(422, "order_id and price required")
+    body = OrderPricingIn(order_id=oid, price=float(price))
+    return admin_set_order_pricing(body, x_admin_password, password)
+
+@app.post("/api/admin/order/set_qty")
+async def _alias_set_qty2(request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    data = await _read_json_object(request)
+    oid = int(data.get("order_id", 0))
+    qty = data.get("quantity")
+    if not oid or qty is None:
+        raise HTTPException(422, "order_id and quantity required")
+    body = OrderQtyIn(order_id=oid, quantity=int(qty), reprice=bool(data.get("reprice", False)))
+    return admin_set_order_quantity(body, x_admin_password, password)
+
+# ---- Service ID overrides aliases ----
+@app.get("/api/admin/services/overrides")
+def _alias_list_service_ids(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_list_service_ids(x_admin_password, password)
+
+@app.post("/api/admin/services/override/set")
+def _alias_set_service_id(body: SvcOverrideIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_set_service_id(body, x_admin_password, password)
+
+@app.post("/api/admin/services/override/clear")
+def _alias_clear_service_id(body: SvcOverrideIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_clear_service_id(body, x_admin_password, password)
+
+# ---- Pricing rules aliases ----
+@app.get("/api/admin/pricing/overrides")
+def _alias_list_pricing(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_list_pricing(x_admin_password, password)
+
+@app.post("/api/admin/pricing/override/set")
+def _alias_set_pricing(body: PricingIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_set_pricing(body, x_admin_password, password)
+
+@app.post("/api/admin/pricing/override/clear")
+def _alias_clear_pricing(body: PricingIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_clear_pricing(body, x_admin_password, password)
+
