@@ -1811,6 +1811,9 @@ def admin_clear_pricing(
 # ------------------------------
 # Public pricing (read-only)
 # ------------------------------
+    finally:
+        put_conn(conn)
+
 @app.get("/api/public/pricing/get")
 def public_get_pricing(ui_key: str):
     """
@@ -1866,9 +1869,6 @@ def public_bulk_pricing(keys: str):
     finally:
         put_conn(conn)
 
-
-    finally:
-        put_conn(conn)
 
 # =========================
 # Per-order pricing override (PUBG/Ludo only)
