@@ -418,6 +418,24 @@ def _create_provider_order_core(cur, uid: str, service_id: Optional[int], servic
     if banned:
         raise HTTPException(403, "user banned")
 
+    # apply service-id override by service_name (ui_key)
+    eff_sid = service_id
+    try:
+        if service_name:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS public.service_id_overrides(
+                    ui_key TEXT PRIMARY KEY,
+                    service_id BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("SELECT service_id FROM public.service_id_overrides WHERE ui_key=%s", (service_name,))
+            r_eff = cur.fetchone()
+            if r_eff and r_eff[0]:
+                eff_sid = int(r_eff[0])
+    except Exception:
+        pass
+
     # charge if paid
     if price and price > 0:
         if bal < price:
@@ -433,8 +451,8 @@ def _create_provider_order_core(cur, uid: str, service_id: Optional[int], servic
         INSERT INTO public.orders(user_id, title, service_id, link, quantity, price, status, payload, type)
         VALUES(%s,%s,%s,%s,%s,%s,'Pending',%s,%s)
         RETURNING id
-    """, (user_id, service_name, service_id, link, quantity, Decimal(price or 0),
-          Json({"source": "provider_form"}), 'provider'))
+    """, (user_id, service_name, eff_sid, link, quantity, Decimal(price or 0),
+          Json({"source": "provider_form", "service_id_provided": service_id, "service_id_effective": eff_sid}), 'provider'))
     oid = cur.fetchone()[0]
     return oid
 
@@ -1592,13 +1610,8 @@ async def admin_reject_topup_alias(oid: int, request: Request, x_admin_password:
     return await admin_reject(oid, request, x_admin_password, password)
 
 
-from typing import Optional
-import json, time
-
-# --- assume the rest of your app (imports, app instance, get_conn, put_conn, _require_admin, admin_deliver, admin_reject, etc.) already exists above ---
-
 # =========================
-# Admin: Pending API services (compact response for app UI)
+# Admin: Pending API services (compact for Android UI)
 # =========================
 @app.get("/api/admin/pending/services")
 def admin_pending_services(
@@ -1610,7 +1623,6 @@ def admin_pending_services(
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            # Prefer rows that are still Pending only (so تختفي مباشرة بعد الموافقة)
             try:
                 cur.execute("""
                     SELECT
@@ -1624,7 +1636,6 @@ def admin_pending_services(
                     LIMIT %s
                 """, (int(limit),))
             except Exception:
-                # Fallback if created_at/status missing
                 cur.execute("""
                     SELECT
                         o.id,
@@ -1640,7 +1651,6 @@ def admin_pending_services(
 
             out = []
             for oid, created_at, status, data in rows:
-                # Convert 'data' to a dict
                 d = {}
                 if isinstance(data, dict):
                     d = data
@@ -1649,7 +1659,8 @@ def admin_pending_services(
                         d = dict(data)
                     except Exception:
                         try:
-                            d = json.loads(data)
+                            import json as _json
+                            d = _json.loads(data)
                         except Exception:
                             d = {}
 
@@ -1660,7 +1671,6 @@ def admin_pending_services(
                             return v
                     return default
 
-                # Map to the exact keys expected by the Android UI
                 title = pick('service_name','pkg_label','title','name','service','platform')
                 if not title:
                     sid = pick('service_id','sid','package_id')
@@ -1683,11 +1693,11 @@ def admin_pending_services(
                 uid = pick('user_id','uid','user') or ""
                 account_id = pick('account_id','game_id','player_id','pubg_id','ludo_id','instagram_id','telegram_username') or ""
 
-                # created_at as milliseconds (Android expects Long)
                 try:
                     created_ms = int(created_at.timestamp() * 1000)
                 except Exception:
-                    created_ms = int(time.time() * 1000)
+                    import time as _t
+                    created_ms = int(_t.time() * 1000)
 
                 out.append({
                     "id": int(oid),
@@ -1705,6 +1715,82 @@ def admin_pending_services(
     finally:
         put_conn(conn)
 
+
+# =========================
+# Service ID overrides (server-level)
+# =========================
+from pydantic import BaseModel
+
+def _ensure_overrides_table(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.service_id_overrides(
+            ui_key TEXT PRIMARY KEY,
+            service_id BIGINT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
+
+class SvcOverrideIn(BaseModel):
+    ui_key: str
+    service_id: Optional[int] = None
+
+@app.get("/api/admin/service_ids/list")
+def admin_list_service_ids(
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_overrides_table(cur)
+            cur.execute("SELECT ui_key, service_id FROM public.service_id_overrides ORDER BY ui_key")
+            rows = cur.fetchall()
+            return {"list": [{"ui_key": r[0], "service_id": int(r[1])} for r in rows]}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/service_ids/set")
+def admin_set_service_id(
+    body: SvcOverrideIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.ui_key or not body.service_id or int(body.service_id) <= 0:
+        raise HTTPException(422, "invalid payload")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_overrides_table(cur)
+            cur.execute("""
+                INSERT INTO public.service_id_overrides(ui_key, service_id)
+                VALUES(%s,%s)
+                ON CONFLICT (ui_key) DO UPDATE SET service_id=EXCLUDED.service_id, created_at=now()
+            """, (body.ui_key, int(body.service_id)))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/service_ids/clear")
+def admin_clear_service_id(
+    body: SvcOverrideIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.ui_key:
+        raise HTTPException(422, "invalid payload")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_overrides_table(cur)
+            cur.execute("DELETE FROM public.service_id_overrides WHERE ui_key=%s", (body.ui_key,))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+
 # =========================
 # Admin: Topup cards aliases (execute / reject)
 # =========================
@@ -1717,4 +1803,3 @@ async def admin_execute_topup_cards_alias(oid: int, request: Request, x_admin_pa
 async def admin_reject_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(x_admin_password or password or "")
     return await admin_reject(oid, request, x_admin_password, password)
-
