@@ -343,7 +343,7 @@ def _ensure_user(cur, uid: str) -> int:
     return cur.fetchone()[0]
 
 def _refund_if_needed(cur, user_id: int, price: float, order_id: int):
-    if price and price > 0:
+    if eff_price and eff_price > 0:
         cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(price), user_id))
         cur.execute("""
             INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
@@ -436,8 +436,48 @@ def _create_provider_order_core(cur, uid: str, service_id: Optional[int], servic
     except Exception:
         pass
 
-    # charge if paid
-    if price and price > 0:
+    
+# apply pricing override by service_name (ui_key)
+eff_price = price
+try:
+    if service_name:
+        cur.execute("SELECT price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (service_name,))
+        rowp = cur.fetchone()
+
+# compute price based on mode
+if rowp:
+    ppk = float(rowp[0]); mn = int(rowp[1]); mx = int(rowp[2]); mode = (rowp[3] or 'per_k')
+    if mode == 'flat':
+        eff_price = float(ppk)
+    else:
+        if quantity < mn or quantity > mx:
+            raise HTTPException(400, f"quantity out of allowed range [{mn}-{mx}]")
+        eff_price = float(Decimal(quantity) * Decimal(ppk) / Decimal(1000))
+
+if not rowp:
+    # category-level fallback for PUBG/Ludo
+    key = None
+    sname = (service_name or "").lower()
+    if any(w in sname for w in ["pubg","ببجي","uc"]):
+        key = "cat.pubg"
+    elif any(w in sname for w in ["ludo","لودو"]):
+        key = "cat.ludo"
+    if key:
+        cur.execute("SELECT price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (key,))
+        rowp = cur.fetchone()
+
+        if rowp:
+            ppk = float(rowp[0]); mn = int(rowp[1]); mx = int(rowp[2])
+            # validate quantity
+            if quantity < mn or quantity > mx:
+                raise HTTPException(400, f"quantity out of allowed range [{mn}-{mx}]")
+            eff_price = float(Decimal(quantity) * Decimal(ppk) / Decimal(1000))
+except Exception as _e:
+    # keep original price if anything fails
+    pass
+
+# charge if paid
+    if eff_price and eff_price > 0:
         if bal < price:
             raise HTTPException(400, "insufficient balance")
         cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (Decimal(price), user_id))
@@ -445,14 +485,14 @@ def _create_provider_order_core(cur, uid: str, service_id: Optional[int], servic
             INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
             VALUES(%s,%s,%s,%s)
         """, (user_id, Decimal(-price), "order_charge",
-              Json({"service_id": service_id, "name": service_name, "qty": quantity})))
+              Json({"service_id": service_id, "name": service_name, "qty": quantity, "price_effective": eff_price})))
 
     cur.execute("""
         INSERT INTO public.orders(user_id, title, service_id, link, quantity, price, status, payload, type)
         VALUES(%s,%s,%s,%s,%s,%s,'Pending',%s,%s)
         RETURNING id
-    """, (user_id, service_name, eff_sid, link, quantity, Decimal(price or 0),
-          Json({"source": "provider_form", "service_id_provided": service_id, "service_id_effective": eff_sid}), 'provider'))
+    """, (user_id, service_name, eff_sid, link, quantity, Decimal(eff_price or 0),
+          Json({"source": "provider_form", "service_id_provided": service_id, "service_id_effective": eff_sid, "price_effective": eff_price}), 'provider'))
     oid = cur.fetchone()[0]
     return oid
 
@@ -1797,6 +1837,233 @@ def admin_set_service_id(
         put_conn(conn)
 
 @app.post("/api/admin/service_ids/clear")
+
+
+# =========================
+# Pricing overrides (server-level)
+# =========================
+class PricingIn(BaseModel):
+        ui_key: str
+        price_per_k: Optional[float] = None
+        min_qty: Optional[int] = None
+        max_qty: Optional[int] = None
+        mode: Optional[str] = None  # 'per_k' (default) or 'flat'
+
+def _ensure_pricing_table(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.service_pricing_overrides(
+                ui_key TEXT PRIMARY KEY,
+                price_per_k NUMERIC(18,6) NOT NULL,
+                min_qty INTEGER NOT NULL,
+                max_qty INTEGER NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'per_k',
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+    """)
+
+
+
+# Ensure pricing table has 'mode' column (per_k | flat)
+def _ensure_pricing_mode_column(cur):
+    try:
+        cur.execute("ALTER TABLE public.service_pricing_overrides ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'per_k'")
+    except Exception:
+        pass
+@app.get("/api/admin/pricing/list")
+def admin_list_pricing(
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table(cur)
+            cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode, 'per_k') FROM public.service_pricing_overrides ORDER BY ui_key")
+            rows = cur.fetchall()
+            out = [{"ui_key": r[0], "price_per_k": float(r[1]), "min_qty": int(r[2]), "max_qty": int(r[3]), "mode": (r[4] or "per_k")} for r in rows]
+            return {"list": out}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/pricing/set")
+def admin_set_pricing(
+    body: PricingIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.ui_key or body.price_per_k is None or body.min_qty is None or body.max_qty is None:
+        raise HTTPException(422, "invalid payload")
+    if body.min_qty < 0 or body.max_qty < body.min_qty:
+        raise HTTPException(422, "invalid range")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table(cur)
+            cur.execute("""
+                INSERT INTO public.service_pricing_overrides(ui_key, price_per_k, min_qty, max_qty)
+                VALUES(%s,%s,%s,%s)
+                ON CONFLICT (ui_key) DO UPDATE SET price_per_k=EXCLUDED.price_per_k, min_qty=EXCLUDED.min_qty, max_qty=EXCLUDED.max_qty, updated_at=now()
+            """, (body.ui_key, Decimal(body.price_per_k), int(body.min_qty), int(body.max_qty)))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/pricing/clear")
+
+
+# =========================
+# Per-order pricing override (PUBG/Ludo only)
+# =========================
+class OrderPricingIn(BaseModel):
+    order_id: int
+    price: Optional[float] = None  # flat price per order
+    mode: Optional[str] = None     # reserved for future
+
+def _ensure_order_pricing_table(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.order_pricing_overrides(
+            order_id BIGINT PRIMARY KEY,
+            price NUMERIC(18,6) NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'flat',
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
+
+@app.post("/api/admin/pricing/order/set")
+def admin_set_order_pricing(
+    body: OrderPricingIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.order_id or body.price is None:
+        raise HTTPException(422, "invalid payload")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_order_pricing_table(cur)
+            # fetch order to validate status and category
+            cur.execute("SELECT id, service_name, status FROM public.orders WHERE id=%s", (int(body.order_id),))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "order not found")
+            oid, sname, status = int(row[0]), str(row[1] or "").lower(), str(row[2] or "Pending")
+            # only allow when Pending
+            if status != "Pending":
+                raise HTTPException(409, "order not pending")
+            # allow only PUBG/Ludo
+            if not (("pubg" in sname) or ("ببجي" in sname) or ("uc" in sname) or ("ludo" in sname) or ("لودو" in sname)):
+                raise HTTPException(422, "not pubg/ludo order")
+            cur.execute("""
+                INSERT INTO public.order_pricing_overrides(order_id, price, mode)
+                VALUES(%s,%s,'flat')
+                ON CONFLICT (order_id) DO UPDATE SET price=EXCLUDED.price, updated_at=now()
+            """, (oid, Decimal(body.price)))
+            # reflect immediately on orders.price for UI consistency
+            cur.execute("UPDATE public.orders SET price=%s WHERE id=%s", (Decimal(body.price), oid))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/pricing/order/clear")
+
+
+# =========================
+# Per-order quantity setter (PUBG/Ludo only)
+# =========================
+class OrderQtyIn(BaseModel):
+    order_id: int
+    quantity: int
+    reprice: Optional[bool] = False  # if True, will recompute price if a per_k rule exists
+
+@app.post("/api/admin/pricing/order/set_qty")
+def admin_set_order_quantity(
+    body: OrderQtyIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.order_id or body.quantity is None:
+        raise HTTPException(422, "invalid payload")
+    if body.quantity <= 0:
+        raise HTTPException(422, "quantity must be > 0")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            # Validate order
+            cur.execute("SELECT id, service_name, status FROM public.orders WHERE id=%s", (int(body.order_id),))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "order not found")
+            oid, sname, status = int(row[0]), str(row[1] or "").lower(), str(row[2] or "Pending")
+            if status != "Pending":
+                raise HTTPException(409, "order not pending")
+            if not (("pubg" in sname) or ("ببجي" in sname) or ("uc" in sname) or ("ludo" in sname) or ("لودو" in sname)):
+                raise HTTPException(422, "not pubg/ludo order")
+
+            # Update quantity
+            cur.execute("UPDATE public.orders SET quantity=%s WHERE id=%s", (int(body.quantity), oid))
+
+            # Optional: reprice if per_k rule exists
+            if body.reprice:
+                # Try service-specific override then category fallback
+                cur.execute("SELECT price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (sname,))
+                rowp = cur.fetchone()
+                if not rowp:
+                    key = None
+                    if any(w in sname for w in ["pubg","ببجي","uc"]):
+                        key = "cat.pubg"
+                    elif any(w in sname for w in ["ludo","لودو"]):
+                        key = "cat.ludo"
+                    if key:
+                        cur.execute("SELECT price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (key,))
+                        rowp = cur.fetchone()
+                if rowp:
+                    ppk = float(rowp[0]); mn = int(rowp[1]); mx = int(rowp[2]); mode = (rowp[3] or 'per_k')
+                    if mode == 'per_k':
+                        if body.quantity < mn or body.quantity > mx:
+                            raise HTTPException(400, f"quantity out of allowed range [{mn}-{mx}]")
+                        eff_price = float(Decimal(body.quantity) * Decimal(ppk) / Decimal(1000))
+                        cur.execute("UPDATE public.orders SET price=%s WHERE id=%s", (Decimal(eff_price), oid))
+
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+def admin_clear_order_pricing(
+    body: OrderPricingIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.order_id:
+        raise HTTPException(422, "invalid payload")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_order_pricing_table(cur)
+            cur.execute("DELETE FROM public.order_pricing_overrides WHERE order_id=%s", (int(body.order_id),))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+def admin_clear_pricing(
+    body: PricingIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.ui_key:
+        raise HTTPException(422, "invalid payload")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table(cur)
+                _ensure_pricing_mode_column(cur)
+                cur.execute("DELETE FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
 def admin_clear_service_id(
     body: SvcOverrideIn,
     x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
