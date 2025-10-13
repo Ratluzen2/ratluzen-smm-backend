@@ -177,7 +177,7 @@ def ensure_schema():
                             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                         );
                     """)
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_uid ON public.users(uid);
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_uid ON public.users(uid);")
 
                     -- FCM token storage
                     BEGIN
@@ -2262,3 +2262,5 @@ def _alias_set_pricing(body: PricingIn, x_admin_password: Optional[str] = Header
 def _alias_clear_pricing(body: PricingIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     return admin_clear_pricing(body, x_admin_password, password)
 
+
+# DEBUG_INFO: SyntaxError at line 187: unterminated string literal (detected at line 187)
