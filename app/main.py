@@ -103,6 +103,7 @@ def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int],
         message = {
             "message": {
                 "token": fcm_token,
+                "notification": {"title": title, "body": body},
                 "data": {
                     "title": title,
                     "body": body,
@@ -125,10 +126,7 @@ def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[i
             "Authorization": f"key={server_key}",
             "Content-Type": "application/json"
         }
-        payload = {
-            "to": fcm_token,
-            "priority": "high",
-            "data": {
+        payload = {"to": fcm_token, "priority": "high", "notification": {"title": title, "body": body}, "data": {
                 "title": title,
                 "body": body,
                 "order_id": str(order_id or ""),
@@ -701,15 +699,15 @@ def create_provider_order(body: ProviderOrderIn):
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            (oid := _create_provider_order_core(
+            oid = _create_provider_order_core(
                 cur, body.uid, body.service_id, body.service_name,
                 body.link, body.quantity, body.price
             )
-        # Notify
-        cur.execute("SELECT user_id, title FROM public.orders WHERE id=%s", (oid,))
-        r = cur.fetchone()
-        if r:
-            _notify_user(conn, r[0], oid, "تم استلام طلبك", f"تم استلام طلب {r[1]}.")
+            # Notify
+            cur.execute("SELECT user_id, title FROM public.orders WHERE id=%s", (oid,))
+            r = cur.fetchone()
+            if r:
+                _notify_user(conn, r[0], oid, "تم استلام طلبك", f"تم استلام طلب {r[1]}.")
         return {"ok": True, "order_id": oid}
     finally:
         put_conn(conn)
@@ -745,10 +743,10 @@ for path in PROVIDER_CREATE_PATHS:
         try:
             with conn, conn.cursor() as cur:
                 oid = _create_provider_order_core(cur, p["uid"], p["service_id"], p["service_name"], p["link"], p["quantity"], p["price"])
-            cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
-            ur = cur.fetchone()
-            if ur:
-                _notify_user(conn, ur[0], oid, "تم استلام طلبك", f"تم استلام طلب {p['service_name']}.")
+                cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
+                ur = cur.fetchone()
+                if ur:
+                    _notify_user(conn, ur[0], oid, "تم استلام طلبك", f"تم استلام طلب {p['service_name']}.")
             return {"ok": True, "order_id": oid}
         finally:
             put_conn(conn)
@@ -766,7 +764,8 @@ def create_manual_order(body: ManualOrderIn):
                 RETURNING id
             """, (user_id, body.title))
             oid = cur.fetchone()[0]
-        _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {body.title}.")\n        return {"ok": True, "order_id": oid}
+        _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {body.title}.")
+        return {"ok": True, "order_id": oid}
     finally:
         put_conn(conn)
 
@@ -802,10 +801,10 @@ def submit_asiacell(body: AsiacellSubmitIn):
     try:
         with conn, conn.cursor() as cur:
             oid = _asiacell_submit_core(cur, body.uid, digits)
-        cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
-        r = cur.fetchone()
-        if r:
-            _notify_user(conn, r[0], oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
+            cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
+            r = cur.fetchone()
+            if r:
+                _notify_user(conn, r[0], oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
         return {"ok": True, "order_id": oid, "status": "received"}
     finally:
         put_conn(conn)
@@ -826,6 +825,10 @@ for path in ASIACELL_PATHS[1:]:
         try:
             with conn, conn.cursor() as cur:
                 oid = _asiacell_submit_core(cur, uid, digits)
+                cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
+                r = cur.fetchone()
+                if r:
+                    _notify_user(conn, r[0], oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
             return {"ok": True, "order_id": oid, "status": "received"}
         finally:
             put_conn(conn)
