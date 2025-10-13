@@ -351,12 +351,12 @@ async def _read_json_object(request: Request) -> Dict[str, Any]:
 
 def _notify_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
     """
-    Insert a notification row AND immediately push an FCM data message to the user's device (if we have a token).
+    Insert a notification row AND immediately push an FCM message to the user's device (best-effort).
     """
+    fcm_token = None
     try:
         with conn:
             with conn.cursor() as cur:
-                # Insert notification record
                 cur.execute(
                     """
                     INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
@@ -364,22 +364,16 @@ def _notify_user(conn, user_id: int, order_id: Optional[int], title: str, body: 
                     """,
                     (user_id, order_id, title, body)
                 )
-                # Fetch user's fcm token
                 cur.execute("SELECT fcm_token FROM public.users WHERE id=%s", (user_id,))
                 row = cur.fetchone()
-                fcm_token = row[0] if row and len(row) > 0 else None
-        # Send push outside the txn (best-effort)
+                fcm_token = row[0] if row else None
+    except Exception as e:
+        logger.exception("notify failed (DB): %s", e)
+
+    try:
         _fcm_send_push(fcm_token, title, body, order_id)
     except Exception as e:
-        logger.exception("notify/push failed: %s", e)
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
-                    VALUES (%s, %s, %s, %s, 'unread', NOW())
-                """, (user_id, order_id, title, body))
-    except Exception as e:
-        logger.exception("notify failed: %s", e)
+        logger.exception("push error (ignored): %s", e)
 
 def _needs_code(title: str, otype: Optional[str]) -> bool:
     t = (title or "").lower()
@@ -438,6 +432,21 @@ def _parse_usd(d: Dict[str, Any]) -> int:
                 pass
     return 0
 
+
+def _push_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
+    """Push FCM without inserting a DB notification row (useful when a DB trigger already inserted)."""
+    token = None
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT fcm_token FROM public.users WHERE id=%s", (user_id,))
+            row = cur.fetchone()
+            token = row[0] if row else None
+    except Exception as e:
+        logger.exception("push_user DB read failed: %s", e)
+    try:
+        _fcm_send_push(token, title, body, order_id)
+    except Exception as e:
+        logger.exception("push_user send failed: %s", e)
 # =========================
 # Models
 # =========================
@@ -692,10 +701,15 @@ def create_provider_order(body: ProviderOrderIn):
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            oid = _create_provider_order_core(
+            (oid := _create_provider_order_core(
                 cur, body.uid, body.service_id, body.service_name,
                 body.link, body.quantity, body.price
             )
+        # Notify
+        cur.execute("SELECT user_id, title FROM public.orders WHERE id=%s", (oid,))
+        r = cur.fetchone()
+        if r:
+            _notify_user(conn, r[0], oid, "تم استلام طلبك", f"تم استلام طلب {r[1]}.")
         return {"ok": True, "order_id": oid}
     finally:
         put_conn(conn)
@@ -731,6 +745,10 @@ for path in PROVIDER_CREATE_PATHS:
         try:
             with conn, conn.cursor() as cur:
                 oid = _create_provider_order_core(cur, p["uid"], p["service_id"], p["service_name"], p["link"], p["quantity"], p["price"])
+            cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
+            ur = cur.fetchone()
+            if ur:
+                _notify_user(conn, ur[0], oid, "تم استلام طلبك", f"تم استلام طلب {p['service_name']}.")
             return {"ok": True, "order_id": oid}
         finally:
             put_conn(conn)
@@ -748,7 +766,7 @@ def create_manual_order(body: ManualOrderIn):
                 RETURNING id
             """, (user_id, body.title))
             oid = cur.fetchone()[0]
-        return {"ok": True, "order_id": oid}
+        _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {body.title}.")\n        return {"ok": True, "order_id": oid}
     finally:
         put_conn(conn)
 
@@ -784,6 +802,10 @@ def submit_asiacell(body: AsiacellSubmitIn):
     try:
         with conn, conn.cursor() as cur:
             oid = _asiacell_submit_core(cur, body.uid, digits)
+        cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
+        r = cur.fetchone()
+        if r:
+            _notify_user(conn, r[0], oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
         return {"ok": True, "order_id": oid, "status": "received"}
     finally:
         put_conn(conn)
@@ -1622,6 +1644,7 @@ def admin_wallet_topup(body: WalletCompatIn, x_admin_password: Optional[str] = H
                 """,
                 (user_id, Decimal(amt), body.reason or "manual_topup", Json({"compat": "topup"}))
             )
+        _push_user(conn, user_id, None, "تمت إضافة رصيد", f"تمت إضافة {amt} إلى رصيدك.")
         return {"ok": True, "status": "adjusted", "amount": amt, "direction": "topup"}
     finally:
         put_conn(conn)
@@ -1656,6 +1679,7 @@ def admin_wallet_deduct(body: WalletCompatIn, x_admin_password: Optional[str] = 
                 """,
                 (user_id, Decimal(-amt), body.reason or "manual_deduct", Json({"compat": "deduct"}))
             )
+        _push_user(conn, user_id, None, "تم خصم رصيد", f"تم خصم {amt} من رصيدك.")
         return {"ok": True, "status": "adjusted", "amount": -amt, "direction": "deduct"}
     finally:
         put_conn(conn)
@@ -2279,4 +2303,3 @@ def _alias_clear_pricing(body: PricingIn, x_admin_password: Optional[str] = Head
     return admin_clear_pricing(body, x_admin_password, password)
 
 
-# DEBUG_INFO: SyntaxError at line 187: unterminated string literal (detected at line 187)
