@@ -103,6 +103,7 @@ def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int],
         message = {
             "message": {
                 "token": fcm_token,
+                "notification": {"title": title, "body": body},
                 "data": {
                     "title": title,
                     "body": body,
@@ -125,10 +126,7 @@ def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[i
             "Authorization": f"key={server_key}",
             "Content-Type": "application/json"
         }
-        payload = {
-            "to": fcm_token,
-            "priority": "high",
-            "data": {
+        payload = {"to": fcm_token, "priority": "high", "notification": {"title": title, "body": body}, "data": {
                 "title": title,
                 "body": body,
                 "order_id": str(order_id or ""),
@@ -376,21 +374,15 @@ def _notify_user(conn, user_id: int, order_id: Optional[int], title: str, body: 
         logger.exception("push error (ignored): %s", e)
 
 def _needs_code(title: str, otype: Optional[str]) -> bool:
-    """
-    Decide if delivering an order requires entering a 'code' (e.g., iTunes / voucher).
-    We DO NOT require a code for PUBG or Ludo orders, nor for Asiacell direct top-up.
-    """
     t = (title or "").lower()
-    # If it's an Asiacell direct top-up card flow, no code is needed at delivery
     if (otype or "").lower() == "topup_card":
         return False
-    # Never require code for PUBG / Ludo deliveries (they are account credits)
-    if any(k in t for k in ("pubg", "bgmi", "uc", "ببجي", "شدات", "ludo", "لودو", "يلا لودو", "yalla")):
-        return False
-    # Require code only for clear gift/voucher cases
-    keywords = ("itunes", "ايتونز", "voucher", "code", "card", "gift", "رمز", "كود", "بطاقة", "كارت")
-    return any(k in t for k in keywords)
+    for k in ("itunes","ايتونز","voucher","code","card","gift","رمز","كود","بطاقة","كارت","شراء"):
+        if k in t:
+            return True
+    return False
 
+# Admin auth compatibility helper
 def _pick_admin_password(header_val: Optional[str], password_qs: Optional[str], body: Optional[Dict[str, Any]] = None) -> Optional[str]:
     cand = header_val or password_qs
     if not cand and body:
@@ -711,11 +703,11 @@ def create_provider_order(body: ProviderOrderIn):
                 cur, body.uid, body.service_id, body.service_name,
                 body.link, body.quantity, body.price
             )
-        # Notify
-        cur.execute("SELECT user_id, title FROM public.orders WHERE id=%s", (oid,))
-        r = cur.fetchone()
-        if r:
-            _notify_user(conn, r[0], oid, "تم استلام طلبك", f"تم استلام طلب {r[1]}.")
+            # Notify
+            cur.execute("SELECT user_id, title FROM public.orders WHERE id=%s", (oid,))
+            r = cur.fetchone()
+            if r:
+                _notify_user(conn, r[0], oid, "تم استلام طلبك", f"تم استلام طلب {r[1]}.")
         return {"ok": True, "order_id": oid}
     finally:
         put_conn(conn)
@@ -751,10 +743,10 @@ for path in PROVIDER_CREATE_PATHS:
         try:
             with conn, conn.cursor() as cur:
                 oid = _create_provider_order_core(cur, p["uid"], p["service_id"], p["service_name"], p["link"], p["quantity"], p["price"])
-            cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
-            ur = cur.fetchone()
-            if ur:
-                _notify_user(conn, ur[0], oid, "تم استلام طلبك", f"تم استلام طلب {p['service_name']}.")
+                cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
+                ur = cur.fetchone()
+                if ur:
+                    _notify_user(conn, ur[0], oid, "تم استلام طلبك", f"تم استلام طلب {p['service_name']}.")
             return {"ok": True, "order_id": oid}
         finally:
             put_conn(conn)
@@ -780,34 +772,6 @@ def create_manual_order(body: ManualOrderIn):
 # Asiacell submit (topup via card)
 def _asiacell_submit_core(cur, uid: str, card_digits: str) -> int:
     user_id = _ensure_user(cur, uid)
-
-    # Check active block
-    cur.execute("SELECT 1 FROM public.user_blocks WHERE user_id=%s AND blocked_until > NOW() LIMIT 1", (user_id,))
-    if cur.fetchone():
-        raise HTTPException(429, "temporarily_blocked")
-
-    # Duplicate card for same user in the last 5 minutes?
-    cur.execute("""
-        SELECT COUNT(*) FROM public.orders
-        WHERE user_id=%s AND type='topup_card'
-          AND COALESCE((COALESCE(NULLIF(payload,''),'{}')::jsonb->>'card'),'') = %s
-          AND created_at > NOW() - INTERVAL '5 minutes'
-    """, (user_id, card_digits))
-    dup_count = int(cur.fetchone()[0])
-
-    # Excessive rate: >6 topup_card orders in last minute
-    cur.execute("""
-        SELECT COUNT(*) FROM public.orders
-        WHERE user_id=%s AND type='topup_card'
-          AND created_at > NOW() - INTERVAL '1 minute'
-    """, (user_id,))
-    rate_1m = int(cur.fetchone()[0])
-
-    if dup_count > 0 or rate_1m > 6:
-        cur.execute("INSERT INTO public.user_blocks(user_id, blocked_until, reason) VALUES(%s, NOW() + INTERVAL '1 hour', %s)",
-                    (user_id, "asiacell_abuse"))
-        raise HTTPException(429, "temporarily_blocked")
-
     cur.execute("""
         INSERT INTO public.orders(user_id, title, quantity, price, status, payload, type)
         VALUES(%s,%s,0,0,'Pending', %s, 'topup_card')
@@ -831,16 +795,16 @@ ASIACELL_PATHS = [
 @app.post("/api/wallet/asiacell/submit")
 def submit_asiacell(body: AsiacellSubmitIn):
     digits = _extract_digits(body.card)
-    if not (12 <= len(digits) <= 20):
+    if len(digits) not in (14, 16):
         raise HTTPException(422, "invalid card length")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             oid = _asiacell_submit_core(cur, body.uid, digits)
-        cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
-        r = cur.fetchone()
-        if r:
-            _notify_user(conn, r[0], oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
+            cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
+            r = cur.fetchone()
+            if r:
+                _notify_user(conn, r[0], oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
         return {"ok": True, "order_id": oid, "status": "received"}
     finally:
         put_conn(conn)
@@ -861,15 +825,10 @@ for path in ASIACELL_PATHS[1:]:
         try:
             with conn, conn.cursor() as cur:
                 oid = _asiacell_submit_core(cur, uid, digits)
-            # notify user (compat path)
-            try:
-                cur = conn.cursor()
                 cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
                 r = cur.fetchone()
                 if r:
                     _notify_user(conn, r[0], oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
-            except Exception:
-                pass
             return {"ok": True, "order_id": oid, "status": "received"}
         finally:
             put_conn(conn)
