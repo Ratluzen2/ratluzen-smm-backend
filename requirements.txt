@@ -4,3 +4,4 @@ psycopg2-binary==2.9.9
 pydantic==1.10.15
 python-multipart==0.0.9
 requests==2.32.3
+google-auth==2.34.0
