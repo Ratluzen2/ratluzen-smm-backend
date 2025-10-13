@@ -22,6 +22,9 @@ DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DATABASE_URL_NEON")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is required")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "2000")
+FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "").strip()
+GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
+FCM_PROJECT_ID = os.getenv("FCM_PROJECT_ID", "").strip()  # optional override
 
 PROVIDER_API_URL = os.getenv("PROVIDER_API_URL", "https://kd1s.com/api/v2")
 PROVIDER_API_KEY = os.getenv("PROVIDER_API_KEY", "25a9ceb07be0d8b2ba88e70dcbe92e06")
@@ -41,6 +44,117 @@ def put_conn(conn: psycopg2.extensions.connection) -> None:
 logger = logging.getLogger("smm")
 logging.basicConfig(level=logging.INFO)
 
+
+# =========================
+# FCM helpers (V1 preferred; Legacy fallback)
+# =========================
+def _fcm_get_access_token_v1(sa_info: dict) -> Optional[str]:
+    """
+    Returns OAuth2 access token using google-auth if available; otherwise falls back to manual JWT if PyJWT is installed.
+    """
+    # Try google-auth first
+    try:
+        from google.oauth2 import service_account
+        from google.auth.transport.requests import Request as GoogleRequest
+        creds = service_account.Credentials.from_service_account_info(sa_info, scopes=[
+            "https://www.googleapis.com/auth/firebase.messaging"
+        ])
+        creds.refresh(GoogleRequest())
+        return creds.token
+    except Exception as e:
+        logger.info("google-auth not available or failed: %s", e)
+
+    # Try manual JWT with PyJWT
+    try:
+        import jwt, time
+        now = int(time.time())
+        payload = {
+            "iss": sa_info["client_email"],
+            "scope": "https://www.googleapis.com/auth/firebase.messaging",
+            "aud": sa_info.get("token_uri", "https://oauth2.googleapis.com/token"),
+            "iat": now,
+            "exp": now + 3600,
+        }
+        signed_jwt = jwt.encode(payload, sa_info["private_key"], algorithm="RS256")
+        resp = requests.post(sa_info.get("token_uri", "https://oauth2.googleapis.com/token"),
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": signed_jwt,
+            }, timeout=10)
+        if resp.status_code in (200, 201):
+            return resp.json().get("access_token")
+        else:
+            logger.warning("JWT token fetch failed: %s %s", resp.status_code, resp.text[:200])
+    except Exception as e:
+        logger.info("pyjwt flow not available or failed: %s", e)
+    return None
+
+def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int], sa_info: dict, project_id: Optional[str] = None):
+    try:
+        access_token = _fcm_get_access_token_v1(sa_info)
+        if not access_token:
+            logger.warning("FCM v1: could not obtain access token")
+            return
+        pid = project_id or sa_info.get("project_id")
+        if not pid:
+            logger.warning("FCM v1: missing project_id")
+            return
+        url = f"https://fcm.googleapis.com/v1/projects/{pid}/messages:send"
+        message = {
+            "message": {
+                "token": fcm_token,
+                "data": {
+                    "title": title,
+                    "body": body,
+                    "order_id": str(order_id or ""),
+                }
+            }
+        }
+        resp = requests.post(url, headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }, json=message, timeout=10)
+        if resp.status_code not in (200, 201):
+            logger.warning("FCM v1 send failed (%s): %s", resp.status_code, resp.text[:300])
+    except Exception as ex:
+        logger.exception("FCM v1 send exception: %s", ex)
+
+def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[int], server_key: str):
+    try:
+        headers = {
+            "Authorization": f"key={server_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "to": fcm_token,
+            "priority": "high",
+            "data": {
+                "title": title,
+                "body": body,
+                "order_id": str(order_id or ""),
+            }
+        }
+        resp = requests.post("https://fcm.googleapis.com/fcm/send", headers=headers, json=payload, timeout=10)
+        if resp.status_code not in (200, 201):
+            logger.warning("FCM legacy send failed (%s): %s", resp.status_code, resp.text[:300])
+    except Exception as ex:
+        logger.exception("FCM legacy send exception: %s", ex)
+
+def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Optional[int]):
+    if not fcm_token:
+        return
+    # Prefer v1 via Service Account JSON stored in env
+    sa_json = (GOOGLE_APPLICATION_CREDENTIALS_JSON or "").strip()
+    if sa_json:
+        try:
+            info = json.loads(sa_json)
+            _fcm_send_v1(fcm_token, title, body, order_id, info, project_id=(FCM_PROJECT_ID or None))
+            return
+        except Exception as e:
+            logger.info("Invalid GOOGLE_APPLICATION_CREDENTIALS_JSON: %s", e)
+    # Fallback to legacy if configured
+    if FCM_SERVER_KEY:
+        _fcm_send_legacy(fcm_token, title, body, order_id, FCM_SERVER_KEY)
 # =========================
 # Schema & Triggers
 # =========================
@@ -63,7 +177,14 @@ def ensure_schema():
                             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                         );
                     """)
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_uid ON public.users(uid);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_uid ON public.users(uid);
+
+                    -- FCM token storage
+                    BEGIN
+                    ALTER TABLE public.users ADD COLUMN IF NOT EXISTS fcm_token TEXT;
+                    EXCEPTION WHEN duplicate_column THEN
+                    -- ignore
+                    END;")
 
                     # wallet_txns
                     cur.execute("""
@@ -401,6 +522,32 @@ def upsert_user(body: UpsertUserIn):
     finally:
         put_conn(conn)
 
+
+# Endpoint to store FCM token for a UID
+class FcmTokenIn(BaseModel):
+    uid: str
+    fcm: str
+
+@app.post("/api/users/fcm_token")
+def api_users_fcm_token(body: FcmTokenIn):
+    uid = (body.uid or "").strip()
+    fcm = (body.fcm or "").strip()
+    if not uid or not fcm:
+        raise HTTPException(422, "uid and fcm token required")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                cur.execute("INSERT INTO public.users(uid) VALUES(%s) RETURNING id", (uid,))
+                user_id = cur.fetchone()[0]
+            else:
+                user_id = r[0]
+            cur.execute("UPDATE public.users SET fcm_token=%s WHERE id=%s", (fcm, user_id))
+        return {"ok": True, "uid": uid}
+    finally:
+        put_conn(conn)
 # ---- Wallet balance (with several aliases to match the app) ----
 @app.get("/api/wallet/balance")
 def wallet_balance(uid: str):
