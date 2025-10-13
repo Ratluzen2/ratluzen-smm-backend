@@ -350,7 +350,28 @@ async def _read_json_object(request: Request) -> Dict[str, Any]:
     return data
 
 def _notify_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
+    """
+    Insert a notification row AND immediately push an FCM data message to the user's device (if we have a token).
+    """
     try:
+        with conn:
+            with conn.cursor() as cur:
+                # Insert notification record
+                cur.execute(
+                    """
+                    INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
+                    VALUES (%s, %s, %s, %s, 'unread', NOW())
+                    """,
+                    (user_id, order_id, title, body)
+                )
+                # Fetch user's fcm token
+                cur.execute("SELECT fcm_token FROM public.users WHERE id=%s", (user_id,))
+                row = cur.fetchone()
+                fcm_token = row[0] if row and len(row) > 0 else None
+        # Send push outside the txn (best-effort)
+        _fcm_send_push(fcm_token, title, body, order_id)
+    except Exception as e:
+        logger.exception("notify/push failed: %s", e)
         with conn:
             with conn.cursor() as cur:
                 cur.execute("""
