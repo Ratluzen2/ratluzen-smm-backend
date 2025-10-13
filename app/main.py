@@ -103,11 +103,13 @@ def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int],
         message = {
             "message": {
                 "token": fcm_token,
+                "notification": {"title": title, "body": body},
                 "data": {
                     "title": title,
                     "body": body,
                     "order_id": str(order_id or ""),
-                }
+                },
+                "android": {"priority": "HIGH"}
             }
         }
         resp = requests.post(url, headers={
@@ -119,6 +121,7 @@ def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int],
     except Exception as ex:
         logger.exception("FCM v1 send exception: %s", ex)
 
+
 def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[int], server_key: str):
     try:
         headers = {
@@ -128,6 +131,7 @@ def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[i
         payload = {
             "to": fcm_token,
             "priority": "high",
+            "notification": {"title": title, "body": body},
             "data": {
                 "title": title,
                 "body": body,
@@ -139,6 +143,7 @@ def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[i
             logger.warning("FCM legacy send failed (%s): %s", resp.status_code, resp.text[:300])
     except Exception as ex:
         logger.exception("FCM legacy send exception: %s", ex)
+
 
 def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Optional[int]):
     if not fcm_token:
@@ -351,12 +356,12 @@ async def _read_json_object(request: Request) -> Dict[str, Any]:
 
 def _notify_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
     """
-    Insert a notification row AND immediately push an FCM data message to the user's device (if we have a token).
+    Insert a notification row AND immediately push an FCM message to the user's device (best-effort).
     """
+    fcm_token = None
     try:
         with conn:
             with conn.cursor() as cur:
-                # Insert notification record
                 cur.execute(
                     """
                     INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
@@ -364,22 +369,17 @@ def _notify_user(conn, user_id: int, order_id: Optional[int], title: str, body: 
                     """,
                     (user_id, order_id, title, body)
                 )
-                # Fetch user's fcm token
                 cur.execute("SELECT fcm_token FROM public.users WHERE id=%s", (user_id,))
                 row = cur.fetchone()
-                fcm_token = row[0] if row and len(row) > 0 else None
-        # Send push outside the txn (best-effort)
+                fcm_token = row[0] if row else None
+    except Exception as e:
+        logger.exception("notify failed (DB): %s", e)
+
+    try:
         _fcm_send_push(fcm_token, title, body, order_id)
     except Exception as e:
-        logger.exception("notify/push failed: %s", e)
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
-                    VALUES (%s, %s, %s, %s, 'unread', NOW())
-                """, (user_id, order_id, title, body))
-    except Exception as e:
-        logger.exception("notify failed: %s", e)
+        logger.exception("push error (ignored): %s", e)
+
 
 def _needs_code(title: str, otype: Optional[str]) -> bool:
     t = (title or "").lower()
@@ -437,6 +437,21 @@ def _parse_usd(d: Dict[str, Any]) -> int:
             except Exception:
                 pass
     return 0
+
+def _push_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
+    """Push FCM without inserting a DB notification row (useful when DB trigger already inserted)."""
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT fcm_token FROM public.users WHERE id=%s", (user_id,))
+            row = cur.fetchone()
+            token = row[0] if row else None
+    except Exception as e:
+        logger.exception("push_user DB read failed: %s", e)
+        token = None
+    try:
+        _fcm_send_push(token, title, body, order_id)
+    except Exception as e:
+        logger.exception("push_user send failed: %s", e)
 
 # =========================
 # Models
@@ -599,7 +614,7 @@ def wallet_balance_alias5(uid: str):
 
 # Create provider order core
 def _create_provider_order_core(cur, uid: str, service_id: Optional[int], service_name: str,
-                                link: Optional[str], quantity: int, price: float) -> int:
+                                link: Optional[str], quantity: int, price: float) -> tuple:
     cur.execute("SELECT id, balance, is_banned FROM public.users WHERE uid=%s", (uid,))
     r = cur.fetchone()
     if not r:
@@ -685,17 +700,17 @@ def _create_provider_order_core(cur, uid: str, service_id: Optional[int], servic
     """, (user_id, service_name, eff_sid, link, quantity, Decimal(eff_price or 0),
           Json({"source": "provider_form", "service_id_provided": service_id, "service_id_effective": eff_sid, "price_effective": eff_price}), 'provider'))
     oid = cur.fetchone()[0]
-    return oid
-
+    return oid, user_id
 @app.post("/api/orders/create/provider")
 def create_provider_order(body: ProviderOrderIn):
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            oid = _create_provider_order_core(
+            (oid, user_id) = _create_provider_order_core(
                 cur, body.uid, body.service_id, body.service_name,
                 body.link, body.quantity, body.price
             )
+        _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {body.service_name}.")
         return {"ok": True, "order_id": oid}
     finally:
         put_conn(conn)
@@ -730,7 +745,8 @@ for path in PROVIDER_CREATE_PATHS:
         conn = get_conn()
         try:
             with conn, conn.cursor() as cur:
-                oid = _create_provider_order_core(cur, p["uid"], p["service_id"], p["service_name"], p["link"], p["quantity"], p["price"])
+                (oid, user_id) = _create_provider_order_core(cur, p["uid"], p["service_id"], p["service_name"], p["link"], p["quantity"], p["price"])
+            _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {p['service_name']}.")
             return {"ok": True, "order_id": oid}
         finally:
             put_conn(conn)
@@ -748,6 +764,7 @@ def create_manual_order(body: ManualOrderIn):
                 RETURNING id
             """, (user_id, body.title))
             oid = cur.fetchone()[0]
+        _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {body.title}.")
         return {"ok": True, "order_id": oid}
     finally:
         put_conn(conn)
@@ -783,7 +800,8 @@ def submit_asiacell(body: AsiacellSubmitIn):
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            oid = _asiacell_submit_core(cur, body.uid, digits)
+            oid, user_id = _asiacell_submit_core(cur, body.uid, digits)
+        _notify_user(conn, user_id, oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
         return {"ok": True, "order_id": oid, "status": "received"}
     finally:
         put_conn(conn)
@@ -803,7 +821,8 @@ for path in ASIACELL_PATHS[1:]:
         conn = get_conn()
         try:
             with conn, conn.cursor() as cur:
-                oid = _asiacell_submit_core(cur, uid, digits)
+                oid, user_id = _asiacell_submit_core(cur, uid, digits)
+            _notify_user(conn, user_id, oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
             return {"ok": True, "order_id": oid, "status": "received"}
         finally:
             put_conn(conn)
@@ -1565,6 +1584,9 @@ async def admin_wallet_adjust(uid: str, request: Request, x_admin_password: Opti
                 (user_id, Decimal(amt), reason, Json(meta))
             )
 
+                # push unless explicitly disabled
+        if not no_notify:
+            _push_user(conn, user_id, None, ("تمت إضافة رصيد" if amt>0 else "تم خصم رصيد"), f"القيمة: {abs(amt)}")
         return {"ok": True, "status": "adjusted", "amount": amt, "reason": reason}
     finally:
         put_conn(conn)
@@ -1622,6 +1644,7 @@ def admin_wallet_topup(body: WalletCompatIn, x_admin_password: Optional[str] = H
                 """,
                 (user_id, Decimal(amt), body.reason or "manual_topup", Json({"compat": "topup"}))
             )
+        _push_user(conn, user_id, None, "تمت إضافة رصيد", f"تمت إضافة {amt} إلى رصيدك.")
         return {"ok": True, "status": "adjusted", "amount": amt, "direction": "topup"}
     finally:
         put_conn(conn)
@@ -1656,6 +1679,7 @@ def admin_wallet_deduct(body: WalletCompatIn, x_admin_password: Optional[str] = 
                 """,
                 (user_id, Decimal(-amt), body.reason or "manual_deduct", Json({"compat": "deduct"}))
             )
+        _push_user(conn, user_id, None, "تم خصم رصيد", f"تم خصم {amt} من رصيدك.")
         return {"ok": True, "status": "adjusted", "amount": -amt, "direction": "deduct"}
     finally:
         put_conn(conn)
@@ -2279,4 +2303,3 @@ def _alias_clear_pricing(body: PricingIn, x_admin_password: Optional[str] = Head
     return admin_clear_pricing(body, x_admin_password, password)
 
 
-# DEBUG_INFO: SyntaxError at line 187: unterminated string literal (detected at line 187)
