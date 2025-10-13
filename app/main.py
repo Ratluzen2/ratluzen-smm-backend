@@ -15,6 +15,50 @@ from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+# ------------- Asiacell protection helpers -------------
+import hashlib
+from datetime import timedelta, datetime, timezone
+
+SAFE_TZ = timezone.utc
+
+def _hash_card(digits: str) -> str:
+    return hashlib.sha256(digits.encode("utf-8")).hexdigest()
+
+def _asiacell_check_ban(cur, user_id: int):
+    cur.execute("SELECT banned_until FROM public.asiacell_bans WHERE user_id=%s", (user_id,))
+    r = cur.fetchone()
+    if r and r[0] and r[0] > datetime.now(SAFE_TZ):
+        return r[0]
+    return None
+
+def _asiacell_ban(cur, user_id: int, minutes: int = 60):
+    until = datetime.now(SAFE_TZ) + timedelta(minutes=minutes)
+    cur.execute("""
+        INSERT INTO public.asiacell_bans(user_id, banned_until) VALUES(%s,%s)
+        ON CONFLICT (user_id) DO UPDATE SET banned_until=EXCLUDED.banned_until
+    """, (user_id, until))
+    return until
+
+def _asiacell_log_attempt(cur, user_id: int, card_hash: str):
+    cur.execute("""
+        INSERT INTO public.asiacell_attempts(user_id, card_hash) VALUES(%s,%s)
+    """, (user_id, card_hash))
+
+def _asiacell_should_ban_duplicate(cur, user_id: int, card_hash: str, minutes: int = 5) -> bool:
+    cur.execute("""
+        SELECT COUNT(*) FROM public.asiacell_attempts
+        WHERE user_id=%s AND card_hash=%s AND created_at > NOW() - INTERVAL %s
+    """, (user_id, card_hash, f"{minutes} minutes"))
+    return (cur.fetchone()[0] or 0) >= 1  # repeated same card within window
+
+def _asiacell_should_ban_rate(cur, user_id: int, limit:int = 5, minutes:int = 2) -> bool:
+    cur.execute("""
+        SELECT COUNT(*) FROM public.asiacell_attempts
+        WHERE user_id=%s AND created_at > NOW() - INTERVAL %s
+    """, (user_id, f"{minutes} minutes"))
+    return (cur.fetchone()[0] or 0) >= limit
+
+
 # =========================
 # Settings
 # =========================
@@ -189,6 +233,22 @@ def ensure_schema():
                             meta       JSONB,
                             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                         );
+
+                    -- Anti-abuse tables for Asiacell
+                    CREATE TABLE IF NOT EXISTS public.asiacell_attempts(
+                        id BIGSERIAL PRIMARY KEY,
+                        user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                        card_hash TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_asiacell_attempts_user_created ON public.asiacell_attempts(user_id, created_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_asiacell_attempts_card ON public.asiacell_attempts(card_hash);
+
+                    CREATE TABLE IF NOT EXISTS public.asiacell_bans(
+                        user_id INTEGER PRIMARY KEY REFERENCES public.users(id) ON DELETE CASCADE,
+                        banned_until TIMESTAMPTZ NOT NULL
+                    );
+
                     """)
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_wallet_txns_user ON public.wallet_txns(user_id);")
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_wallet_txns_created ON public.wallet_txns(created_at);")
@@ -800,6 +860,17 @@ def submit_asiacell(body: AsiacellSubmitIn):
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
+            user_id = _ensure_user(cur, uid)
+            # --- Asiacell anti-abuse checks ---
+            active = _asiacell_check_ban(cur, user_id)
+            if active:
+                raise HTTPException(429, f"محظور مؤقتًا حتى {active} بسبب محاولات متكررة.")
+            card_hash = _hash_card(digits)
+            if _asiacell_should_ban_duplicate(cur, user_id, card_hash, minutes=5) or _asiacell_should_ban_rate(cur, user_id, limit=5, minutes=2):
+                until = _asiacell_ban(cur, user_id, minutes=60)
+                raise HTTPException(429, f"محظور لمدة ساعة حتى {until} بسبب تكرار/سرعة محاولات الشحن.")
+            _asiacell_log_attempt(cur, user_id, card_hash)
+
             oid = _asiacell_submit_core(cur, body.uid, digits)
             cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
             r = cur.fetchone()
