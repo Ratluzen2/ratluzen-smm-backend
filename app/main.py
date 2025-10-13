@@ -178,13 +178,8 @@ def ensure_schema():
                         );
                     """)
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_users_uid ON public.users(uid);")
+                    cur.execute("ALTER TABLE public.users ADD COLUMN IF NOT EXISTS fcm_token TEXT;")
 
-                    -- FCM token storage
-                    BEGIN
-                    ALTER TABLE public.users ADD COLUMN IF NOT EXISTS fcm_token TEXT;
-                    EXCEPTION WHEN duplicate_column THEN
-                    -- ignore
-                    END;")
 
                     # wallet_txns
                     cur.execute("""
