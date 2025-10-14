@@ -248,16 +248,16 @@ def ensure_schema():
                     """)
 
                     
-# owner FCM tokens (for admin/owner devices)
-cur.execute("""
-    CREATE TABLE IF NOT EXISTS public.owner_fcm_tokens(
-        token TEXT PRIMARY KEY,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-""")
-# user_notifications
+                        # owner FCM tokens (for admin/owner devices)
                     cur.execute("""
-                        CREATE TABLE IF NOT EXISTS public.user_notifications(
+                    CREATE TABLE IF NOT EXISTS public.owner_fcm_tokens(
+                        token TEXT PRIMARY KEY,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        );
+                        """)
+                    # user_notifications
+                    cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.user_notifications(
                             id BIGSERIAL PRIMARY KEY,
                             user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
                             order_id INTEGER NULL REFERENCES public.orders(id) ON DELETE SET NULL,
@@ -442,7 +442,28 @@ def _parse_usd(d: Dict[str, Any]) -> int:
 
 
 def _push_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
-
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    "INSERT INTO public.user_notifications(user_id, order_id, title, body) VALUES(%s,%s,%s,%s)",
+                    (user_id, order_id, title, body),
+                )
+            except Exception:
+                # table may not exist yet; ignore insert errors to not break main flow
+                pass
+            try:
+                cur.execute("SELECT fcm_token FROM public.users WHERE id=%s", (user_id,))
+                r = cur.fetchone()
+                if r and r[0]:
+                    try:
+                        _fcm_send_push(r[0], title, body, order_id, extra_data=None)
+                    except Exception as ex:
+                        logger.warning("user fcm send failed: %s", ex)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.exception("_push_user failed: %s", e)
 def _notify_owners(title: str, body: str, order_id: Optional[int] = None):
     conn = get_conn()
     tokens: List[str] = []
