@@ -290,7 +290,18 @@ def ensure_schema():
                             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                             read_at    TIMESTAMPTZ NULL
                         );
+                    """
+                    cur.execute("""
+
+CREATE TABLE IF NOT EXISTS public.owner_notifications(
+    id BIGSERIAL PRIMARY KEY,
+    order_id INTEGER NULL REFERENCES public.orders(id) ON DELETE SET NULL,
+    title TEXT NOT NULL,
+    body  TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
                     """)
+)
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_user_created ON public.user_notifications(user_id, created_at DESC);")
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);")
 
@@ -518,6 +529,17 @@ def _notify_owners_order_created(order_id: int, title: str):
         _notify_owners("طلب جديد", f"{title} (ID={order_id}) وصل للمالك.", order_id)
     except Exception as ex:
         logger.warning("owner_notify send failed: %s", ex)
+
+def _owner_notice_store(conn, title: str, body: str, order_id: Optional[int] = None):
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO public.owner_notifications(order_id, title, body) VALUES(%s, %s, %s)",
+                (order_id, title, body),
+            )
+    except Exception as e:
+        logger.warning("owner_notice_store failed: %s", e)
+
 
 
     """Push FCM without inserting a DB notification row (useful when a DB trigger already inserted)."""
@@ -796,6 +818,15 @@ def create_provider_order(body: ProviderOrderIn):
             r = cur.fetchone()
             if r:
                 _notify_user(conn, r[0], oid, "تم استلام طلبك", f"تم استلام طلب {r[1]}.")
+
+        
+        try:
+        
+            _owner_notice_store(conn, f"طلب {p['service_name']}", f"تم إنشاء الطلب.", oid)
+        
+        except Exception as _ex:
+        
+            logger.warning("owner_store error: %s", _ex)
         
         try:
         
@@ -904,6 +935,15 @@ def submit_asiacell(body: AsiacellSubmitIn):
             r = cur.fetchone()
             if r:
                 _notify_user(conn, r[0], oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
+
+        
+        try:
+        
+            _owner_notice_store(conn, f"طلب {p['service_name']}", f"تم إنشاء الطلب.", oid)
+        
+        except Exception as _ex:
+        
+            logger.warning("owner_store error: %s", _ex)
         
         try:
         
@@ -1162,6 +1202,19 @@ async def create_manual_paid(request: Request):
         # optional: immediate user notification (order received)
         body = title + (f" | ID: {account_id}" if account_id else "")
         _notify_user(conn, user_id, oid, "تم استلام طلبك", body)
+
+
+        
+        try:
+
+        
+            _owner_notice_store(conn, f"طلب {p['service_name']}", f"تم إنشاء الطلب.", oid)
+
+        
+        except Exception as _ex:
+
+        
+            logger.warning("owner_store error: %s", _ex)
 
         
         try:
@@ -2535,6 +2588,36 @@ def api_admin_fcm_debug(x_admin_password: str = Header(None), password: Optional
     finally:
         put_conn(conn)
     return {"ok": True, "owner_tokens": count, "fcm": cfg}
+
+
+class OwnerNoticeOut(BaseModel):
+    order_id: Optional[int] = None
+    title: str
+    body: str
+    ts: int
+
+@app.get("/api/admin/notices/list")
+def api_admin_owner_notices_list(request: Request, x_admin_password: str = Header(None), password: Optional[str] = None, after_ts: Optional[int] = None, limit: int = 100):
+    pw = _pick_admin_password(x_admin_password, password, None)
+    _require_admin(pw or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            if after_ts and after_ts > 0:
+                cur.execute(
+                    "SELECT order_id, title, body, EXTRACT(EPOCH FROM created_at)::bigint*1000 FROM public.owner_notifications WHERE created_at > to_timestamp(%s/1000.0) ORDER BY id ASC LIMIT %s",
+                    (after_ts, max(10, min(limit, 500))),  # clamp
+                )
+            else:
+                cur.execute(
+                    "SELECT order_id, title, body, EXTRACT(EPOCH FROM created_at)::bigint*1000 FROM public.owner_notifications ORDER BY id DESC LIMIT %s",
+                    (max(10, min(limit, 500)),),
+                )
+            rows = cur.fetchall() or []
+        items = [{"order_id": r[0], "title": r[1], "body": r[2], "ts": int(r[3] or 0)} for r in rows]
+        return {"ok": True, "items": items}
+    finally:
+        put_conn(conn)
 def api_admin_fcm_list(x_admin_password: str = Header(None), password: Optional[str] = None):
     pw = _pick_admin_password(x_admin_password, password, None)
     _require_admin(pw or "")
