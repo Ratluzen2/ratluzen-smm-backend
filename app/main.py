@@ -271,16 +271,18 @@ def ensure_schema():
                     """)
 
                     
-                        # owner FCM tokens (for admin/owner devices)
+                        
+                    # owner FCM tokens (for admin/owner devices)
                     cur.execute("""
-                    CREATE TABLE IF NOT EXISTS public.owner_fcm_tokens(
-                        token TEXT PRIMARY KEY,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        CREATE TABLE IF NOT EXISTS public.owner_fcm_tokens(
+                            token TEXT PRIMARY KEY,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                         );
-                        """)
+                    """)
+
                     # user_notifications
                     cur.execute("""
-                    CREATE TABLE IF NOT EXISTS public.user_notifications(
+                        CREATE TABLE IF NOT EXISTS public.user_notifications(
                             id BIGSERIAL PRIMARY KEY,
                             user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
                             order_id INTEGER NULL REFERENCES public.orders(id) ON DELETE SET NULL,
@@ -290,22 +292,27 @@ def ensure_schema():
                             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                             read_at    TIMESTAMPTZ NULL
                         );
-                    """
-                    cur.execute("""
-
-CREATE TABLE IF NOT EXISTS public.owner_notifications(
-    id BIGSERIAL PRIMARY KEY,
-    order_id INTEGER NULL REFERENCES public.orders(id) ON DELETE SET NULL,
-    title TEXT NOT NULL,
-    body  TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
                     """)
-)
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_user_created ON public.user_notifications(user_id, created_at DESC);")
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);")
+                    cur.execute("""
+                        CREATE INDEX IF NOT EXISTS ix_user_notifications_user_created
+                        ON public.user_notifications(user_id, created_at DESC);
+                    """)
+                    cur.execute("""
+                        CREATE INDEX IF NOT EXISTS ix_user_notifications_status
+                        ON public.user_notifications(status);
+                    """)
 
-                    # trigger: notify on wallet_txns insert (skip asiacell_topup or meta.no_notify)
+                    # owner_notifications (for in-app owner bell)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.owner_notifications(
+                            id BIGSERIAL PRIMARY KEY,
+                            order_id INTEGER NULL REFERENCES public.orders(id) ON DELETE SET NULL,
+                            title TEXT NOT NULL,
+                            body  TEXT NOT NULL,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        );
+                    """)
+# trigger: notify on wallet_txns insert (skip asiacell_topup or meta.no_notify)
                     cur.execute("""
                         CREATE OR REPLACE FUNCTION public.wallet_txns_notify()
                         RETURNS trigger AS $$
