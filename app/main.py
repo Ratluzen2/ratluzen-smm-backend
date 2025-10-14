@@ -107,7 +107,8 @@ def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int],
                 "data": {
                     "title": title,
                     "body": body,
-                    "order_id": str(order_id or ""),\n                    **(extra_data or {}),\n                **(extra_data or {}),
+                    "order_id": str(order_id or ""),
+                    **(extra_data or {}),
                 }
             }
         }
@@ -129,7 +130,8 @@ def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[i
         payload = {"to": fcm_token, "priority": "high", "notification": {"title": title, "body": body}, "data": {
                 "title": title,
                 "body": body,
-                "order_id": str(order_id or ""),\n                    **(extra_data or {}),\n                **(extra_data or {}),
+                "order_id": str(order_id or ""),
+                    **(extra_data or {}),
             }
         }
         resp = requests.post("https://fcm.googleapis.com/fcm/send", headers=headers, json=payload, timeout=10)
@@ -146,13 +148,13 @@ def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Op
     if sa_json:
         try:
             info = json.loads(sa_json)
-            _fcm_send_v1(fcm_token, title, body, order_id, info, project_id=(FCM_PROJECT_ID or None))
+            _fcm_send_v1(fcm_token, title, body, order_id, info, project_id=(FCM_PROJECT_ID or None), extra_data=extra_data)
             return
         except Exception as e:
             logger.info("Invalid GOOGLE_APPLICATION_CREDENTIALS_JSON: %s", e)
     # Fallback to legacy if configured
     if FCM_SERVER_KEY:
-        _fcm_send_legacy(fcm_token, title, body, order_id, FCM_SERVER_KEY)
+        _fcm_send_legacy(fcm_token, title, body, order_id, FCM_SERVER_KEY, extra_data=extra_data)
 # =========================
 # Schema & Triggers
 # =========================
