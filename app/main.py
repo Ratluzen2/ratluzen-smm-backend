@@ -2,6 +2,7 @@
 import os
 import json
 import time
+from datetime import datetime
 import logging
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
@@ -2636,3 +2637,6 @@ def api_admin_fcm_list(x_admin_password: str = Header(None), password: Optional[
         return {"ok": True, "tokens": rows}
     finally:
         put_conn(conn)
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "ts": int(time.time())}
