@@ -797,7 +797,13 @@ def create_provider_order(body: ProviderOrderIn):
             if r:
                 _notify_user(conn, r[0], oid, "تم استلام طلبك", f"تم استلام طلب {r[1]}.")
         
-        _notify_owners_order_created(oid, f"طلب {p['service_name']}")
+        try:
+        
+            _notify_owners_order_created(oid, f"طلب {p['service_name']}")
+        
+        except Exception as _ex:
+        
+            logger.warning("owner_notify error: %s", _ex)
         _notify_owners_order_created(oid, 'طلب يدوي مدفوع')
         return {"ok": True, "order_id": oid}
     finally:
@@ -899,7 +905,13 @@ def submit_asiacell(body: AsiacellSubmitIn):
             if r:
                 _notify_user(conn, r[0], oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
         
-        _notify_owners_order_created(oid, f"طلب {p['service_name']}")
+        try:
+        
+            _notify_owners_order_created(oid, f"طلب {p['service_name']}")
+        
+        except Exception as _ex:
+        
+            logger.warning("owner_notify error: %s", _ex)
         return {"ok": True, "order_id": oid, "status": "received"}
     finally:
         put_conn(conn)
@@ -1152,7 +1164,16 @@ async def create_manual_paid(request: Request):
         _notify_user(conn, user_id, oid, "تم استلام طلبك", body)
 
         
-        _notify_owners_order_created(oid, f"طلب {p['service_name']}")
+        try:
+
+        
+            _notify_owners_order_created(oid, f"طلب {p['service_name']}")
+
+        
+        except Exception as _ex:
+
+        
+            logger.warning("owner_notify error: %s", _ex)
         return {"ok": True, "order_id": oid, "charged": float(price)}
     finally:
         put_conn(conn)
