@@ -89,7 +89,7 @@ def _fcm_get_access_token_v1(sa_info: dict) -> Optional[str]:
         logger.info("pyjwt flow not available or failed: %s", e)
     return None
 
-def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int], sa_info: dict, project_id: Optional[str] = None):
+def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int], sa_info: dict, project_id: Optional[str] = None, extra_data: Optional[dict] = None):
     try:
         access_token = _fcm_get_access_token_v1(sa_info)
         if not access_token:
@@ -107,7 +107,7 @@ def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int],
                 "data": {
                     "title": title,
                     "body": body,
-                    "order_id": str(order_id or ""),
+                    "order_id": str(order_id or ""),\n                    **(extra_data or {}),\n                **(extra_data or {}),
                 }
             }
         }
@@ -120,7 +120,7 @@ def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int],
     except Exception as ex:
         logger.exception("FCM v1 send exception: %s", ex)
 
-def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[int], server_key: str):
+def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[int], server_key: str, extra_data: Optional[dict] = None):
     try:
         headers = {
             "Authorization": f"key={server_key}",
@@ -129,7 +129,7 @@ def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[i
         payload = {"to": fcm_token, "priority": "high", "notification": {"title": title, "body": body}, "data": {
                 "title": title,
                 "body": body,
-                "order_id": str(order_id or ""),
+                "order_id": str(order_id or ""),\n                    **(extra_data or {}),\n                **(extra_data or {}),
             }
         }
         resp = requests.post("https://fcm.googleapis.com/fcm/send", headers=headers, json=payload, timeout=10)
@@ -138,7 +138,7 @@ def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[i
     except Exception as ex:
         logger.exception("FCM legacy send exception: %s", ex)
 
-def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Optional[int]):
+def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Optional[int], extra_data: Optional[dict] = None):
     if not fcm_token:
         return
     # Prefer v1 via Service Account JSON stored in env
@@ -245,7 +245,15 @@ def ensure_schema():
                         );
                     """)
 
-                    # user_notifications
+                    
+# owner FCM tokens (for admin/owner devices)
+cur.execute("""
+    CREATE TABLE IF NOT EXISTS public.owner_fcm_tokens(
+        token TEXT PRIMARY KEY,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+""")
+# user_notifications
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS public.user_notifications(
                             id BIGSERIAL PRIMARY KEY,
@@ -432,6 +440,28 @@ def _parse_usd(d: Dict[str, Any]) -> int:
 
 
 def _push_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
+
+def _notify_owners(title: str, body: str, order_id: Optional[int] = None):
+    conn = get_conn()
+    tokens: List[str] = []
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT token FROM public.owner_fcm_tokens")
+            tokens = [r[0] for r in cur.fetchall() or []]
+    except Exception as e:
+        logger.exception("read owner tokens failed: %s", e)
+    finally:
+        try: put_conn(conn)
+        except Exception: pass
+    if not tokens:
+        return
+    extra = {"for_owner": "1"}
+    for tk in tokens:
+        try:
+            _fcm_send_push(tk, title, body, order_id, extra_data=extra)
+        except Exception as ex:
+            logger.warning("owner push failed: %s", ex)
+
     """Push FCM without inserting a DB notification row (useful when a DB trigger already inserted)."""
     token = None
     try:
@@ -747,6 +777,7 @@ for path in PROVIDER_CREATE_PATHS:
                 ur = cur.fetchone()
                 if ur:
                     _notify_user(conn, ur[0], oid, "تم استلام طلبك", f"تم استلام طلب {p['service_name']}.")
+                _notify_owners("طلب جديد", f"طلب {p['service_name']} (ID={oid}) وصل للمالك.", oid)
             return {"ok": True, "order_id": oid}
         finally:
             put_conn(conn)
@@ -765,6 +796,7 @@ def create_manual_order(body: ManualOrderIn):
             """, (user_id, body.title))
             oid = cur.fetchone()[0]
         _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {body.title}.")
+        _notify_owners("طلب جديد", f"طلب {body.title} (ID={oid}) وصل للمالك.", oid)
         return {"ok": True, "order_id": oid}
     finally:
         put_conn(conn)
@@ -829,6 +861,7 @@ for path in ASIACELL_PATHS[1:]:
                 r = cur.fetchone()
                 if r:
                     _notify_user(conn, r[0], oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
+                _notify_owners("طلب جديد", f"طلب كارت أسيا سيل (ID={oid}) وصل للمالك.", oid)
             return {"ok": True, "order_id": oid, "status": "received"}
         finally:
             put_conn(conn)
@@ -2306,3 +2339,51 @@ def _alias_clear_pricing(body: PricingIn, x_admin_password: Optional[str] = Head
     return admin_clear_pricing(body, x_admin_password, password)
 
 
+
+
+# ===== Owner FCM tokens register/unregister =====
+class OwnerFcmIn(BaseModel):
+    fcm: str
+
+@app.post("/api/admin/fcm/register")
+def api_admin_fcm_register(body: OwnerFcmIn, x_admin_password: str = Header(None), password: Optional[str] = None):
+    pw = _pick_admin_password(x_admin_password, password, body.dict() if hasattr(body, "dict") else None)
+    _require_admin(pw or "")
+    token = (body.fcm or "").strip()
+    if not token:
+        raise HTTPException(422, "fcm required")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("INSERT INTO public.owner_fcm_tokens(token) VALUES(%s) ON CONFLICT (token) DO NOTHING", (token,))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/fcm/unregister")
+def api_admin_fcm_unregister(body: OwnerFcmIn, x_admin_password: str = Header(None), password: Optional[str] = None):
+    pw = _pick_admin_password(x_admin_password, password, body.dict() if hasattr(body, "dict") else None)
+    _require_admin(pw or "")
+    token = (body.fcm or "").strip()
+    if not token:
+        raise HTTPException(422, "fcm required")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM public.owner_fcm_tokens WHERE token=%s", (token,))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+@app.get("/api/admin/fcm/list")
+def api_admin_fcm_list(x_admin_password: str = Header(None), password: Optional[str] = None):
+    pw = _pick_admin_password(x_admin_password, password, None)
+    _require_admin(pw or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT token FROM public.owner_fcm_tokens ORDER BY created_at DESC")
+            rows = [r[0] for r in cur.fetchall() or []]
+        return {"ok": True, "tokens": rows}
+    finally:
+        put_conn(conn)
