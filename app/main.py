@@ -2,7 +2,6 @@
 import os
 import json
 import time
-from datetime import datetime
 import logging
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
@@ -43,25 +42,6 @@ def put_conn(conn: psycopg2.extensions.connection) -> None:
 # Logging
 # =========================
 logger = logging.getLogger("smm")
-
-
-def _fcm_config_status():
-    mode = None
-    details = {}
-    sa_json = (GOOGLE_APPLICATION_CREDENTIALS_JSON or "").strip()
-    if sa_json:
-        mode = "v1_service_account"
-        try:
-            info = json.loads(sa_json)
-            details["project_id"] = info.get("project_id") or (FCM_PROJECT_ID or None)
-        except Exception as e:
-            details["service_account_json_error"] = str(e)
-    elif FCM_SERVER_KEY:
-        mode = "legacy_server_key"
-        details["key_present"] = True
-    else:
-        mode = "not_configured"
-    return {"mode": mode, **details}
 logging.basicConfig(level=logging.INFO)
 
 
@@ -109,7 +89,7 @@ def _fcm_get_access_token_v1(sa_info: dict) -> Optional[str]:
         logger.info("pyjwt flow not available or failed: %s", e)
     return None
 
-def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int], sa_info: dict, project_id: Optional[str] = None, extra_data: Optional[dict] = None):
+def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int], sa_info: dict, project_id: Optional[str] = None):
     try:
         access_token = _fcm_get_access_token_v1(sa_info)
         if not access_token:
@@ -128,7 +108,6 @@ def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int],
                     "title": title,
                     "body": body,
                     "order_id": str(order_id or ""),
-                    **(extra_data or {}),
                 }
             }
         }
@@ -141,7 +120,7 @@ def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int],
     except Exception as ex:
         logger.exception("FCM v1 send exception: %s", ex)
 
-def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[int], server_key: str, extra_data: Optional[dict] = None):
+def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[int], server_key: str):
     try:
         headers = {
             "Authorization": f"key={server_key}",
@@ -151,7 +130,6 @@ def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[i
                 "title": title,
                 "body": body,
                 "order_id": str(order_id or ""),
-                    **(extra_data or {}),
             }
         }
         resp = requests.post("https://fcm.googleapis.com/fcm/send", headers=headers, json=payload, timeout=10)
@@ -160,25 +138,21 @@ def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[i
     except Exception as ex:
         logger.exception("FCM legacy send exception: %s", ex)
 
-def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Optional[int], extra_data: Optional[dict] = None):
+def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Optional[int]):
     if not fcm_token:
-        return
-    _cfg = _fcm_config_status()
-    if _cfg.get('mode') == 'not_configured':
-        logger.warning("FCM not configured: set GOOGLE_APPLICATION_CREDENTIALS_JSON or FCM_SERVER_KEY")
         return
     # Prefer v1 via Service Account JSON stored in env
     sa_json = (GOOGLE_APPLICATION_CREDENTIALS_JSON or "").strip()
     if sa_json:
         try:
             info = json.loads(sa_json)
-            _fcm_send_v1(fcm_token, title, body, order_id, info, project_id=(FCM_PROJECT_ID or None), extra_data=extra_data)
+            _fcm_send_v1(fcm_token, title, body, order_id, info, project_id=(FCM_PROJECT_ID or None))
             return
         except Exception as e:
             logger.info("Invalid GOOGLE_APPLICATION_CREDENTIALS_JSON: %s", e)
     # Fallback to legacy if configured
     if FCM_SERVER_KEY:
-        _fcm_send_legacy(fcm_token, title, body, order_id, FCM_SERVER_KEY, extra_data=extra_data)
+        _fcm_send_legacy(fcm_token, title, body, order_id, FCM_SERVER_KEY)
 # =========================
 # Schema & Triggers
 # =========================
@@ -271,16 +245,6 @@ def ensure_schema():
                         );
                     """)
 
-                    
-                        
-                    # owner FCM tokens (for admin/owner devices)
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS public.owner_fcm_tokens(
-                            token TEXT PRIMARY KEY,
-                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                        );
-                    """)
-
                     # user_notifications
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS public.user_notifications(
@@ -294,26 +258,10 @@ def ensure_schema():
                             read_at    TIMESTAMPTZ NULL
                         );
                     """)
-                    cur.execute("""
-                        CREATE INDEX IF NOT EXISTS ix_user_notifications_user_created
-                        ON public.user_notifications(user_id, created_at DESC);
-                    """)
-                    cur.execute("""
-                        CREATE INDEX IF NOT EXISTS ix_user_notifications_status
-                        ON public.user_notifications(status);
-                    """)
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_user_created ON public.user_notifications(user_id, created_at DESC);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);")
 
-                    # owner_notifications (for in-app owner bell)
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS public.owner_notifications(
-                            id BIGSERIAL PRIMARY KEY,
-                            order_id INTEGER NULL REFERENCES public.orders(id) ON DELETE SET NULL,
-                            title TEXT NOT NULL,
-                            body  TEXT NOT NULL,
-                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                        );
-                    """)
-# trigger: notify on wallet_txns insert (skip asiacell_topup or meta.no_notify)
+                    # trigger: notify on wallet_txns insert (skip asiacell_topup or meta.no_notify)
                     cur.execute("""
                         CREATE OR REPLACE FUNCTION public.wallet_txns_notify()
                         RETURNS trigger AS $$
@@ -484,72 +432,6 @@ def _parse_usd(d: Dict[str, Any]) -> int:
 
 
 def _push_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
-    try:
-        with conn.cursor() as cur:
-            try:
-                cur.execute(
-                    "INSERT INTO public.user_notifications(user_id, order_id, title, body) VALUES(%s,%s,%s,%s)",
-                    (user_id, order_id, title, body),
-                )
-            except Exception:
-                # table may not exist yet; ignore insert errors to not break main flow
-                pass
-            try:
-                cur.execute("SELECT fcm_token FROM public.users WHERE id=%s", (user_id,))
-                r = cur.fetchone()
-                if r and r[0]:
-                    try:
-                        _fcm_send_push(r[0], title, body, order_id, extra_data=None)
-                    except Exception as ex:
-                        logger.warning("user fcm send failed: %s", ex)
-            except Exception:
-                pass
-    except Exception as e:
-        logger.exception("_push_user failed: %s", e)
-def _notify_owners(title: str, body: str, order_id: Optional[int] = None):
-    conn = get_conn()
-    tokens: List[str] = []
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT token FROM public.owner_fcm_tokens")
-            tokens = [r[0] for r in cur.fetchall() or []]
-    except Exception as e:
-        logger.exception("read owner tokens failed: %s", e)
-    finally:
-        try: put_conn(conn)
-        except Exception: pass
-    if not tokens:
-        return
-    extra = {"for_owner": "1"}
-    for tk in tokens:
-        try:
-            _fcm_send_push(tk, title, body, order_id, extra_data=extra)
-        except Exception as ex:
-            logger.warning("owner push failed: %s", ex)
-
-# Unified helper to notify all owner devices when an order is created
-def _notify_owners_order_created(order_id: int, title: str):
-    try:
-        logger.info("owner_notify: order_created id=%s title=%s", order_id, title)
-    except Exception:
-        pass
-    try:
-        _notify_owners("طلب جديد", f"{title} (ID={order_id}) وصل للمالك.", order_id)
-    except Exception as ex:
-        logger.warning("owner_notify send failed: %s", ex)
-
-def _owner_notice_store(conn, title: str, body: str, order_id: Optional[int] = None):
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO public.owner_notifications(order_id, title, body) VALUES(%s, %s, %s)",
-                (order_id, title, body),
-            )
-    except Exception as e:
-        logger.warning("owner_notice_store failed: %s", e)
-
-
-
     """Push FCM without inserting a DB notification row (useful when a DB trigger already inserted)."""
     token = None
     try:
@@ -826,24 +708,6 @@ def create_provider_order(body: ProviderOrderIn):
             r = cur.fetchone()
             if r:
                 _notify_user(conn, r[0], oid, "تم استلام طلبك", f"تم استلام طلب {r[1]}.")
-
-        
-        try:
-        
-            _owner_notice_store(conn, f"طلب {p['service_name']}", f"تم إنشاء الطلب.", oid)
-        
-        except Exception as _ex:
-        
-            logger.warning("owner_store error: %s", _ex)
-        
-        try:
-        
-            _notify_owners_order_created(oid, f"طلب {p['service_name']}")
-        
-        except Exception as _ex:
-        
-            logger.warning("owner_notify error: %s", _ex)
-        _notify_owners_order_created(oid, 'طلب يدوي مدفوع')
         return {"ok": True, "order_id": oid}
     finally:
         put_conn(conn)
@@ -883,7 +747,6 @@ for path in PROVIDER_CREATE_PATHS:
                 ur = cur.fetchone()
                 if ur:
                     _notify_user(conn, ur[0], oid, "تم استلام طلبك", f"تم استلام طلب {p['service_name']}.")
-                _notify_owners("طلب جديد", f"طلب {p['service_name']} (ID={oid}) وصل للمالك.", oid)
             return {"ok": True, "order_id": oid}
         finally:
             put_conn(conn)
@@ -902,7 +765,6 @@ def create_manual_order(body: ManualOrderIn):
             """, (user_id, body.title))
             oid = cur.fetchone()[0]
         _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {body.title}.")
-        _notify_owners("طلب جديد", f"طلب {body.title} (ID={oid}) وصل للمالك.", oid)
         return {"ok": True, "order_id": oid}
     finally:
         put_conn(conn)
@@ -943,23 +805,6 @@ def submit_asiacell(body: AsiacellSubmitIn):
             r = cur.fetchone()
             if r:
                 _notify_user(conn, r[0], oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
-
-        
-        try:
-        
-            _owner_notice_store(conn, f"طلب {p['service_name']}", f"تم إنشاء الطلب.", oid)
-        
-        except Exception as _ex:
-        
-            logger.warning("owner_store error: %s", _ex)
-        
-        try:
-        
-            _notify_owners_order_created(oid, f"طلب {p['service_name']}")
-        
-        except Exception as _ex:
-        
-            logger.warning("owner_notify error: %s", _ex)
         return {"ok": True, "order_id": oid, "status": "received"}
     finally:
         put_conn(conn)
@@ -984,7 +829,6 @@ for path in ASIACELL_PATHS[1:]:
                 r = cur.fetchone()
                 if r:
                     _notify_user(conn, r[0], oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
-                _notify_owners("طلب جديد", f"طلب كارت أسيا سيل (ID={oid}) وصل للمالك.", oid)
             return {"ok": True, "order_id": oid, "status": "received"}
         finally:
             put_conn(conn)
@@ -1211,30 +1055,6 @@ async def create_manual_paid(request: Request):
         body = title + (f" | ID: {account_id}" if account_id else "")
         _notify_user(conn, user_id, oid, "تم استلام طلبك", body)
 
-
-        
-        try:
-
-        
-            _owner_notice_store(conn, f"طلب {p['service_name']}", f"تم إنشاء الطلب.", oid)
-
-        
-        except Exception as _ex:
-
-        
-            logger.warning("owner_store error: %s", _ex)
-
-        
-        try:
-
-        
-            _notify_owners_order_created(oid, f"طلب {p['service_name']}")
-
-        
-        except Exception as _ex:
-
-        
-            logger.warning("owner_notify error: %s", _ex)
         return {"ok": True, "order_id": oid, "charged": float(price)}
     finally:
         put_conn(conn)
@@ -2068,10 +1888,7 @@ def admin_set_service_id(
                 VALUES(%s,%s)
                 ON CONFLICT (ui_key) DO UPDATE SET service_id=EXCLUDED.service_id, created_at=now()
             """, (body.ui_key, int(body.service_id)))
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM public.owner_fcm_tokens")
-            c = cur.fetchone()[0]
-        return {"ok": True, "owner_tokens": int(c)}
+        return {"ok": True}
     finally:
         put_conn(conn)
 
@@ -2089,10 +1906,7 @@ def admin_clear_service_id(
         with conn, conn.cursor() as cur:
             _ensure_overrides_table(cur)
             cur.execute("DELETE FROM public.service_id_overrides WHERE ui_key=%s", (body.ui_key,))
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM public.owner_fcm_tokens")
-            c = cur.fetchone()[0]
-        return {"ok": True, "owner_tokens": int(c)}
+        return {"ok": True}
     finally:
         put_conn(conn)
 
@@ -2162,10 +1976,7 @@ def admin_set_pricing(
                 VALUES(%s,%s,%s,%s,COALESCE(%s,'per_k'), now())
                 ON CONFLICT (ui_key) DO UPDATE SET price_per_k=EXCLUDED.price_per_k, min_qty=EXCLUDED.min_qty, max_qty=EXCLUDED.max_qty, mode=COALESCE(EXCLUDED.mode,'per_k'), updated_at=now()
             """, (body.ui_key, Decimal(body.price_per_k), int(body.min_qty), int(body.max_qty), (body.mode or 'per_k')))
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM public.owner_fcm_tokens")
-            c = cur.fetchone()[0]
-        return {"ok": True, "owner_tokens": int(c)}
+        return {"ok": True}
     finally:
         put_conn(conn)
 
@@ -2184,10 +1995,7 @@ def admin_clear_pricing(
             _ensure_pricing_table(cur)
             _ensure_pricing_mode_column(cur)
             cur.execute("DELETE FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM public.owner_fcm_tokens")
-            c = cur.fetchone()[0]
-        return {"ok": True, "owner_tokens": int(c)}
+        return {"ok": True}
     finally:
         put_conn(conn)
 
@@ -2295,10 +2103,7 @@ def admin_set_order_pricing(
             """, (oid, Decimal(body.price)))
             # reflect immediately on orders.price for UI consistency
             cur.execute("UPDATE public.orders SET price=%s WHERE id=%s", (Decimal(body.price), oid))
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM public.owner_fcm_tokens")
-            c = cur.fetchone()[0]
-        return {"ok": True, "owner_tokens": int(c)}
+        return {"ok": True}
     finally:
         put_conn(conn)
 
@@ -2316,10 +2121,7 @@ def admin_clear_order_pricing(
         with conn, conn.cursor() as cur:
             _ensure_order_pricing_table(cur)
             cur.execute("DELETE FROM public.order_pricing_overrides WHERE order_id=%s", (int(body.order_id),))
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM public.owner_fcm_tokens")
-            c = cur.fetchone()[0]
-        return {"ok": True, "owner_tokens": int(c)}
+        return {"ok": True}
     finally:
         put_conn(conn)
 
@@ -2381,10 +2183,7 @@ def admin_set_order_quantity(
                         eff_price = float(Decimal(body.quantity) * Decimal(ppk) / Decimal(1000))
                         cur.execute("UPDATE public.orders SET price=%s WHERE id=%s", (Decimal(eff_price), oid))
 
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM public.owner_fcm_tokens")
-            c = cur.fetchone()[0]
-        return {"ok": True, "owner_tokens": int(c)}
+        return {"ok": True}
     finally:
         put_conn(conn)
 
@@ -2507,136 +2306,3 @@ def _alias_clear_pricing(body: PricingIn, x_admin_password: Optional[str] = Head
     return admin_clear_pricing(body, x_admin_password, password)
 
 
-
-
-# ===== Owner FCM tokens register/unregister =====
-class OwnerFcmIn(BaseModel):
-    fcm: str
-
-@app.post("/api/admin/fcm/register")
-def api_admin_fcm_register(body: OwnerFcmIn, x_admin_password: str = Header(None), password: Optional[str] = None):
-    pw = _pick_admin_password(x_admin_password, password, body.dict() if hasattr(body, "dict") else None)
-    _require_admin(pw or "")
-    token = (body.fcm or "").strip()
-    if not token:
-        raise HTTPException(422, "fcm required")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("INSERT INTO public.owner_fcm_tokens(token) VALUES(%s) ON CONFLICT (token) DO NOTHING", (token,))
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM public.owner_fcm_tokens")
-            c = cur.fetchone()[0]
-        return {"ok": True, "owner_tokens": int(c)}
-    finally:
-        put_conn(conn)
-
-@app.post("/api/admin/fcm/unregister")
-def api_admin_fcm_unregister(body: OwnerFcmIn, x_admin_password: str = Header(None), password: Optional[str] = None):
-    pw = _pick_admin_password(x_admin_password, password, body.dict() if hasattr(body, "dict") else None)
-    _require_admin(pw or "")
-    token = (body.fcm or "").strip()
-    if not token:
-        raise HTTPException(422, "fcm required")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("DELETE FROM public.owner_fcm_tokens WHERE token=%s", (token,))
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM public.owner_fcm_tokens")
-            c = cur.fetchone()[0]
-        return {"ok": True, "owner_tokens": int(c)}
-    finally:
-        put_conn(conn)
-
-@app.get("/api/admin/fcm/list")
-
-
-class OwnerFcmTestIn(BaseModel):
-    title: str = "اختبار إشعار للمالك"
-    body: str = "هذه رسالة اختبار FCM للمالك."
-    order_id: Optional[int] = None
-
-@app.post("/api/admin/fcm/test")
-def api_admin_fcm_test(body: OwnerFcmTestIn, x_admin_password: str = Header(None), password: Optional[str] = None):
-    pw = _pick_admin_password(x_admin_password, password, body.dict() if hasattr(body, "dict") else None)
-    _require_admin(pw or "")
-    conn = get_conn()
-    tokens = []
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT token FROM public.owner_fcm_tokens")
-            tokens = [r[0] for r in cur.fetchall() or []]
-    finally:
-        put_conn(conn)
-    if not tokens:
-        return {"ok": False, "error": "no owner tokens registered"}
-    sent = 0
-    for tk in tokens:
-        try:
-            _fcm_send_push(tk, body.title, body.body, body.order_id, extra_data={"for_owner": "1"})
-            sent += 1
-        except Exception as ex:
-            logger.warning("owner test push failed: %s", ex)
-    return {"ok": True, "sent": sent}
-
-
-@app.get("/api/admin/fcm/debug")
-def api_admin_fcm_debug(x_admin_password: str = Header(None), password: Optional[str] = None):
-    pw = _pick_admin_password(x_admin_password, password, None)
-    _require_admin(pw or "")
-    cfg = _fcm_config_status()
-    conn = get_conn()
-    count = 0
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM public.owner_fcm_tokens")
-            r = cur.fetchone()
-            count = (r[0] if r else 0) or 0
-    finally:
-        put_conn(conn)
-    return {"ok": True, "owner_tokens": count, "fcm": cfg}
-
-
-class OwnerNoticeOut(BaseModel):
-    order_id: Optional[int] = None
-    title: str
-    body: str
-    ts: int
-
-@app.get("/api/admin/notices/list")
-def api_admin_owner_notices_list(request: Request, x_admin_password: str = Header(None), password: Optional[str] = None, after_ts: Optional[int] = None, limit: int = 100):
-    pw = _pick_admin_password(x_admin_password, password, None)
-    _require_admin(pw or "")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            if after_ts and after_ts > 0:
-                cur.execute(
-                    "SELECT order_id, title, body, EXTRACT(EPOCH FROM created_at)::bigint*1000 FROM public.owner_notifications WHERE created_at > to_timestamp(%s/1000.0) ORDER BY id ASC LIMIT %s",
-                    (after_ts, max(10, min(limit, 500))),  # clamp
-                )
-            else:
-                cur.execute(
-                    "SELECT order_id, title, body, EXTRACT(EPOCH FROM created_at)::bigint*1000 FROM public.owner_notifications ORDER BY id DESC LIMIT %s",
-                    (max(10, min(limit, 500)),),
-                )
-            rows = cur.fetchall() or []
-        items = [{"order_id": r[0], "title": r[1], "body": r[2], "ts": int(r[3] or 0)} for r in rows]
-        return {"ok": True, "items": items}
-    finally:
-        put_conn(conn)
-def api_admin_fcm_list(x_admin_password: str = Header(None), password: Optional[str] = None):
-    pw = _pick_admin_password(x_admin_password, password, None)
-    _require_admin(pw or "")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT token FROM public.owner_fcm_tokens ORDER BY created_at DESC")
-            rows = [r[0] for r in cur.fetchall() or []]
-        return {"ok": True, "tokens": rows}
-    finally:
-        put_conn(conn)
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "ts": int(time.time())}
