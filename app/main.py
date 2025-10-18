@@ -25,6 +25,7 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "2000")
 FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "").strip()
 GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
 FCM_PROJECT_ID = os.getenv("FCM_PROJECT_ID", "").strip()  # optional override
+OWNER_UID = os.getenv("OWNER_UID", "OWNER-0001").strip()
 
 PROVIDER_API_URL = os.getenv("PROVIDER_API_URL", "https://kd1s.com/api/v2")
 PROVIDER_API_KEY = os.getenv("PROVIDER_API_KEY", "25a9ceb07be0d8b2ba88e70dcbe92e06")
@@ -179,7 +180,19 @@ def ensure_schema():
                     cur.execute("ALTER TABLE public.users ADD COLUMN IF NOT EXISTS fcm_token TEXT;")
 
 
-                    # wallet_txns
+                    
+# user_devices (multi-device FCM tokens)
+cur.execute("""
+    CREATE TABLE IF NOT EXISTS public.user_devices(
+        id BIGSERIAL PRIMARY KEY,
+        uid TEXT NOT NULL,
+        fcm_token TEXT NOT NULL UNIQUE,
+        platform TEXT DEFAULT 'android',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+""")
+cur.execute("CREATE INDEX IF NOT EXISTS idx_user_devices_uid ON public.user_devices(uid);")
+# wallet_txns
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS public.wallet_txns(
                             id         SERIAL PRIMARY KEY,
@@ -322,6 +335,20 @@ app.add_middleware(
 )
 
 # ===== Helpers =====
+
+def _tokens_for_uid(cur, uid: str):
+    """Return list of FCM tokens for a uid from user_devices or fallback to users.fcm_token"""
+    try:
+        cur.execute("SELECT fcm_token FROM public.user_devices WHERE uid=%s", (uid,))
+        rows = cur.fetchall()
+        toks = [r[0] for r in rows if r and r[0]]
+        if toks:
+            return toks
+    except Exception:
+        pass
+    cur.execute("SELECT fcm_token FROM public.users WHERE uid=%s", (uid,))
+    r = cur.fetchone()
+    return [r[0]] if r and r[0] else []
 def _require_admin(passwd: str):
     if passwd != ADMIN_PASSWORD:
         raise HTTPException(401, "bad admin password")
@@ -348,6 +375,43 @@ async def _read_json_object(request: Request) -> Dict[str, Any]:
     return data
 
 def _notify_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
+
+def _notify_owner_new_order(conn, order_id: int):
+    """Insert DB notification for OWNER and send FCM (same table as user)."""
+    title = "طلب جديد"
+    body = f"طلب جديد رقم {order_id}"
+    tokens = []
+    try:
+        with conn, conn.cursor() as cur:
+            # enrich body with order title + user uid if available
+            try:
+                cur.execute("""
+                    SELECT o.title, u.uid
+                    FROM public.orders o
+                    LEFT JOIN public.users u ON u.id = o.user_id
+                    WHERE o.id=%s
+                """, (order_id,))
+                row = cur.fetchone()
+                if row:
+                    otitle = row[0] or ""
+                    u_uid = row[1] or ""
+                    body = f"طلب جديد رقم {order_id}: {otitle}" + (f" | UID: {u_uid}" if u_uid else "")
+            except Exception:
+                pass
+            owner_id = _ensure_owner_user_id(cur)
+            cur.execute(
+                "INSERT INTO public.user_notifications(user_id, order_id, title, body, status, created_at) "
+                "VALUES (%s,%s,%s,%s,'unread', NOW())",
+                (owner_id, order_id, title, body)
+            )
+            tokens = _tokens_for_uid(cur, OWNER_UID)
+    except Exception as e:
+        logger.exception("owner notify (db) failed: %s", e)
+    for t in tokens:
+        try:
+            _fcm_send_push(t, title, body, order_id)
+        except Exception as e:
+            logger.exception("owner notify (push) failed: %s", e)
     """
     Insert a notification row AND immediately push an FCM message to the user's device (best-effort).
     """
@@ -505,6 +569,14 @@ def health():
 # Internal helpers
 # =========================
 def _ensure_user(cur, uid: str) -> int:
+
+def _ensure_owner_user_id(cur) -> int:
+    cur.execute("SELECT id FROM public.users WHERE uid=%s", (OWNER_UID,))
+    r = cur.fetchone()
+    if r and r[0]:
+        return int(r[0])
+    cur.execute("INSERT INTO public.users(uid) VALUES(%s) RETURNING id", (OWNER_UID,))
+    return int(cur.fetchone()[0])
     cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
     r = cur.fetchone()
     if r:
@@ -567,8 +639,18 @@ def api_users_fcm_token(body: FcmTokenIn):
                 user_id = cur.fetchone()[0]
             else:
                 user_id = r[0]
-            cur.execute("UPDATE public.users SET fcm_token=%s WHERE id=%s", (fcm, user_id))
-        return {"ok": True, "uid": uid}
+            
+    cur.execute("UPDATE public.users SET fcm_token=%s WHERE id=%s", (fcm, user_id))
+    # upsert into user_devices
+    try:
+        cur.execute("""
+            INSERT INTO public.user_devices(uid, fcm_token, platform)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (fcm_token) DO UPDATE SET uid=EXCLUDED.uid, platform=COALESCE(EXCLUDED.platform,'android'), updated_at=NOW()
+        """, (uid, fcm, 'android'))
+    except Exception:
+        pass
+return {"ok": True, "uid": uid}
     finally:
         put_conn(conn)
 # ---- Wallet balance (with several aliases to match the app) ----
@@ -881,6 +963,10 @@ def user_orders_list(uid: str):
     return {"orders": _orders_for_uid(uid)}
 
 # =========================
+
+@app.get("/api/notifications/by_uid")
+def _alias_notifications_by_uid(uid: str, status: str = "unread", limit: int = 50):
+    return list_user_notifications(uid=uid, status=status, limit=limit)
 # Notifications
 # =========================
 @app.get("/api/user/by-uid/{uid}/notifications")
@@ -2306,3 +2392,28 @@ def _alias_clear_pricing(body: PricingIn, x_admin_password: Optional[str] = Head
     return admin_clear_pricing(body, x_admin_password, password)
 
 
+
+
+class TestPushIn(BaseModel):
+    title: str = "طلب جديد (اختبار)"
+    body: str = "هذا إشعار تجريبي للمالك"
+    order_id: Optional[int] = None
+
+@app.post("/api/test/push_owner")
+def test_push_owner(p: TestPushIn):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            owner_id = _ensure_owner_user_id(cur)
+            cur.execute(
+                "INSERT INTO public.user_notifications(user_id, order_id, title, body, status) VALUES (%s,%s,%s,%s,'unread')",
+                (owner_id, p.order_id, p.title, p.body)
+            )
+            toks = _tokens_for_uid(cur, OWNER_UID)
+        sent = 0
+        for t in toks:
+            _fcm_send_push(t, p.title, p.body, p.order_id)
+            sent += 1
+        return {"ok": True, "sent": sent, "owner_uid": OWNER_UID}
+    finally:
+        put_conn(conn)
