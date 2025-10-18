@@ -261,24 +261,6 @@ def ensure_schema():
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_user_created ON public.user_notifications(user_id, created_at DESC);")
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);")
 
-
-                    -- admin_devices: stores FCM tokens for all owner devices
-                    CREATE TABLE IF NOT EXISTS public.admin_devices(
-                        fcm_token TEXT PRIMARY KEY,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    );
-                    -- admin_notifications: every user order creates a row for owner inbox
-                    CREATE TABLE IF NOT EXISTS public.admin_notifications(
-                        id BIGSERIAL PRIMARY KEY,
-                        order_id BIGINT NULL,
-                        title TEXT NOT NULL,
-                        body  TEXT NOT NULL,
-                        status TEXT NOT NULL DEFAULT 'unread',
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        read_at    TIMESTAMPTZ NULL
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_admin_notifications_created ON public.admin_notifications(created_at DESC);
-                    CREATE INDEX IF NOT EXISTS idx_admin_notifications_status ON public.admin_notifications(status);
                     # trigger: notify on wallet_txns insert (skip asiacell_topup or meta.no_notify)
                     cur.execute("""
                         CREATE OR REPLACE FUNCTION public.wallet_txns_notify()
@@ -391,34 +373,6 @@ def _notify_user(conn, user_id: int, order_id: Optional[int], title: str, body: 
     except Exception as e:
         logger.exception("push error (ignored): %s", e)
 
-
-def _notify_admin(conn, order_id: Optional[int], title: str, body: str):
-    """
-    Insert a notification row for owner AND push FCM to all admin devices (best-effort).
-    """
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO public.admin_notifications(order_id, title, body, status, created_at) VALUES(%s,%s,%s,'unread',NOW()) RETURNING id",
-                    (order_id, title, body)
-                )
-    except Exception as e:
-        logger.exception("admin notify failed (DB): %s", e)
-
-    try:
-        # broadcast to all admin device tokens
-        with conn.cursor() as cur:
-            cur.execute("SELECT fcm_token FROM public.admin_devices")
-            rows = cur.fetchall()
-        for (fcm_token,) in rows:
-            try:
-                _fcm_send_push(fcm_token, title, body, order_id)
-            except Exception as e:
-                logger.info("push to admin device failed: %s", e)
-    except Exception as e:
-        logger.info("admin devices fetch failed: %s", e)
-
 def _needs_code(title: str, otype: Optional[str]) -> bool:
     t = (title or "").lower()
     if (otype or "").lower() == "topup_card":
@@ -430,60 +384,6 @@ def _needs_code(title: str, otype: Optional[str]) -> bool:
 
 # Admin auth compatibility helper
 def _pick_admin_password(header_val: Optional[str], password_qs: Optional[str], body: Optional[Dict[str, Any]] = None) -> Optional[str]:
-
-# ============ Admin FCM & Notifications ============
-class AdminFcmIn(BaseModel):
-    fcm: str = Field(...)
-
-@app.post("/api/admin/fcm_token")
-def admin_set_fcm_token(body: AdminFcmIn, x_admin_password: Optional[str] = Header(None)):
-    passwd = _pick_admin_password(x_admin_password)
-    if passwd != ADMIN_PASSWORD:
-        raise HTTPException(401, "bad admin password")
-    token = body.fcm.strip()
-    if not token:
-        raise HTTPException(422, "empty fcm")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("INSERT INTO public.admin_devices(fcm_token) VALUES(%s) ON CONFLICT (fcm_token) DO NOTHING", (token,))
-        return {"ok": True}
-    finally:
-        put_conn(conn)
-
-@app.get("/api/admin/notifications")
-def admin_list_notifications(status: str = "unread", limit: int = 50, x_admin_password: Optional[str] = Header(None)):
-    passwd = _pick_admin_password(x_admin_password)
-    if passwd != ADMIN_PASSWORD:
-        raise HTTPException(401, "bad admin password")
-    status = status.lower().strip()
-    if status not in ("unread","read","all"):
-        status = "unread"
-    conn = get_conn()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if status == "all":
-                cur.execute("SELECT id, order_id, title, body, EXTRACT(EPOCH FROM created_at)*1000 AS ts FROM public.admin_notifications ORDER BY created_at DESC LIMIT %s", (limit,))
-            else:
-                cur.execute("SELECT id, order_id, title, body, EXTRACT(EPOCH FROM created_at)*1000 AS ts FROM public.admin_notifications WHERE status=%s ORDER BY created_at DESC LIMIT %s", (status, limit))
-            rows = cur.fetchall()
-        return rows
-    finally:
-        put_conn(conn)
-
-@app.post("/api/admin/notifications/{nid}/read")
-def admin_mark_notification_read(nid: int, x_admin_password: Optional[str] = Header(None)):
-    passwd = _pick_admin_password(x_admin_password)
-    if passwd != ADMIN_PASSWORD:
-        raise HTTPException(401, "bad admin password")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("UPDATE public.admin_notifications SET status='read', read_at=NOW() WHERE id=%s", (nid,))
-        return {"ok": True}
-    finally:
-        put_conn(conn)
-
     cand = header_val or password_qs
     if not cand and body:
         cand = body.get("password") or body.get("admin_password") or body.get("x-admin-password")
@@ -808,7 +708,6 @@ def create_provider_order(body: ProviderOrderIn):
             r = cur.fetchone()
             if r:
                 _notify_user(conn, r[0], oid, "تم استلام طلبك", f"تم استلام طلب {r[1]}.")
-                _notify_admin(conn, oid, "طلب جديد", f"تم استلام طلب {r[1]}.")
         return {"ok": True, "order_id": oid}
     finally:
         put_conn(conn)
@@ -866,7 +765,6 @@ def create_manual_order(body: ManualOrderIn):
             """, (user_id, body.title))
             oid = cur.fetchone()[0]
         _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {body.title}.")
-        _notify_admin(conn, oid, "طلب جديد", f"تم استلام طلب {body.title}.")
         return {"ok": True, "order_id": oid}
     finally:
         put_conn(conn)
@@ -907,7 +805,6 @@ def submit_asiacell(body: AsiacellSubmitIn):
             r = cur.fetchone()
             if r:
                 _notify_user(conn, r[0], oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
-        _notify_admin(conn, oid, "طلب جديد", "تم استلام طلب كارت أسيا سيل.")
         return {"ok": True, "order_id": oid, "status": "received"}
     finally:
         put_conn(conn)
@@ -932,7 +829,6 @@ for path in ASIACELL_PATHS[1:]:
                 r = cur.fetchone()
                 if r:
                     _notify_user(conn, r[0], oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
-        _notify_admin(conn, oid, "طلب جديد", "تم استلام طلب كارت أسيا سيل.")
             return {"ok": True, "order_id": oid, "status": "received"}
         finally:
             put_conn(conn)
@@ -1158,7 +1054,6 @@ async def create_manual_paid(request: Request):
         # optional: immediate user notification (order received)
         body = title + (f" | ID: {account_id}" if account_id else "")
         _notify_user(conn, user_id, oid, "تم استلام طلبك", body)
-        _notify_admin(conn, oid, "طلب جديد", body)
 
         return {"ok": True, "order_id": oid, "charged": float(price)}
     finally:
