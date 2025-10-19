@@ -2669,8 +2669,8 @@ def _bg_provider_sync_once(limit:int=200, min_interval_sec:int=60):
         put_conn(conn)
 
 def _bg_provider_sync_loop():
-    interval = int(os.getenv("SYNC_PROVIDER_INTERVAL_SEC", "30"))
-    min_interval_sec = max(15, int(os.getenv("SYNC_PROVIDER_MIN_INTERVAL_SEC", "60")))
+    interval = int(os.getenv("SYNC_PROVIDER_INTERVAL_SEC", "5"))
+    min_interval_sec = max(15, int(os.getenv("SYNC_PROVIDER_MIN_INTERVAL_SEC", "5")))
     while True:
         try:
             _bg_provider_sync_once(limit=200, min_interval_sec=min_interval_sec)
