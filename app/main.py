@@ -391,38 +391,49 @@ async def _read_json_object(request: Request) -> Dict[str, Any]:
     return data
 
 
-def _notify_user(_conn_ignored, user_id: int, order_id: Optional[int], title: str, body: str):
+def _notify_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
     """
-    SAFE: open a fresh DB connection (no recursive re-entry).
+    SAFE: Reuse provided DB connection if available to avoid pool exhaustion.
     Inserts DB notification + pushes FCM to all user's devices.
     """
-    c = get_conn()
-    try:
-        uid = None
-        tokens: List[str] = []
+    def _insert_and_fetch(cur):
+        cur.execute(
+            "INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at) "
+            "VALUES (%s,%s,%s,%s,'unread', NOW())",
+            (user_id, order_id, title, body)
+        )
+        cur.execute("SELECT uid FROM public.users WHERE id=%s", (user_id,))
+        row = cur.fetchone()
+        uid = row[0] if row else None
+        tokens = _tokens_for_uid(cur, uid) if uid else []
+        return tokens
+
+    tokens = []
+    # Prefer reusing the given connection if it looks valid
+    if conn is not None:
+        try:
+            with conn.cursor() as cur:
+                tokens = _insert_and_fetch(cur)
+        except Exception as e:
+            logger.exception("notify (reuse-conn) failed, fallback to new conn: %s", e)
+            conn = None  # fallback below
+
+    if conn is None:
+        c = get_conn()
         try:
             with c, c.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at) "
-                    "VALUES (%s,%s,%s,%s,'unread', NOW())",
-                    (user_id, order_id, title, body)
-                )
-                cur.execute("SELECT uid FROM public.users WHERE id=%s", (user_id,))
-                row = cur.fetchone()
-                uid = row[0] if row else None
-                if uid:
-                    tokens = _tokens_for_uid(cur, uid)
+                tokens = _insert_and_fetch(cur)
         except Exception as e:
-            logger.exception("notify user failed (DB): %s", e)
+            logger.exception("notify (new-conn) failed: %s", e)
+        finally:
+            put_conn(c)
 
-        for t in tokens:
-            try:
-                _fcm_send_push(t, title, body, order_id)
-            except Exception as e:
-                logger.exception("notify user push error: %s", e)
-    finally:
-        put_conn(c)
-
+    # Send FCM outside transaction
+    for t in tokens or []:
+        try:
+            _fcm_send_push(t, title, body, order_id)
+        except Exception as e:
+            logger.exception("notify push error: %s", e)
 def _ensure_user(cur, uid: str) -> int:
     cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
     r = cur.fetchone()
