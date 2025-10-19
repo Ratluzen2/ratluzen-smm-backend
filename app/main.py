@@ -801,17 +801,21 @@ def _create_provider_order_core(cur, uid: str, service_id: Optional[int], servic
 def create_provider_order(body: ProviderOrderIn):
     conn = get_conn()
     try:
+        # create order & collect data inside txn
         with conn, conn.cursor() as cur:
             oid = _create_provider_order_core(
                 cur, body.uid, body.service_id, body.service_name,
                 body.link, body.quantity, body.price
             )
-            # Notify user
+            # collect needed fields but DO NOT notify yet (commit first)
             cur.execute("SELECT user_id, title FROM public.orders WHERE id=%s", (oid,))
-            r = cur.fetchone()
-            if r:
-                _notify_user(conn, r[0], oid, "تم استلام طلبك", f"تم استلام طلب {r[1]}.")
-        # Notify owner (after commit)
+            row = cur.fetchone()
+            user_id = row[0] if row else None
+            title = row[1] if row else body.service_name
+
+        # now outside transaction (COMMITTED): safe to notify
+        if user_id:
+            _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {title}.")
         _notify_owner_new_order(conn, oid)
         return {"ok": True, "order_id": oid}
     finally:
@@ -846,13 +850,17 @@ for path in PROVIDER_CREATE_PATHS:
             raise HTTPException(422, "invalid payload")
         conn = get_conn()
         try:
+            # Do all DB writes first
             with conn, conn.cursor() as cur:
                 oid = _create_provider_order_core(cur, p["uid"], p["service_id"], p["service_name"], p["link"], p["quantity"], p["price"])
+                # collect user_id for notify after commit
                 cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
                 ur = cur.fetchone()
-                if ur:
-                    _notify_user(conn, ur[0], oid, "تم استلام طلبك", f"تم استلام طلب {p['service_name']}.")
-            # owner push
+                user_id = ur[0] if ur else None
+
+            # After COMMIT: push notifications
+            if user_id:
+                _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {p['service_name']}.")
             _notify_owner_new_order(conn, oid)
             return {"ok": True, "order_id": oid}
         finally:
@@ -909,10 +917,14 @@ def submit_asiacell(body: AsiacellSubmitIn):
     try:
         with conn, conn.cursor() as cur:
             oid = _asiacell_submit_core(cur, body.uid, digits)
+            # collect user_id for notify after commit
             cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
             r = cur.fetchone()
-            if r:
-                _notify_user(conn, r[0], oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
+            user_id = r[0] if r else None
+
+        # After COMMIT: push notifications
+        if user_id:
+            _notify_user(conn, user_id, oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
         _notify_owner_new_order(conn, oid)
         return {"ok": True, "order_id": oid, "status": "received"}
     finally:
