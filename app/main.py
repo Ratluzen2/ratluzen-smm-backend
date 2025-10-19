@@ -391,49 +391,69 @@ async def _read_json_object(request: Request) -> Dict[str, Any]:
     return data
 
 
-def _notify_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
+def _notify_user(_conn_ignored, user_id: int, order_id: Optional[int], title: str, body: str):
     """
-    SAFE: Reuse provided DB connection if available to avoid pool exhaustion.
+    SAFE: open a fresh DB connection (no recursive re-entry).
     Inserts DB notification + pushes FCM to all user's devices.
     """
-    def _insert_and_fetch(cur):
-        cur.execute(
-            "INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at) "
-            "VALUES (%s,%s,%s,%s,'unread', NOW())",
-            (user_id, order_id, title, body)
-        )
-        cur.execute("SELECT uid FROM public.users WHERE id=%s", (user_id,))
-        row = cur.fetchone()
-        uid = row[0] if row else None
-        tokens = _tokens_for_uid(cur, uid) if uid else []
-        return tokens
-
-    tokens = []
-    # Prefer reusing the given connection if it looks valid
-    if conn is not None:
-        try:
-            with conn.cursor() as cur:
-                tokens = _insert_and_fetch(cur)
-        except Exception as e:
-            logger.exception("notify (reuse-conn) failed, fallback to new conn: %s", e)
-            conn = None  # fallback below
-
-    if conn is None:
-        c = get_conn()
+    c = get_conn()
+    try:
+        uid = None
+        tokens: List[str] = []
         try:
             with c, c.cursor() as cur:
-                tokens = _insert_and_fetch(cur)
+                cur.execute(
+                    "INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at) "
+                    "VALUES (%s,%s,%s,%s,'unread', NOW())",
+                    (user_id, order_id, title, body)
+                )
+                cur.execute("SELECT uid FROM public.users WHERE id=%s", (user_id,))
+                row = cur.fetchone()
+                uid = row[0] if row else None
+                if uid:
+                    tokens = _tokens_for_uid(cur, uid)
         except Exception as e:
-            logger.exception("notify (new-conn) failed: %s", e)
-        finally:
-            put_conn(c)
+            logger.exception("notify user failed (DB): %s", e)
 
-    # Send FCM outside transaction
-    for t in tokens or []:
+        for t in tokens:
+            try:
+                _fcm_send_push(t, title, body, order_id)
+            except Exception as e:
+                logger.exception("notify user push error: %s", e)
+    finally:
+        put_conn(c)
+
+def _insert_user_inbox_safe(user_id: int, order_id: Optional[int], title: str, body: str) -> None:
+    """
+    Insert a notification row into public.user_notifications, idempotently.
+    Uses a fresh DB connection so it's safe to call from anywhere.
+    """
+    c = get_conn()
+    try:
+        with c, c.cursor() as cur:
+            try:
+                cur.execute("""
+                    INSERT INTO public.user_notifications(user_id, order_id, title, body, status, created_at)
+                    SELECT %s,%s,%s,%s,'unread', NOW()
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM public.user_notifications
+                        WHERE user_id=%s AND COALESCE(order_id, -1)=COALESCE(%s, -1)
+                          AND title=%s AND body=%s
+                          AND created_at > NOW() - INTERVAL '10 minutes'
+                    )
+                """, (user_id, order_id, title, body, user_id, order_id, title, body))
+            except Exception as ee:
+                try:
+                    logger.exception("inbox insert failed: %s", ee)
+                except Exception:
+                    pass
+    finally:
         try:
-            _fcm_send_push(t, title, body, order_id)
-        except Exception as e:
-            logger.exception("notify push error: %s", e)
+            put_conn(c)
+        except Exception:
+            pass
+
+
 def _ensure_user(cur, uid: str) -> int:
     cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
     r = cur.fetchone()
@@ -827,6 +847,10 @@ def create_provider_order(body: ProviderOrderIn):
         # now outside transaction (COMMITTED): safe to notify
         if user_id:
             _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {title}.")
+            try:
+                _insert_user_inbox_safe(user_id, oid, "تم استلام طلبك", "تم استلام طلبك")
+            except Exception:
+                pass
         _notify_owner_new_order(conn, oid)
         return {"ok": True, "order_id": oid}
     finally:
@@ -872,6 +896,10 @@ for path in PROVIDER_CREATE_PATHS:
             # After COMMIT: push notifications
             if user_id:
                 _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {p['service_name']}.")
+                try:
+                    _insert_user_inbox_safe(user_id, oid, "تم استلام طلبك", "تم استلام طلبك")
+                except Exception:
+                    pass
             _notify_owner_new_order(conn, oid)
             return {"ok": True, "order_id": oid}
         finally:
@@ -891,6 +919,10 @@ def create_manual_order(body: ManualOrderIn):
             """, (user_id, body.title))
             oid = cur.fetchone()[0]
         _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {body.title}.")
+        try:
+            _insert_user_inbox_safe(user_id, oid, "تم استلام طلبك", "تم استلام طلبك")
+        except Exception:
+            pass
         _notify_owner_new_order(conn, oid)
         return {"ok": True, "order_id": oid}
     finally:
@@ -936,6 +968,10 @@ def submit_asiacell(body: AsiacellSubmitIn):
         # After COMMIT: push notifications
         if user_id:
             _notify_user(conn, user_id, oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
+            try:
+                _insert_user_inbox_safe(user_id, oid, "تم استلام طلبك", "تم استلام طلبك")
+            except Exception:
+                pass
         _notify_owner_new_order(conn, oid)
         return {"ok": True, "order_id": oid, "status": "received"}
     finally:
@@ -1214,6 +1250,10 @@ async def create_manual_paid(request: Request):
         # optional: immediate user notification (order received)
         body = title + (f" | ID: {account_id}" if account_id else "")
         _notify_user(conn, user_id, oid, "تم استلام طلبك", body)
+        try:
+            _insert_user_inbox_safe(user_id, oid, "تم استلام طلبك", "تم استلام طلبك")
+        except Exception:
+            pass
         _notify_owner_new_order(conn, oid)
 
         return {"ok": True, "order_id": oid, "charged": float(price)}
@@ -1329,6 +1369,10 @@ def admin_approve_order(oid: int, request: Request, background_tasks: Background
 
 
                     _notify_user(conn, user_id, order_id, title_txt, body_txt)
+        try:
+            _insert_user_inbox_safe(user_id, order_id, title_txt, body_txt)
+        except Exception:
+            pass
 
 
                 except Exception:
@@ -1491,6 +1535,10 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: Optional[s
             body_txt = title or "تم التنفيذ"
 
         _notify_user(conn, user_id, order_id, title_txt, body_txt)
+        try:
+            _insert_user_inbox_safe(user_id, order_id, title_txt, body_txt)
+        except Exception:
+            pass
         return {"ok": True, "status": "Done"}
     finally:
         put_conn(conn)
@@ -2759,6 +2807,10 @@ def sync_provider(uid: str, limit: int = 30):
                 if new_status in finals and status not in finals:
                     try:
                         _notify_user(conn, user_id, oid, "تم تحديث طلبك", f"الحالة: {new_status}")
+                        try:
+                            _insert_user_inbox_safe(user_id, oid, "تم تحديث طلبك", f"الحالة: {new_status}")
+                        except Exception:
+                            pass
                     except Exception:
                         pass
 
