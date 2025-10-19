@@ -352,18 +352,30 @@ app.add_middleware(
 # ===== Helpers =====
 
 def _tokens_for_uid(cur, uid: str):
-    """Return list of FCM tokens for a uid from user_devices or fallback to users.fcm_token"""
+    """Return FCM tokens for a uid from user_devices and users."""
+    # Prefer user_devices by uid
     try:
         cur.execute("SELECT fcm_token FROM public.user_devices WHERE uid=%s", (uid,))
-        rows = cur.fetchall()
+        rows = cur.fetchall() or []
         toks = [r[0] for r in rows if r and r[0]]
-        if toks:
-            return toks
+    except Exception:
+        toks = []
+    # Fallback to users.fcm_token OR users.fcm
+    try:
+        cur.execute("SELECT COALESCE(fcm_token, fcm) FROM public.users WHERE uid=%s", (uid,))
+        r = cur.fetchone()
+        if r and r[0]:
+            toks.append(r[0])
     except Exception:
         pass
-    cur.execute("SELECT fcm_token FROM public.users WHERE uid=%s", (uid,))
-    r = cur.fetchone()
-    return [r[0]] if r and r[0] else []
+    # dedupe
+    out = []
+    seen = set()
+    for t in toks:
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
 def _require_admin(passwd: str):
     if passwd != ADMIN_PASSWORD:
@@ -2573,6 +2585,8 @@ def _provider_status(order_no: str) -> dict:
 
 @app.post("/api/orders/sync_provider")
 def sync_provider(uid: str, limit: int = 30):
+    to_notify = []
+
     """For a given user, refresh statuses of provider-linked orders that are not final."""
     # final statuses (no more polling): Done, Rejected, Refunded
     finals = ("Done", "Rejected", "Refunded")
@@ -2625,12 +2639,13 @@ def sync_provider(uid: str, limit: int = 30):
                             (new_status, Json(cur_payload), oid))
                 updated.append({"id": oid, "status": new_status})
 
-                # push FCM only when API order moves to Done
-                if new_status == 'Done' and status != 'Done':
-                    try:
-                        _notify_user(conn, user_id, oid, "طلبك اكتمل", f"رقم الطلب: {ono}")
-                    except Exception:
-                        pass
+                to_notify.append((user_id, oid, f"رقم الطلب: {ono}"))
     finally:
         put_conn(conn)
+    # send notifications after commit
+    for (uid_i, oid_i, body_txt) in to_notify:
+        try:
+            _notify_user(None, uid_i, oid_i, "طلبك اكتمل", body_txt)
+        except Exception:
+            logger.exception("post-commit notify failed")
     return {"ok": True, "updated": updated, "errors": errors}
