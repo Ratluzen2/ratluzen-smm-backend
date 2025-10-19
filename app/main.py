@@ -1322,9 +1322,6 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: Optional[s
     code_val = (data.get("code") or "").strip()
     amount   = data.get("amount")
 
-    # Optional: provider order number supplied by admin
-    provided_order_no = (data.get("order_no") or data.get("provider_order_no") or data.get("provider_order_id") or "").strip()
-
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -1356,30 +1353,6 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: Optional[s
                 except Exception:
                     pass
 
-            # Attach/Generate order_no:
-            # - If admin provided one, use it and also set provider_order_id.
-            # - Else, for non-API orders (type != 'provider'), generate a numeric order_no similar length to last provider id (fallback 9).
-            if provided_order_no:
-                try:
-                    cur.execute("UPDATE public.orders SET provider_order_id=%s WHERE id=%s", (provided_order_no, order_id))
-                except Exception:
-                    pass
-                if isinstance(current, dict):
-                    current["order_no"] = str(provided_order_no)
-            else:
-                if (otype or "").lower() != "provider":
-                    try:
-                        cur.execute("SELECT provider_order_id FROM public.orders WHERE provider_order_id IS NOT NULL AND provider_order_id <> '' ORDER BY id DESC LIMIT 1")
-                        rr = cur.fetchone()
-                        pref_len = len(str(rr[0])) if rr and rr[0] else 9
-                    except Exception:
-                        pref_len = 9
-                    if pref_len < 6 or pref_len > 18:
-                        pref_len = 9
-                    import random
-                    gen_no = "".join(random.choice("0123456789") for _ in range(pref_len))
-                    if isinstance(current, dict):
-                        current["order_no"] = gen_no
             # Persist order as Done
             if current:
                 if is_jsonb:
