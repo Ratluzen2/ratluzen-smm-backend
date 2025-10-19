@@ -1,7 +1,6 @@
 import os
 import json
 import time
-import threading
 import logging
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
@@ -353,30 +352,18 @@ app.add_middleware(
 # ===== Helpers =====
 
 def _tokens_for_uid(cur, uid: str):
-    """Return FCM tokens for a uid from user_devices and users."""
-    # Prefer user_devices by uid
+    """Return list of FCM tokens for a uid from user_devices or fallback to users.fcm_token"""
     try:
         cur.execute("SELECT fcm_token FROM public.user_devices WHERE uid=%s", (uid,))
-        rows = cur.fetchall() or []
+        rows = cur.fetchall()
         toks = [r[0] for r in rows if r and r[0]]
-    except Exception:
-        toks = []
-    # Fallback to users.fcm_token OR users.fcm
-    try:
-        cur.execute("SELECT COALESCE(fcm_token, fcm) FROM public.users WHERE uid=%s", (uid,))
-        r = cur.fetchone()
-        if r and r[0]:
-            toks.append(r[0])
+        if toks:
+            return toks
     except Exception:
         pass
-    # dedupe
-    out = []
-    seen = set()
-    for t in toks:
-        if t and t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
+    cur.execute("SELECT fcm_token FROM public.users WHERE uid=%s", (uid,))
+    r = cur.fetchone()
+    return [r[0]] if r and r[0] else []
 
 def _require_admin(passwd: str):
     if passwd != ADMIN_PASSWORD:
@@ -2584,116 +2571,8 @@ def _provider_status(order_no: str) -> dict:
             "charge": charge, "remains": remains, "start_count": start, "currency": currency, "raw": data}
 
 
-
-# =========================
-# Background Provider Sync Worker
-# =========================
-_BG_THREAD_STARTED = False
-
-def _bg_provider_sync_once(limit:int=200, min_interval_sec:int=60):
-    """Run one sweep to update provider orders and queue notifications."""
-    finals = ("Done", "Rejected", "Refunded")
-    to_notify = []
-    now_ms = int(time.time() * 1000)
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            # Use advisory lock to ensure single sweep at a time across dyno restarts
-            try:
-                cur.execute("SELECT pg_try_advisory_lock(987654322)")
-                if not (cur.fetchone() or [False])[0]:
-                    return 0
-            except Exception:
-                pass
-
-            cur.execute("""
-                SELECT id, user_id, provider_order_id, status, payload, title, type
-                FROM public.orders
-                WHERE provider_order_id IS NOT NULL AND provider_order_id<>''
-                  AND status NOT IN ('Done','Rejected','Refunded')
-                ORDER BY id DESC
-                LIMIT %s
-            """, (limit,))
-            rows = cur.fetchall() or []
-            updated = 0
-            for (oid, user_id, ono, status, payload, title, otype) in rows:
-                # throttle by provider_checked_at in payload
-                p = payload if isinstance(payload, dict) else {}
-                try:
-                    last = int(p.get("provider_checked_at") or 0)
-                except Exception:
-                    last = 0
-                if now_ms - last < (min_interval_sec * 1000):
-                    continue
-
-                md = _provider_status(ono)
-                # update provider_checked_at regardless of success
-                p = dict(p) if isinstance(p, dict) else {}
-                p["provider_checked_at"] = now_ms
-
-                if not md.get("ok"):
-                    # persist only the checked_at bump
-                    try:
-                        cur.execute("UPDATE public.orders SET payload=%s WHERE id=%s", (Json(p), oid))
-                    except Exception:
-                        pass
-                    continue
-
-                new_status = md.get("status") or "Processing"
-                p["provider_status"] = md.get("status_raw")
-                if md.get("charge") is not None: p["provider_charge"] = md.get("charge")
-                if md.get("remains") is not None: p["provider_remains"] = md.get("remains")
-                if md.get("start_count") is not None: p["start_count"] = md.get("start_count")
-                if md.get("currency"): p["currency"] = md.get("currency")
-
-                cur.execute("UPDATE public.orders SET status=%s, payload=%s WHERE id=%s",
-                            (new_status, Json(p), oid))
-                updated += 1
-
-                if new_status == "Done" and status != "Done":
-                    to_notify.append((user_id, oid, f"رقم الطلب: {ono}"))
-
-            # release lock
-            try:
-                cur.execute("SELECT pg_advisory_unlock(987654322)")
-            except Exception:
-                pass
-        # send notifications after commit
-        for (uid_i, oid_i, body_txt) in to_notify:
-            try:
-                _notify_user(None, uid_i, oid_i, "طلبك اكتمل", body_txt)
-            except Exception:
-                logger.exception("bg post-commit notify failed")
-        return updated
-    finally:
-        put_conn(conn)
-
-def _bg_provider_sync_loop():
-    interval = int(os.getenv("SYNC_PROVIDER_INTERVAL_SEC", "5"))
-    min_interval_sec = max(15, int(os.getenv("SYNC_PROVIDER_MIN_INTERVAL_SEC", "5")))
-    while True:
-        try:
-            _bg_provider_sync_once(limit=200, min_interval_sec=min_interval_sec)
-        except Exception as e:
-            logger.exception("bg provider sync error: %s", e)
-        time.sleep(interval)
-
-def _ensure_bg_thread():
-    global _BG_THREAD_STARTED
-    if _BG_THREAD_STARTED:
-        return
-    if os.getenv("SYNC_PROVIDER_BG", "1") != "1":
-        logger.info("Background provider sync disabled by SYNC_PROVIDER_BG")
-        _BG_THREAD_STARTED = True
-        return
-    t = threading.Thread(target=_bg_provider_sync_loop, name="provider-sync-worker", daemon=True)
-    t.start()
-    _BG_THREAD_STARTED = True
-    logger.info("Background provider sync worker started")
 @app.post("/api/orders/sync_provider")
 def sync_provider(uid: str, limit: int = 30):
-    to_notify = []
-
     """For a given user, refresh statuses of provider-linked orders that are not final."""
     # final statuses (no more polling): Done, Rejected, Refunded
     finals = ("Done", "Rejected", "Refunded")
@@ -2702,11 +2581,6 @@ def sync_provider(uid: str, limit: int = 30):
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            # Ensure single runner (avoid duplicate pushes)
-            try:
-                cur.execute("SELECT pg_try_advisory_lock(987654322)")
-            except Exception:
-                pass
             # find user id
             cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
             r = cur.fetchone()
@@ -2745,30 +2619,56 @@ def sync_provider(uid: str, limit: int = 30):
                     cur_payload["start_count"] = md.get("start_count")
                 if md.get("currency"):
                     cur_payload["currency"] = md.get("currency")
-                # decide notify once when moving to Done and not already notified
-                notify = (new_status == 'Done' and status != 'Done' and not bool(cur_payload.get('notified_done')))
-                if notify:
-                    cur_payload['notified_done'] = True
 
                 # persist
                 cur.execute("UPDATE public.orders SET status=%s, payload=%s WHERE id=%s",
                             (new_status, Json(cur_payload), oid))
                 updated.append({"id": oid, "status": new_status})
 
-                if notify:
-                    to_notify.append((user_id, oid, f"رقم الطلب: {ono}"))
+                # push notify if moved to a final state
+                if new_status in finals and status not in finals:
+                    try:
+                        _notify_user(conn, user_id, oid, "تم تحديث طلبك", f"الحالة: {new_status}")
+                    except Exception:
+                        pass
+
     finally:
-        # release advisory lock if held
-        try:
-            with conn, conn.cursor() as cur:
-                cur.execute("SELECT pg_advisory_unlock(987654322)")
-        except Exception:
-            pass
         put_conn(conn)
-    # send notifications after commit
-    for (uid_i, oid_i, body_txt) in to_notify:
-        try:
-            _notify_user(None, uid_i, oid_i, "طلبك اكتمل", body_txt)
-        except Exception:
-            logger.exception("post-commit notify failed")
     return {"ok": True, "updated": updated, "errors": errors}
+
+
+@app.get("/api/admin/orders/provider/pending")
+def admin_list_provider_pending(x_admin_password: Optional[str] = Header(None),
+                                password: Optional[str] = None,
+                                limit: int = 200):
+    _require_admin(_pick_admin_password(x_admin_password, password, {}) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, user_id, title, quantity, price, link,
+                       EXTRACT(EPOCH FROM created_at)*1000 AS created_at,
+                       payload
+                FROM public.orders
+                WHERE type='provider'
+                  AND COALESCE(status,'Pending') = 'Pending'
+                  AND COALESCE(provider_order_id::text,'') = ''
+                ORDER BY id DESC
+                LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall() or []
+        items = []
+        for r in rows:
+            items.append({
+                "id": r[0],
+                "user_id": r[1],
+                "title": r[2],
+                "quantity": r[3],
+                "price": float(r[4] or 0),
+                "link": r[5],
+                "created_at": int(r[6] or 0),
+                "payload": r[7] if isinstance(r[7], dict) else {}
+            })
+        return {"ok": True, "items": items}
+    finally:
+        put_conn(conn)
