@@ -2529,3 +2529,109 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
+
+# =========================
+# Provider status helpers
+# =========================
+def _map_provider_status(s: str) -> str:
+    s = (s or "").strip().lower()
+    if s in ("completed", "complete", "finished", "success", "done"):
+        return "Done"
+    if s in ("processing", "in progress", "in_progress"):
+        return "Processing"
+    if s in ("pending", "queued", "waiting"):
+        return "Pending"
+    if s in ("partial", "refunded"):
+        return "Refunded"
+    if s in ("canceled", "cancelled", "rejected", "fail", "failed"):
+        return "Rejected"
+    return "Processing"
+
+def _provider_status(order_no: str) -> dict:
+    url = PROVIDER_API_URL
+    key = PROVIDER_API_KEY
+    # Many SMM panels use 'status' endpoint with fields 'status', 'charge', 'start_count', 'remains'
+    try:
+        resp = requests.post(url, data={"key": key, "action": "status", "order": str(order_no)}, timeout=20)
+    except Exception:
+        return {"ok": False, "error": "provider_unreachable"}
+    if resp.status_code // 100 != 2:
+        return {"ok": False, "error": "provider_http", "code": resp.status_code}
+    try:
+        data = resp.json()
+    except Exception:
+        return {"ok": False, "error": "bad_provider_json", "text": resp.text[:200]}
+    # normalize
+    status_raw = str(data.get("status") or data.get("order_status") or "").strip()
+    charge = data.get("charge")
+    remains = data.get("remains")
+    start = data.get("start_count") or data.get("start") or data.get("startcount")
+    currency = data.get("currency") or None
+    return {"ok": True, "status_raw": status_raw, "status": _map_provider_status(status_raw),
+            "charge": charge, "remains": remains, "start_count": start, "currency": currency, "raw": data}
+
+
+@app.post("/api/orders/sync_provider")
+def sync_provider(uid: str, limit: int = 30):
+    """For a given user, refresh statuses of provider-linked orders that are not final."""
+    # final statuses (no more polling): Done, Rejected, Refunded
+    finals = ("Done", "Rejected", "Refunded")
+    updated = []
+    errors = []
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            # find user id
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                return {"ok": True, "updated": [], "errors": []}
+            user_id = r[0]
+            # pick candidate orders
+            cur.execute("""
+                SELECT id, provider_order_id, status, payload, title, type
+                FROM public.orders
+                WHERE user_id=%s AND provider_order_id IS NOT NULL AND provider_order_id<>''
+                  AND status NOT IN ('Done','Rejected','Refunded')
+                ORDER BY id DESC
+                LIMIT %s
+            """, (user_id, limit))
+            rows = cur.fetchall() or []
+
+            for (oid, ono, status, payload, title, otype) in rows:
+                md = _provider_status(ono)
+                if not md.get("ok"):
+                    errors.append({"id": oid, "error": md.get("error","provider_error")})
+                    continue
+                new_status = md.get("status") or "Processing"
+                # update payload
+                cur_payload = payload if isinstance(payload, dict) else {}
+                try:
+                    cur_payload = dict(cur_payload)
+                except Exception:
+                    cur_payload = {}
+                cur_payload["provider_status"] = md.get("status_raw")
+                if md.get("charge") is not None:
+                    cur_payload["provider_charge"] = md.get("charge")
+                if md.get("remains") is not None:
+                    cur_payload["provider_remains"] = md.get("remains")
+                if md.get("start_count") is not None:
+                    cur_payload["start_count"] = md.get("start_count")
+                if md.get("currency"):
+                    cur_payload["currency"] = md.get("currency")
+
+                # persist
+                cur.execute("UPDATE public.orders SET status=%s, payload=%s WHERE id=%s",
+                            (new_status, Json(cur_payload), oid))
+                updated.append({"id": oid, "status": new_status})
+
+                # push notify if moved to a final state
+                if new_status in finals and status not in finals:
+                    try:
+                        _notify_user(conn, user_id, oid, "تم تحديث طلبك", f"الحالة: {new_status}")
+                    except Exception:
+                        pass
+
+    finally:
+        put_conn(conn)
+    return {"ok": True, "updated": updated, "errors": errors}
