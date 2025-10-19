@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import psycopg2
-from psycopg2.extras import Json
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor, Json
 
@@ -249,8 +248,8 @@ def ensure_schema():
                     cur.execute("UPDATE public.orders SET type='provider' WHERE type IS NULL;")
                     cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET DEFAULT 'provider';")
                     cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET NOT NULL;")
-                    cur.execute("UPDATE public.orders SET payload='{}'::jsonb WHERE payload IS NULL;
-                    ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
+                    cur.execute("UPDATE public.orders SET payload='{}'::jsonb WHERE payload IS NULL;")
+                    cur.execute("ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
 
                     # service overrides tables
                     cur.execute("""
@@ -1283,8 +1282,6 @@ def _kd1s_fetch_status_bulk(ids: list[str]) -> dict:
 # =========================
 # Approve/Deliver/Reject
 # =========================
-@app.post("/api/admin/orders/{oid}/approve")
-
 @app.post("/api/admin/orders/{oid}/approve")
 def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     body = {}
