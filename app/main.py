@@ -2588,6 +2588,117 @@ def test_push_owner(p: TestPushIn):
     finally:
         put_conn(conn)
 
+
+# =========================
+# Background provider-status poller (FCM on final states)
+# =========================
+import threading as _thr
+import time as _time
+
+def _scan_provider_orders_and_notify_once(_batch_limit: int = 50):
+    # Scan a batch of provider-linked orders that are not final yet,
+    # refresh their status from the provider, persist changes, and send FCM
+    # once when they transition into a final state (Done / Rejected / Refunded).
+    finals = ("Done", "Rejected", "Refunded")
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # Lock a small batch to avoid racing with admin actions
+                cur.execute(
+                    """
+                    SELECT id, user_id, provider_order_id, status, payload, title
+                    FROM public.orders
+                    WHERE provider_order_id IS NOT NULL AND provider_order_id<>''
+                      AND status NOT IN ('Done','Rejected','Refunded')
+                    ORDER BY id DESC
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    (_batch_limit,),
+                )
+                rows = cur.fetchall() or []
+
+                for (oid, user_id, ono, old_status, payload, title) in rows:
+                    try:
+                        md = _provider_status(ono)
+                    except Exception:
+                        md = {"ok": False, "error": "provider_error"}
+
+                    if not md.get("ok"):
+                        # keep as-is; try later
+                        continue
+
+                    new_status = md.get("status") or "Processing"
+
+                    # merge payload safely
+                    cur_payload = payload if isinstance(payload, dict) else {}
+                    try:
+                        cur_payload = dict(cur_payload)
+                    except Exception:
+                        cur_payload = {}
+                    cur_payload["provider_status"] = md.get("status_raw")
+                    if md.get("charge") is not None:
+                        cur_payload["provider_charge"] = md.get("charge")
+                    if md.get("remains") is not None:
+                        cur_payload["provider_remains"] = md.get("remains")
+                    if md.get("start_count") is not None:
+                        cur_payload["start_count"] = md.get("start_count")
+                    if md.get("currency"):
+                        cur_payload["currency"] = md.get("currency")
+
+                    # persist new status + payload
+                    cur.execute(
+                        "UPDATE public.orders SET status=%s, payload=%s WHERE id=%s",
+                        (new_status, Json(cur_payload), oid),
+                    )
+
+                    # if transitioned into final state, notify user via FCM
+                    if (new_status in finals) and (old_status not in finals):
+                        try:
+                            _notify_user(conn, user_id, oid, "تم تحديث طلبك", f"الحالة: {new_status}")
+                        except Exception:
+                            # never block the loop on FCM errors
+                            pass
+    finally:
+        put_conn(conn)
+
+
+def _provider_poller_loop():
+    try:
+        interval = int(os.getenv("PROVIDER_POLL_INTERVAL_SECS", "5"))
+    except Exception:
+        interval = 5
+
+    # Allow disabling via env
+    enabled = (os.getenv("ENABLE_PROVIDER_POLL", "1") or "1").strip() not in ("0", "false", "False")
+    if not enabled:
+        logger.info("Provider poller disabled via ENABLE_PROVIDER_POLL")
+        return
+
+    logger.info("Starting provider poller thread: every %ss", interval)
+    while True:
+        try:
+            _scan_provider_orders_and_notify_once(_batch_limit=50)
+        except Exception as e:
+            try:
+                logger.exception("provider poller iteration failed: %s", e)
+            except Exception:
+                pass
+        # sleep last to avoid tight loop on immediate shutdown or exceptions
+        _time.sleep(interval)
+
+
+# Start the background poller as a daemon thread on import
+try:
+    _thr.Thread(target=_provider_poller_loop, name="provider-poller", daemon=True).start()
+except Exception as _e:
+    try:
+        logger.exception("failed to start provider poller: %s", _e)
+    except Exception:
+        pass
+
+
 # =============== Run local ===============
 if __name__ == "__main__":
     import uvicorn
