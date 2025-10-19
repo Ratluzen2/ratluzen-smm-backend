@@ -2631,6 +2631,6 @@ def sync_provider(uid: str, limit: int = 30):
                         _notify_user(conn, user_id, oid, "طلبك اكتمل", f"رقم الطلب: {ono}")
                     except Exception:
                         pass
-finally:
+    finally:
         put_conn(conn)
     return {"ok": True, "updated": updated, "errors": errors}
