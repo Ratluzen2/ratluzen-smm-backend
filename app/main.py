@@ -33,7 +33,22 @@ POOL_MIN, POOL_MAX = 1, int(os.getenv("DB_POOL_MAX", "5"))
 dbpool: pool.SimpleConnectionPool = pool.SimpleConnectionPool(POOL_MIN, POOL_MAX, dsn=DATABASE_URL)
 
 def get_conn() -> psycopg2.extensions.connection:
-    return dbpool.getconn()
+    """Get a healthy connection from the pool (auto-reopen if closed)."""
+    conn = dbpool.getconn()
+    try:
+        if getattr(conn, "closed", 0):
+            raise Exception("connection closed")
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+    except Exception:
+        try:
+            # Remove the bad connection from pool and close it
+            dbpool.putconn(conn, close=True)
+        except Exception:
+            pass
+        # Get a fresh connection
+        conn = dbpool.getconn()
+    return conn
 
 def put_conn(conn: psycopg2.extensions.connection) -> None:
     dbpool.putconn(conn)
@@ -528,17 +543,20 @@ def _parse_usd(d: Dict[str, Any]) -> int:
 
 
 def _push_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
-    """Push FCM without inserting a DB notification row (useful when a DB trigger already inserted)."""
-    token = None
+    """Push FCM to all user's devices (user_devices + fallback), without inserting DB row."""
+    tokens = []
     try:
         with conn, conn.cursor() as cur:
-            cur.execute("SELECT fcm_token FROM public.users WHERE id=%s", (user_id,))
-            row = cur.fetchone()
-            token = row[0] if row else None
+            cur.execute("SELECT uid FROM public.users WHERE id=%s", (user_id,))
+            r = cur.fetchone()
+            uid = r[0] if r else None
+            if uid:
+                tokens = _tokens_for_uid(cur, uid)
     except Exception as e:
         logger.exception("push_user DB read failed: %s", e)
     try:
-        _fcm_send_push(token, title, body, order_id)
+        for t in tokens:
+            _fcm_send_push(t, title, body, order_id)
     except Exception as e:
         logger.exception("push_user send failed: %s", e)
 
