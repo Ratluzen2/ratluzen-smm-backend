@@ -1280,6 +1280,23 @@ def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[s
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
                 return {"ok": True, "status": "Done"}
 
+
+# Move out of Pending right away for provider orders to avoid re-appearing in pending list
+if otype not in ("topup_card", "manual") and service_id is not None:
+    try:
+        # attach approved_at in payload
+        cur_payload = payload if isinstance(payload, dict) else {}
+        try:
+            cur_payload = dict(cur_payload)
+        except Exception:
+            cur_payload = {}
+        import time as _t
+        cur_payload["approved_at"] = int(_t.time() * 1000)
+        cur.execute("UPDATE public.orders SET status='Processing', payload=%s WHERE id=%s", (Json(cur_payload), order_id))
+    except Exception as _e:
+        # best-effort; continue
+        pass
+
             try:
                 resp = requests.post(
                     PROVIDER_API_URL,
@@ -1694,8 +1711,7 @@ def admin_pending_balances(x_admin_password: Optional[str] = Header(None, alias=
 def admin_pending_services_endpoint(
     x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
     password: Optional[str] = None,
-    limit: int = 100
-):
+    limit: int = 100, after: int = 0):
     _require_admin(x_admin_password or password or "")
     conn = get_conn()
     try:
@@ -1716,6 +1732,8 @@ def admin_pending_services_endpoint(
                 FROM public.orders o
                 JOIN public.users u ON u.id = o.user_id
                 WHERE COALESCE(o.status, 'Pending') = 'Pending'
+                AND COALESCE(o.provider_order_id::text,'') = ''
+                AND o.id > %s
                 ORDER BY COALESCE(o.created_at, NOW()) DESC
                 LIMIT %s
             """, (int(limit),))
