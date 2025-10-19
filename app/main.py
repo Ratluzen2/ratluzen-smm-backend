@@ -974,16 +974,29 @@ def _orders_for_uid(uid: str) -> List[dict]:
                 ORDER BY id DESC
             """, (user_id,))
             rows = cur.fetchall()
-        return [{
-            "id": row[0],
-            "title": row[1],
-            "quantity": row[2],
-            "price": float(row[3] or 0),
-            "status": row[4],
-            "created_at": int(row[5] or 0),
-            "link": row[6],
-            "order_no": row[7]
-        } for row in rows]
+        out = []
+        for row in rows:
+            _id, _title, _qty, _price, _status, _created, _link, _ono = row
+            _price = float(_price or 0)
+            _created = int(_created or 0)
+            # display id prefers provider order number
+            display_id = str(_ono) if (_ono and str(_ono).strip()) else str(_id)
+            # append order_no to title if available
+            if _ono and str(_ono).strip():
+                if 'رقم الطلب' not in (_title or ''):
+                    _title = f"{_title} | رقم الطلب: {str(_ono)}"
+            out.append({
+            "id": _id,
+            "display_id": display_id,
+            "title": _title,
+            "quantity": _qty,
+            "price": _price,
+            "status": _status,
+            "created_at": _created,
+            "link": _link,
+            "order_no": _ono
+        })
+        return out
     finally:
         put_conn(conn)
 
