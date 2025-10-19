@@ -2,7 +2,6 @@ import os
 import json
 import time
 import logging
-import random
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -957,7 +956,6 @@ for path in ASIACELL_PATHS[1:]:
             put_conn(conn)
 
 # Orders of a user
-
 def _orders_for_uid(uid: str) -> List[dict]:
     conn = get_conn()
     try:
@@ -969,23 +967,21 @@ def _orders_for_uid(uid: str) -> List[dict]:
             user_id = r[0]
             cur.execute("""
                 SELECT id, title, quantity, price,
-                       status, EXTRACT(EPOCH FROM created_at)*1000, link,
-                       COALESCE(provider_order_id::text, (COALESCE(NULLIF(payload,''),'{}')::jsonb->>'order_no')) AS order_no
+                       status, EXTRACT(EPOCH FROM created_at)*1000, link
                 FROM public.orders
                 WHERE user_id=%s
                 ORDER BY id DESC
             """, (user_id,))
             rows = cur.fetchall()
         return [{
-            "id": r[0],
-            "title": r[1],
-            "quantity": r[2],
-            "price": float(r[3] or 0),
-            "status": r[4],
-            "created_at": int(r[5] or 0),
-            "link": r[6],
-            "order_no": r[7]
-        } for r in rows]
+            "id": row[0],
+            "title": row[1],
+            "quantity": row[2],
+            "price": float(row[3] or 0),
+            "status": row[4],
+            "created_at": int(row[5] or 0),
+            "link": row[6]
+        } for row in rows]
     finally:
         put_conn(conn)
 
@@ -1244,6 +1240,8 @@ def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[s
             body = request._json  # type: ignore
         except Exception:
             body = {}
+    # Extract optional provider order number supplied by admin
+    provided_order_no = str((body.get("order_no") or body.get("provider_order_id") or body.get("order") or body.get("id") or "")).strip()
     _require_admin(_pick_admin_password(x_admin_password, password, body) or "")
     conn = get_conn()
     try:
@@ -1265,13 +1263,6 @@ def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[s
             # manual/topup_card doesn't call provider
             if otype in ("topup_card", "manual") or service_id is None:
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
-
-            # Set provider_order_id if we have an order number from provider
-            if provided_order_no:
-                try:
-                    cur.execute("UPDATE public.orders SET provider_order_id=%s WHERE id=%s", (str(provided_order_no), order_id))
-                except Exception:
-                    pass
                 return {"ok": True, "status": "Done"}
 
             try:
@@ -1328,9 +1319,6 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: Optional[s
 
     code_val = (data.get("code") or "").strip()
     amount   = data.get("amount")
-    # ✅ Capture provider order number (if provided by owner) or generate for non-API services
-    provided_order_no = (data.get("order_no") or data.get("provider_order_no") or data.get("provider_order_id") or "").strip()
-
 
     conn = get_conn()
     try:
@@ -1363,28 +1351,6 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: Optional[s
                 except Exception:
                     pass
 
-            
-            # Attach an order number:
-            # - If owner provided a provider order number, use it.
-            # - Otherwise for non-API orders, generate a numeric order_no with similar length to provider orders (fallback 9).
-            order_no_to_set = None
-            if provided_order_no:
-                order_no_to_set = provided_order_no
-            else:
-                # Generate only for non-provider orders if missing
-                if (otype or "").lower() != "provider":
-                    try:
-                        cur.execute("SELECT provider_order_id FROM public.orders WHERE provider_order_id IS NOT NULL AND provider_order_id <> '' ORDER BY id DESC LIMIT 1")
-                        rr = cur.fetchone()
-                        pref_len = len(str(rr[0])) if rr and rr[0] else 9
-                    except Exception:
-                        pref_len = 9
-                    if pref_len < 6 or pref_len > 18:
-                        pref_len = 9
-                    order_no_to_set = "".join(random.choice("0123456789") for _ in range(pref_len))
-            if order_no_to_set:
-                current["order_no"] = str(order_no_to_set)
-
             # Persist order as Done
             if current:
                 if is_jsonb:
@@ -1393,13 +1359,6 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: Optional[s
                     cur.execute("UPDATE public.orders SET status='Done', payload=(%s)::jsonb::text WHERE id=%s", (json.dumps(current, ensure_ascii=False), order_id))
             else:
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
-
-            # Set provider_order_id if we have an order number from provider
-            if provided_order_no:
-                try:
-                    cur.execute("UPDATE public.orders SET provider_order_id=%s WHERE id=%s", (str(provided_order_no), order_id))
-                except Exception:
-                    pass
 
             # Credit wallet for Asiacell direct topup (topup_card type)
             if (otype or "").lower() == "topup_card":
