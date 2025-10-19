@@ -32,9 +32,7 @@ PROVIDER_API_URL = os.getenv("PROVIDER_API_URL", "https://kd1s.com/api/v2").stri
 PROVIDER_API_KEY = os.getenv("PROVIDER_API_KEY", "").strip()
 ORDER_POLL_INTERVAL_SECONDS = int(os.getenv("ORDER_POLL_INTERVAL_SECONDS", "3"))
 
-
-PROVIDER_API_URL = os.getenv("PROVIDER_API_URL", "https://kd1s.com/api/v2")
-PROVIDER_API_KEY = os.getenv("PROVIDER_API_KEY", "25a9ceb07be0d8b2ba88e70dcbe92e06")
+# Provider settings already defined above via env; removed hardcoded defaults
 
 POOL_MIN, POOL_MAX = 1, int(os.getenv("DB_POOL_MAX", "5"))
 dbpool: pool.SimpleConnectionPool = pool.SimpleConnectionPool(POOL_MIN, POOL_MAX, dsn=DATABASE_URL)
@@ -251,7 +249,8 @@ def ensure_schema():
                     cur.execute("UPDATE public.orders SET type='provider' WHERE type IS NULL;")
                     cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET DEFAULT 'provider';")
                     cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET NOT NULL;")
-                    cur.execute("UPDATE public.orders SET payload='{}'::jsonb WHERE payload IS NULL;")
+                    cur.execute("UPDATE public.orders SET payload='{}'::jsonb WHERE payload IS NULL;
+                    ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
 
                     # service overrides tables
                     cur.execute("""
@@ -963,6 +962,7 @@ for path in ASIACELL_PATHS[1:]:
             put_conn(conn)
 
 # Orders of a user
+
 def _orders_for_uid(uid: str) -> List[dict]:
     conn = get_conn()
     try:
@@ -972,31 +972,34 @@ def _orders_for_uid(uid: str) -> List[dict]:
             if not r:
                 return []
             user_id = r[0]
-            cur.execute("""
-                SELECT id, title, quantity, price,
-                       status, EXTRACT(EPOCH FROM created_at)*1000, link
+            cur.execute("""                SELECT id, title, quantity, price,
+                       status, EXTRACT(EPOCH FROM created_at)*1000, link,
+                       COALESCE(provider_order_id,''), COALESCE(payload, '{}'::jsonb)
                 FROM public.orders
                 WHERE user_id=%s
                 ORDER BY id DESC
             """, (user_id,))
             rows = cur.fetchall()
-        return [{
-            "id": row[0],
-            "title": row[1],
-            "quantity": row[2],
-            "price": float(row[3] or 0),
-            "status": row[4],
-            "created_at": int(row[5] or 0),
-            "link": row[6]
-        } for row in rows]
+        items = []
+        for row in rows:
+            oid, title, qty, price, status, created_ms, link, provider_oid, payload = row
+            display_title = title
+            if provider_oid and "كود المزود:" not in (display_title or ""):
+                display_title = f"{title} | كود المزود: {provider_oid}"
+            items.append({
+                "id": oid,
+                "title": display_title,
+                "quantity": qty,
+                "price": float(price or 0),
+                "status": status,
+                "created_at": int(created_ms or 0),
+                "link": link,
+                "provider_order_id": provider_oid,
+                "payload": payload if isinstance(payload, dict) else {}
+            })
+        return items
     finally:
         put_conn(conn)
-
-@app.get("/api/orders/my")
-def my_orders(uid: str):
-    return _orders_for_uid(uid)
-
-# more aliases for safety
 @app.get("/api/orders")
 def orders_alias(uid: str):
     return _orders_for_uid(uid)
@@ -1281,6 +1284,8 @@ def _kd1s_fetch_status_bulk(ids: list[str]) -> dict:
 # Approve/Deliver/Reject
 # =========================
 @app.post("/api/admin/orders/{oid}/approve")
+
+@app.post("/api/admin/orders/{oid}/approve")
 def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     body = {}
     try:
@@ -1294,8 +1299,7 @@ def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[s
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, user_id, service_id, link, quantity, price, status, provider_order_id, title, payload, type
+            cur.execute("""                SELECT id, user_id, service_id, link, quantity, price, status, provider_order_id, title, payload, type
                 FROM public.orders WHERE id=%s FOR UPDATE
             """, (oid,))
             row = cur.fetchone()
@@ -1310,7 +1314,13 @@ def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[s
 
             # manual/topup_card doesn't call provider
             if otype in ("topup_card", "manual") or service_id is None:
-                cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
+                cur.execute("UPDATE public.orders SET status='Done', updated_at=NOW() WHERE id=%s", (order_id,))
+                try:
+                    _notify_user(conn, user_id, order_id, "تم تنفيذ طلبك", title or "تم التنفيذ")
+                except Exception: pass
+                try:
+                    _notify_owner_new_order(conn, order_id)
+                except Exception: pass
                 return {"ok": True, "status": "Done"}
 
             try:
@@ -1321,36 +1331,45 @@ def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[s
                 )
             except Exception:
                 _refund_if_needed(cur, user_id, price, order_id)
-                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                cur.execute("UPDATE public.orders SET status='Rejected', updated_at=NOW() WHERE id=%s", (order_id,))
                 return {"ok": False, "status": "Rejected", "reason": "provider_unreachable"}
 
             if resp.status_code // 100 != 2:
                 _refund_if_needed(cur, user_id, price, order_id)
-                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                cur.execute("UPDATE public.orders SET status='Rejected', updated_at=NOW() WHERE id=%s", (order_id,))
                 return {"ok": False, "status": "Rejected", "reason": "provider_http"}
 
             try:
                 data = resp.json()
             except Exception:
                 _refund_if_needed(cur, user_id, price, order_id)
-                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                cur.execute("UPDATE public.orders SET status='Rejected', updated_at=NOW() WHERE id=%s", (order_id,))
                 return {"ok": False, "status": "Rejected", "reason": "bad_provider_json"}
 
             provider_id = data.get("order") or data.get("order_id")
             if not provider_id:
                 _refund_if_needed(cur, user_id, price, order_id)
-                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                cur.execute("UPDATE public.orders SET status='Rejected', updated_at=NOW() WHERE id=%s", (order_id,))
                 return {"ok": False, "status": "Rejected", "reason": "no_provider_id"}
 
-            cur.execute("""
-                UPDATE public.orders
-                SET provider_order_id=%s, status='Processing'
+            cur.execute(
+                """                UPDATE public.orders
+                SET provider_order_id=%s, status='Processing', updated_at=NOW(),
+                    payload = COALESCE(payload, '{}'::jsonb) || %s::jsonb
                 WHERE id=%s
-            """, (str(provider_id), order_id))
-            return {"ok": True, "status": "Processing", "provider_order_id": provider_id}
+                """, (str(provider_id), Json({"provider_order_id": str(provider_id), "provider_response": data}), order_id)
+            )
+        # notify
+        try:
+            _notify_user(conn, user_id, order_id, "تم تنفيذ طلبك", f"رقم المزود: {provider_id}")
+        except Exception: pass
+        try:
+            _notify_owner_new_order(conn, order_id)
+        except Exception: pass
+
+        return {"ok": True, "status": "Processing", "provider_order_id": provider_id}
     finally:
         put_conn(conn)
-
 def _refund_if_needed(cur, user_id: int, price: float, order_id: int):
     # Correctly use the price parameter (eff_price might be used elsewhere).
     if price and price > 0:
@@ -2530,14 +2549,7 @@ def test_push_owner(p: TestPushIn):
     finally:
         put_conn(conn)
 
-try:
-    if PROVIDER_API_KEY:
-        threading.Thread(target=_provider_poll_loop, daemon=True).start()
-        logger.info("KD1S polling started every %ss (%s)", ORDER_POLL_INTERVAL_SECONDS, PROVIDER_API_URL)
-    else:
-        logger.warning("KD1S polling NOT started: PROVIDER_API_KEY is empty")
-except Exception as _e:
-    logger.warning("Failed to start KD1S poller: %s", _e)
+
 
 
 
@@ -2773,84 +2785,11 @@ def _postprocess_payload_raw(item: dict) -> dict:
         item['payload'] = _safe_json(item.pop('payload_raw'))
     return item
 
-
-@app.post("/api/admin/orders/{oid}/approve")
-def admin_approve_and_submit_provider(oid: int):
-    """
-    Approve order and, if API/provider type without provider_order_id, submit to KD1S and save provider_order_id.
-    This endpoint is idempotent: if provider_order_id is already set, it won't re-submit.
-    """
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, user_id, COALESCE(type,'manual') AS type,
-                       COALESCE(provider_order_id,''),
-                       COALESCE(payload, '{}'::jsonb), COALESCE(link, ''), COALESCE(quantity, 0), COALESCE(title,'')
-                FROM public.orders
-                WHERE id=%s
-            """, (oid,))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(404, "Order not found")
-
-            order_id, user_id, otype, provider_oid, payload0, link0, qty0, title = row
-            payload = _safe_json(payload0)
-
-            # 1) approve/update status locally
-            new_status = "Processing" if otype in ("api","provider","smm","service") else "Approved"
-            cur.execute("UPDATE public.orders SET status=%s, updated_at=NOW() WHERE id=%s", (new_status, oid))
-
-        # 2) If api/provider -> submit to KD1S once
-        if otype in ("api","provider","smm","service") and (not provider_oid):
-            if not PROVIDER_API_KEY:
-                logger.warning("Approve: PROVIDER_API_KEY missing; cannot submit to provider for order %s", oid)
-            else:
-                service = payload.get("service") or payload.get("service_id") or payload.get("sid")
-                link = payload.get("link") or link0
-                quantity = int(payload.get("quantity") or qty0 or 0)
-                extras = payload.get("extras") or {}
-                if service and link and quantity > 0:
-                    form = {
-                        "key": PROVIDER_API_KEY,
-                        "action": "add",
-                        "service": str(service),
-                        "link": link,
-                        "quantity": str(quantity)
-                    }
-                    if isinstance(extras, dict):
-                        for k, v in extras.items():
-                            if v is not None:
-                                form[str(k)] = str(v)
-                    try:
-                        r = requests.post(PROVIDER_API_URL, data=form, timeout=15)
-                        r.raise_for_status()
-                        data = r.json()
-                        prov_id = str(data.get("order") or "")
-                        if prov_id:
-                            with get_conn() as conn2, conn2.cursor() as cur2:
-                                cur2.execute("""
-                                    UPDATE public.orders
-                                       SET provider_order_id=%s,
-                                           payload = (CASE WHEN pg_typeof(payload)::text='jsonb'
-                                                           THEN payload || %s::jsonb ELSE payload END),
-                                           updated_at=NOW()
-                                     WHERE id=%s
-                                """, (prov_id, Json({"provider_order_id": prov_id, "provider_response": data}), oid))
-                            try:
-                                _notify_user(get_conn(), int(user_id), int(oid), "تم تنفيذ طلبك", f"رقم المزود: {prov_id}")
-                            except Exception as ne:
-                                logger.warning("notify user after provider add failed: %s", ne)
-                        else:
-                            logger.warning("Approve: provider did not return 'order' for %s; response=%s", oid, data)
-                    except Exception as e:
-                        logger.warning("Approve: provider add error for %s: %s", oid, e)
-
-        try:
-            _notify_owner_new_order(get_conn(), oid)
-        except Exception:
-            pass
-
-        return {"ok": True, "id": oid}
-    finally:
-        put_conn(conn)
+try:
+    if PROVIDER_API_KEY:
+        threading.Thread(target=_provider_poll_loop, daemon=True).start()
+        logger.info("KD1S polling started every %ss (%s)", ORDER_POLL_INTERVAL_SECONDS, PROVIDER_API_URL)
+    else:
+        logger.warning("KD1S polling NOT started: PROVIDER_API_KEY is empty")
+except Exception as _e:
+    logger.warning("Failed to start KD1S poller: %s", _e)
