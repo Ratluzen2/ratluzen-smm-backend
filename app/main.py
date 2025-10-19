@@ -2,7 +2,7 @@ import os
 import json
 import time
 import logging
-import threading
+import random
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -27,11 +27,8 @@ GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_
 FCM_PROJECT_ID = os.getenv("FCM_PROJECT_ID", "").strip()  # optional override
 OWNER_UID = os.getenv("OWNER_UID", "OWNER-0001").strip()
 
-PROVIDER_API_URL = os.getenv("PROVIDER_API_URL", "https://kd1s.com/api/v2").strip()
-PROVIDER_API_KEY = os.getenv("PROVIDER_API_KEY", "").strip()
-ORDER_POLL_INTERVAL_SECONDS = int(os.getenv("ORDER_POLL_INTERVAL_SECONDS", "3"))
-
-# Provider settings already defined above via env; removed hardcoded defaults
+PROVIDER_API_URL = os.getenv("PROVIDER_API_URL", "https://kd1s.com/api/v2")
+PROVIDER_API_KEY = os.getenv("PROVIDER_API_KEY", "25a9ceb07be0d8b2ba88e70dcbe92e06")
 
 POOL_MIN, POOL_MAX = 1, int(os.getenv("DB_POOL_MAX", "5"))
 dbpool: pool.SimpleConnectionPool = pool.SimpleConnectionPool(POOL_MIN, POOL_MAX, dsn=DATABASE_URL)
@@ -249,7 +246,6 @@ def ensure_schema():
                     cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET DEFAULT 'provider';")
                     cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET NOT NULL;")
                     cur.execute("UPDATE public.orders SET payload='{}'::jsonb WHERE payload IS NULL;")
-                    cur.execute("ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
 
                     # service overrides tables
                     cur.execute("""
@@ -961,7 +957,6 @@ for path in ASIACELL_PATHS[1:]:
             put_conn(conn)
 
 # Orders of a user
-
 def _orders_for_uid(uid: str) -> List[dict]:
     conn = get_conn()
     try:
@@ -971,34 +966,31 @@ def _orders_for_uid(uid: str) -> List[dict]:
             if not r:
                 return []
             user_id = r[0]
-            cur.execute("""                SELECT id, title, quantity, price,
-                       status, EXTRACT(EPOCH FROM created_at)*1000, link,
-                       COALESCE(provider_order_id,''), COALESCE(payload, '{}'::jsonb)
+            cur.execute("""
+                SELECT id, title, quantity, price,
+                       status, EXTRACT(EPOCH FROM created_at)*1000, link, COALESCE(provider_order_id::text, (payload->>'order_no')) AS order_no
                 FROM public.orders
                 WHERE user_id=%s
                 ORDER BY id DESC
             """, (user_id,))
             rows = cur.fetchall()
-        items = []
-        for row in rows:
-            oid, title, qty, price, status, created_ms, link, provider_oid, payload = row
-            display_title = title
-            if provider_oid and "كود المزود:" not in (display_title or ""):
-                display_title = f"{title} | كود المزود: {provider_oid}"
-            items.append({
-                "id": oid,
-                "title": display_title,
-                "quantity": qty,
-                "price": float(price or 0),
-                "status": status,
-                "created_at": int(created_ms or 0),
-                "link": link,
-                "provider_order_id": provider_oid,
-                "payload": payload if isinstance(payload, dict) else {}
-            })
-        return items
+        return [{
+            "id": row[0],
+            "title": row[1],
+            "quantity": row[2],
+            "price": float(row[3] or 0),
+            "status": row[4],
+            "created_at": int(row[5] or 0),
+            "link": row[6]
+        } for row in row, "order_no": row[7] } for row in rows]
     finally:
         put_conn(conn)
+
+@app.get("/api/orders/my")
+def my_orders(uid: str):
+    return _orders_for_uid(uid)
+
+# more aliases for safety
 @app.get("/api/orders")
 def orders_alias(uid: str):
     return _orders_for_uid(uid)
@@ -1236,49 +1228,6 @@ async def create_manual_paid_alias7(request: Request):
 async def create_manual_paid_alias8(request: Request):
     return await create_manual_paid(request)
 
-
-
-def _normalize_provider_status(raw: str) -> str:
-    s = (raw or "").strip().lower()
-    if s in ("completed", "complete", "done", "success", "finished"):
-        return "Done"
-    if s in ("partial",):
-        return "Partial"
-    if s in ("processing", "in progress", "in_progress", "inprogress", "pending", "queued"):
-        return "Processing"
-    if s in ("canceled", "cancelled", "rejected", "failed", "error"):
-        return "Cancelled"
-    return (raw or "Unknown").capitalize()
-
-def _kd1s_fetch_status_bulk(ids: list[str]) -> dict:
-    if not ids:
-        return {}
-    try:
-        resp = requests.post(
-            PROVIDER_API_URL,
-            data={"key": PROVIDER_API_KEY, "action": "status", "orders": ",".join(ids[:100])},
-            timeout=12
-        )
-        if resp.status_code // 100 != 2:
-            return {}
-        data = resp.json()
-        if not isinstance(data, dict):
-            return {}
-        out = {}
-        for oid, item in data.items():
-            if isinstance(item, dict) and "status" in item:
-                out[str(oid)] = {
-                    "status": _normalize_provider_status(item.get("status")),
-                    "charge": item.get("charge"),
-                    "start_count": item.get("start_count"),
-                    "remains": item.get("remains"),
-                    "currency": item.get("currency"),
-                }
-        return out
-    except Exception as e:
-        logger.warning("KD1S bulk status fetch failed: %s", e)
-        return {}
-
 # =========================
 # Approve/Deliver/Reject
 # =========================
@@ -1296,7 +1245,8 @@ def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[s
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            cur.execute("""                SELECT id, user_id, service_id, link, quantity, price, status, provider_order_id, title, payload, type
+            cur.execute("""
+                SELECT id, user_id, service_id, link, quantity, price, status, provider_order_id, title, payload, type
                 FROM public.orders WHERE id=%s FOR UPDATE
             """, (oid,))
             row = cur.fetchone()
@@ -1311,13 +1261,14 @@ def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[s
 
             # manual/topup_card doesn't call provider
             if otype in ("topup_card", "manual") or service_id is None:
-                cur.execute("UPDATE public.orders SET status='Done', updated_at=NOW() WHERE id=%s", (order_id,))
+                cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
+
+            # Set provider_order_id if we have an order number from provider
+            if provided_order_no:
                 try:
-                    _notify_user(conn, user_id, order_id, "تم تنفيذ طلبك", title or "تم التنفيذ")
-                except Exception: pass
-                try:
-                    _notify_owner_new_order(conn, order_id)
-                except Exception: pass
+                    cur.execute("UPDATE public.orders SET provider_order_id=%s WHERE id=%s", (str(provided_order_no), order_id))
+                except Exception:
+                    pass
                 return {"ok": True, "status": "Done"}
 
             try:
@@ -1328,45 +1279,36 @@ def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[s
                 )
             except Exception:
                 _refund_if_needed(cur, user_id, price, order_id)
-                cur.execute("UPDATE public.orders SET status='Rejected', updated_at=NOW() WHERE id=%s", (order_id,))
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
                 return {"ok": False, "status": "Rejected", "reason": "provider_unreachable"}
 
             if resp.status_code // 100 != 2:
                 _refund_if_needed(cur, user_id, price, order_id)
-                cur.execute("UPDATE public.orders SET status='Rejected', updated_at=NOW() WHERE id=%s", (order_id,))
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
                 return {"ok": False, "status": "Rejected", "reason": "provider_http"}
 
             try:
                 data = resp.json()
             except Exception:
                 _refund_if_needed(cur, user_id, price, order_id)
-                cur.execute("UPDATE public.orders SET status='Rejected', updated_at=NOW() WHERE id=%s", (order_id,))
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
                 return {"ok": False, "status": "Rejected", "reason": "bad_provider_json"}
 
             provider_id = data.get("order") or data.get("order_id")
             if not provider_id:
                 _refund_if_needed(cur, user_id, price, order_id)
-                cur.execute("UPDATE public.orders SET status='Rejected', updated_at=NOW() WHERE id=%s", (order_id,))
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
                 return {"ok": False, "status": "Rejected", "reason": "no_provider_id"}
 
-            cur.execute(
-                """                UPDATE public.orders
-                SET provider_order_id=%s, status='Processing', updated_at=NOW(),
-                    payload = COALESCE(payload, '{}'::jsonb) || %s::jsonb
+            cur.execute("""
+                UPDATE public.orders
+                SET provider_order_id=%s, status='Processing'
                 WHERE id=%s
-                """, (str(provider_id), Json({"provider_order_id": str(provider_id), "provider_response": data}), order_id)
-            )
-        # notify
-        try:
-            _notify_user(conn, user_id, order_id, "تم تنفيذ طلبك", f"رقم المزود: {provider_id}")
-        except Exception: pass
-        try:
-            _notify_owner_new_order(conn, order_id)
-        except Exception: pass
-
-        return {"ok": True, "status": "Processing", "provider_order_id": provider_id}
+            """, (str(provider_id), order_id))
+            return {"ok": True, "status": "Processing", "provider_order_id": provider_id}
     finally:
         put_conn(conn)
+
 def _refund_if_needed(cur, user_id: int, price: float, order_id: int):
     # Correctly use the price parameter (eff_price might be used elsewhere).
     if price and price > 0:
@@ -1383,6 +1325,9 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: Optional[s
 
     code_val = (data.get("code") or "").strip()
     amount   = data.get("amount")
+    # ✅ Capture provider order number (if provided by owner) or generate for non-API services
+    provided_order_no = (data.get("order_no") or data.get("provider_order_no") or data.get("provider_order_id") or "").strip()
+
 
     conn = get_conn()
     try:
@@ -1415,6 +1360,28 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: Optional[s
                 except Exception:
                     pass
 
+            
+            # Attach an order number:
+            # - If owner provided a provider order number, use it.
+            # - Otherwise for non-API orders, generate a numeric order_no with similar length to provider orders (fallback 9).
+            order_no_to_set = None
+            if provided_order_no:
+                order_no_to_set = provided_order_no
+            else:
+                # Generate only for non-provider orders if missing
+                if (otype or "").lower() != "provider":
+                    try:
+                        cur.execute("SELECT provider_order_id FROM public.orders WHERE provider_order_id IS NOT NULL AND provider_order_id <> '' ORDER BY id DESC LIMIT 1")
+                        rr = cur.fetchone()
+                        pref_len = len(str(rr[0])) if rr and rr[0] else 9
+                    except Exception:
+                        pref_len = 9
+                    if pref_len < 6 or pref_len > 18:
+                        pref_len = 9
+                    order_no_to_set = "".join(random.choice("0123456789") for _ in range(pref_len))
+            if order_no_to_set:
+                current["order_no"] = str(order_no_to_set)
+
             # Persist order as Done
             if current:
                 if is_jsonb:
@@ -1423,6 +1390,13 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: Optional[s
                     cur.execute("UPDATE public.orders SET status='Done', payload=(%s)::jsonb::text WHERE id=%s", (json.dumps(current, ensure_ascii=False), order_id))
             else:
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
+
+            # Set provider_order_id if we have an order number from provider
+            if provided_order_no:
+                try:
+                    cur.execute("UPDATE public.orders SET provider_order_id=%s WHERE id=%s", (str(provided_order_no), order_id))
+                except Exception:
+                    pass
 
             # Credit wallet for Asiacell direct topup (topup_card type)
             if (otype or "").lower() == "topup_card":
@@ -2546,247 +2520,8 @@ def test_push_owner(p: TestPushIn):
     finally:
         put_conn(conn)
 
-
-
-
-
-# =========================
-# KD1S API - create order and store provider_order_id
-# =========================
-from pydantic import BaseModel
-from typing import Optional, Any, Dict
-
-class ApiOrderIn(BaseModel):
-    uid: str            # user UID in our system
-    service: int        # KD1S service id
-    link: str           # target link
-    quantity: int       # requested quantity
-    title: Optional[str] = None
-    price: Optional[float] = None
-    extras: Optional[Dict[str, Any]] = None  # optional extra params to send
-
-@app.post("/api/orders/api/create")
-def api_create_order_kd1s(body: ApiOrderIn):
-    if not PROVIDER_API_KEY:
-        raise HTTPException(503, "Provider not configured")
-    # 1) resolve user_id
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT id FROM public.users WHERE uid=%s", (body.uid,))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(404, "user not found")
-            user_id = int(row[0])
-            # 2) insert local order (type=api), put details in payload
-            payload = {
-                "service": body.service,
-                "link": body.link,
-                "quantity": body.quantity,
-                "extras": body.extras or {},
-                "provider": "kd1s"
-            }
-            title = body.title or f"API Service {body.service}"
-            cur.execute("""
-                INSERT INTO public.orders (user_id, title, status, type, payload)
-                VALUES (%s, %s, %s, %s, %s::jsonb)
-                RETURNING id
-            """, (user_id, title, "Processing", "api", Json(payload)))
-            oid = int(cur.fetchone()[0])
-        # 3) submit to KD1S
-        try:
-            form = {
-                "key": PROVIDER_API_KEY,
-                "action": "add",
-                "service": str(body.service),
-                "link": body.link,
-                "quantity": str(body.quantity),
-            }
-            if body.extras:
-                for k, v in body.extras.items():
-                    if v is not None:
-                        form[k] = str(v)
-            r = requests.post(PROVIDER_API_URL, data=form, timeout=15)
-            r.raise_for_status()
-            data = r.json()
-            if "order" not in data:
-                # provider returned error
-                msg = data.get("error") or data.get("message") or "provider error"
-                with conn, conn.cursor() as cur:
-                    cur.execute("UPDATE public.orders SET status=%s, updated_at=NOW() WHERE id=%s", ("Rejected", oid))
-                raise HTTPException(502, f"Provider add failed: {msg}")
-            provider_oid = str(data["order"])
-            # 4) save provider_order_id and keep details in payload
-            with conn, conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE public.orders 
-                       SET provider_order_id=%s, 
-                           payload = payload || %s::jsonb, 
-                           updated_at=NOW()
-                     WHERE id=%s
-                """, (provider_oid, Json({"provider_order_id": provider_oid, "provider_response": data}), oid))
-            # 5) notify
-            try:
-                _notify_user(conn, user_id, oid, "تم استلام طلبك", f"رقم الطلب في المزود: {provider_oid}")
-            except Exception as e:
-                logger.warning("notify user after create failed: %s", e)
-            try:
-                _notify_owner_new_order(conn, oid)
-            except Exception as e:
-                logger.warning("notify owner after create failed: %s", e)
-            return {"ok": True, "order_id": oid, "provider_order_id": provider_oid}
-        except HTTPException:
-            raise
-        except Exception as e:
-            # provider exception
-            with conn, conn.cursor() as cur:
-                cur.execute("UPDATE public.orders SET status=%s, updated_at=NOW() WHERE id=%s", ("Rejected", oid))
-            raise HTTPException(502, f"Provider error: {e}")
-    finally:
-        put_conn(conn)
-
-
-
-@app.get("/api/orders/my/api")
-def my_api_orders(uid: str):
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT o.id, o.title, o.status, COALESCE(o.provider_order_id,''), o.created_at, o.updated_at,
-                       COALESCE(o.payload, '{}'::jsonb)
-                FROM public.orders o
-                JOIN public.users u ON u.id = o.user_id
-                WHERE u.uid=%s AND COALESCE(o.type,'manual') IN ('provider','api','smm','service')
-                ORDER BY o.id DESC
-                LIMIT 200
-            """, (uid,))
-            rows = cur.fetchall()
-        items = []
-        for (oid, title, status, provider_oid, created_at, updated_at, payload) in rows:
-            items.append({
-                "id": oid,
-                "title": title,
-                "status": status,
-                "provider_order_id": provider_oid,
-                "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else created_at,
-                "updated_at": updated_at.isoformat() if hasattr(updated_at, "isoformat") else updated_at,
-                "payload": payload if isinstance(payload, dict) else {},
-            })
-        return {"ok": True, "orders": items}
-    finally:
-        put_conn(conn)
-
-
 # =============== Run local ===============
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
-
-
-def _provider_poll_loop():
-    while True:
-        t0 = time.time()
-        try:
-            conn = get_conn()
-            try:
-                with conn, conn.cursor() as cur:
-                    cur.execute("SELECT pg_try_advisory_lock(991001223)")
-                    got = cur.fetchone()[0] if cur.rowcount else False
-                if not got:
-                    time.sleep(max(0.5, ORDER_POLL_INTERVAL_SECONDS / 2))
-                    put_conn(conn)
-                    continue
-                try:
-                    with conn.cursor() as cur:
-                        cur.execute("""
-                            SELECT o.id, o.user_id, o.title, o.provider_order_id, COALESCE(o.status,'Pending') AS status, COALESCE(o.type,'provider')
-                            FROM public.orders o
-                            WHERE o.provider_order_id IS NOT NULL
-                              AND COALESCE(o.type, 'provider') IN ('provider','api','smm','service')
-                              AND COALESCE(o.status,'Pending') NOT IN ('Done','Cancelled','Rejected','Refunded')
-                            ORDER BY o.id DESC
-                            LIMIT 500
-                        """)
-                        rows = cur.fetchall()
-                    batch, acc = [], []
-                    for row in rows:
-                        oid, user_id, title, prov_oid, old_status, otype = row
-                        for sid in str(prov_oid).split(","):
-                            sid = sid.strip()
-                            if sid:
-                                batch.append((sid, row))
-                                if len(batch) >= 100:
-                                    acc.append(batch); batch = []
-                    if batch: acc.append(batch)
-                    for bucket in acc:
-                        id_list = [sid for (sid, _row) in bucket]
-                        result = _kd1s_fetch_status_bulk(id_list)
-                        if not result: continue
-                        for (sid, row) in bucket:
-                            oid, user_id, title, prov_oid, old_status, otype = row
-                            info = result.get(str(sid))
-                            if not info: continue
-                            new_status = info.get("status") or old_status
-                            if new_status == old_status: continue
-                            with conn, conn.cursor() as cur:
-                                try:
-                                    cur.execute("SELECT pg_typeof(payload)::text FROM public.orders WHERE id=%s", (oid,))
-                                    tp = cur.fetchone()[0] if cur.rowcount else "jsonb"
-                                    if isinstance(tp, str) and tp.lower() == "jsonb":
-                                        extra = {k: v for k, v in info.items() if k != "status" and v is not None}
-                                        cur.execute("UPDATE public.orders SET status=%s, payload = payload || %s::jsonb, updated_at=NOW() WHERE id=%s",
-                                                    (new_status, Json(extra), oid))
-                                    else:
-                                        cur.execute("UPDATE public.orders SET status=%s, updated_at=NOW() WHERE id=%s", (new_status, oid))
-                                except Exception:
-                                    cur.execute("UPDATE public.orders SET status=%s, updated_at=NOW() WHERE id=%s", (new_status, oid))
-                            try:
-                                _notify_user(conn, int(user_id), int(oid), f"تم تحديث طلبك #{oid}", f"الحالة: {new_status}")
-                            except Exception as e:
-                                logger.warning("notify user failed: %s", e)
-                            try:
-                                _notify_owner_new_order(conn, int(oid))
-                            except Exception as e:
-                                logger.warning("notify owner failed: %s", e)
-                finally:
-                    try:
-                        with conn, conn.cursor() as cur:
-                            cur.execute("SELECT pg_advisory_unlock(991001223)")
-                    except Exception:
-                        pass
-            finally:
-                put_conn(conn)
-        except Exception as e:
-            logger.warning("poll loop error: %s", e)
-        time.sleep(max(0.5, ORDER_POLL_INTERVAL_SECONDS - (time.time() - t0)))
-
-
-def _safe_json(value):
-    if value is None:
-        return {}
-    if isinstance(value, (dict, list)):
-        return value
-    try:
-        return json.loads(value)
-    except Exception:
-        return {}
-
-
-def _postprocess_payload_raw(item: dict) -> dict:
-    """
-    If item contains 'payload_raw', convert it to 'payload' as JSON, otherwise leave as-is.
-    """
-    if 'payload_raw' in item and 'payload' not in item:
-        item['payload'] = _safe_json(item.pop('payload_raw'))
-    return item
-
-try:
-    if PROVIDER_API_KEY:
-        threading.Thread(target=_provider_poll_loop, daemon=True).start()
-        logger.info("KD1S polling started every %ss (%s)", ORDER_POLL_INTERVAL_SECONDS, PROVIDER_API_URL)
-    else:
-        logger.warning("KD1S polling NOT started: PROVIDER_API_KEY is empty")
-except Exception as _e:
-    logger.warning("Failed to start KD1S poller: %s", _e)
