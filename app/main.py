@@ -975,15 +975,16 @@ def _orders_for_uid(uid: str) -> List[dict]:
             """, (user_id,))
             rows = cur.fetchall()
         return [{
-            "id": row[0],
-            "title": row[1],
-            "quantity": row[2],
-            "price": float(row[3] or 0),
-            "status": row[4],
-            "created_at": int(row[5] or 0),
-            "link": row[6]
-        } for row in row, "order_no": row[7] } for row in rows]
-    finally:
+            "id": r[0],
+            "title": r[1],
+            "quantity": r[2],
+            "price": float(r[3] or 0),
+            "status": r[4],
+            "created_at": int(r[5] or 0),
+            "link": r[6],
+            "order_no": r[7]
+        } for r in rows]
+finally:
         put_conn(conn)
 
 @app.get("/api/orders/my")
