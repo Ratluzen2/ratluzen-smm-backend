@@ -2625,13 +2625,12 @@ def sync_provider(uid: str, limit: int = 30):
                             (new_status, Json(cur_payload), oid))
                 updated.append({"id": oid, "status": new_status})
 
-                # push notify if moved to a final state
-                if new_status in finals and status not in finals:
+                # push FCM only when API order moves to Done
+                if new_status == 'Done' and status != 'Done':
                     try:
-                        _notify_user(conn, user_id, oid, "تم تحديث طلبك", f"الحالة: {new_status}")
+                        _notify_user(conn, user_id, oid, "طلبك اكتمل", f"رقم الطلب: {ono}")
                     except Exception:
                         pass
-
-    finally:
+finally:
         put_conn(conn)
     return {"ok": True, "updated": updated, "errors": errors}
