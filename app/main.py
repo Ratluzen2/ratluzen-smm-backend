@@ -970,7 +970,7 @@ def _orders_for_uid(uid: str) -> List[dict]:
             cur.execute("""
                 SELECT id, title, quantity, price,
                        status, EXTRACT(EPOCH FROM created_at)*1000, link,
-                       COALESCE(provider_order_id::text, (payload->>'order_no')) AS order_no
+                       COALESCE(provider_order_id::text, (COALESCE(NULLIF(payload,''),'{}')::jsonb->>'order_no')) AS order_no
                 FROM public.orders
                 WHERE user_id=%s
                 ORDER BY id DESC
