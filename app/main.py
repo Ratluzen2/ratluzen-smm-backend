@@ -1279,9 +1279,55 @@ def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[s
                 raise HTTPException(400, "invalid status")
 
             # manual/topup_card doesn't call provider
+
+
             if otype in ("topup_card", "manual") or service_id is None:
+
+
+                # mark done
+
+
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
+
+
+                # notify user (FCM + inbox)
+
+
+                try:
+
+
+                    title_txt = f"تم تنفيذ طلبك {title or ''}".strip()
+
+
+                    body_txt = title or "تم التنفيذ"
+
+
+                    try:
+
+
+                        if isinstance(payload, dict) and payload.get("account_id"):
+
+
+                            body_txt = f"{body_txt} | ID: {payload.get('account_id')}"
+
+
+                    except Exception:
+
+
+                        pass
+
+
+                    _notify_user(conn, user_id, order_id, title_txt, body_txt)
+
+
+                except Exception:
+
+
+                    pass
+
+
                 return {"ok": True, "status": "Done"}
+
 
             # Provider-type: move to Processing immediately to avoid re-appearing in pending list
             try:
