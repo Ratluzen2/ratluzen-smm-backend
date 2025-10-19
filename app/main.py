@@ -1245,97 +1245,96 @@ async def create_manual_paid_alias8(request: Request):
 # =========================
 # Approve/Deliver/Reject
 # =========================
+
 @app.post("/api/admin/orders/{oid}/approve")
 def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-
-body = {}
-try:
-    body = json.loads(request._body.decode()) if hasattr(request, "_body") and request._body else {}
-except Exception:
+    body = {}
     try:
-        body = request._json  # type: ignore
+        # Try to read body if present
+        if hasattr(request, "_body") and request._body:
+            try:
+                body = json.loads(request._body.decode())
+            except Exception:
+                body = {}
+        else:
+            body = {}
     except Exception:
         body = {}
-# Extract optional provider order number supplied by admin
-provided_order_no = str((body.get("order_no") or body.get("provider_order_id") or body.get("order") or body.get("id") or "")).strip()
-_require_admin(_pick_admin_password(x_admin_password, password, body) or "")
-conn = get_conn()
-try:
-    with conn, conn.cursor() as cur:
-        cur.execute("""                SELECT id, user_id, service_id, link, quantity, price, status, provider_order_id, title, payload, type
-            FROM public.orders WHERE id=%s FOR UPDATE
-        """, (oid,))
-        row = cur.fetchone()
-        if not row:
-            raise HTTPException(404, "order not found")
+    provided_order_no = str((body.get("order_no") or body.get("provider_order_id") or body.get("order") or body.get("id") or "")).strip()
+    _require_admin(_pick_admin_password(x_admin_password, password, body) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""                SELECT id, user_id, service_id, link, quantity, price, status, provider_order_id, title, payload, type
+                FROM public.orders WHERE id=%s FOR UPDATE
+            """, (oid,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "order not found")
 
-        (order_id, user_id, service_id, link, quantity, price, status, provider_order_id, title, payload, otype) = row
-        price = float(price or 0)
+            (order_id, user_id, service_id, link, quantity, price, status, provider_order_id, title, payload, otype) = row
+            price = float(price or 0)
 
-        if status not in ("Pending", "Processing"):
-            raise HTTPException(400, "invalid status")
+            if status not in ("Pending", "Processing"):
+                raise HTTPException(400, "invalid status")
 
-        # manual/topup_card doesn't call provider
-        if otype in ("topup_card", "manual") or service_id is None:
-            cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
-            return {"ok": True, "status": "Done"}
+            # manual/topup_card doesn't call provider
+            if otype in ("topup_card", "manual") or service_id is None:
+                cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
+                return {"ok": True, "status": "Done"}
 
-        # Provider-type: move to Processing immediately to avoid re-appearing in pending list
-        try:
-            cur_payload = payload if isinstance(payload, dict) else {}
+            # Provider-type: move to Processing immediately to avoid re-appearing in pending list
             try:
-                cur_payload = dict(cur_payload)
+                cur_payload = payload if isinstance(payload, dict) else {}
+                try:
+                    cur_payload = dict(cur_payload)
+                except Exception:
+                    cur_payload = {}
+                import time as _t
+                cur_payload["approved_at"] = int(_t.time() * 1000)
+                cur.execute("UPDATE public.orders SET status='Processing', payload=%s WHERE id=%s", (Json(cur_payload), order_id))
             except Exception:
-                cur_payload = {}
-            import time as _t
-            cur_payload["approved_at"] = int(_t.time() * 1000)
-            cur.execute("UPDATE public.orders SET status='Processing', payload=%s WHERE id=%s", (Json(cur_payload), order_id))
-        except Exception:
-            # best-effort; continue
-            pass
+                # best-effort
+                pass
 
-        # Send to provider
-        try:
-            resp = requests.post(
-                PROVIDER_API_URL,
-                data={"key": PROVIDER_API_KEY, "action": "add", "service": str(service_id), "link": link, "quantity": str(quantity)},
-                timeout=25
-            )
-        except Exception:
-            _refund_if_needed(cur, user_id, price, order_id)
-            cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
-            return {"ok": False, "status": "Rejected", "reason": "provider_unreachable"}
+            # Send to provider
+            try:
+                resp = requests.post(
+                    PROVIDER_API_URL,
+                    data={"key": PROVIDER_API_KEY, "action": "add", "service": str(service_id), "link": link, "quantity": str(quantity)},
+                    timeout=25
+                )
+            except Exception:
+                _refund_if_needed(cur, user_id, price, order_id)
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                return {"ok": False, "status": "Rejected", "reason": "provider_unreachable"}
 
-        if resp.status_code // 100 != 2:
-            _refund_if_needed(cur, user_id, price, order_id)
-            cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
-            return {"ok": False, "status": "Rejected", "reason": "provider_http"}
+            if resp.status_code // 100 != 2:
+                _refund_if_needed(cur, user_id, price, order_id)
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                return {"ok": False, "status": "Rejected", "reason": "provider_http"}
 
-        try:
-            data = resp.json()
-        except Exception:
-            _refund_if_needed(cur, user_id, price, order_id)
-            cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
-            return {"ok": False, "status": "Rejected", "reason": "bad_provider_json"}
+            try:
+                data = resp.json()
+            except Exception:
+                _refund_if_needed(cur, user_id, price, order_id)
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                return {"ok": False, "status": "Rejected", "reason": "bad_provider_json"}
 
-        provider_id = data.get("order") or data.get("order_id")
-        if not provider_id:
-            _refund_if_needed(cur, user_id, price, order_id)
-            cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
-            return {"ok": False, "status": "Rejected", "reason": "no_provider_id"}
+            provider_id = data.get("order") or data.get("order_id")
+            if not provider_id:
+                _refund_if_needed(cur, user_id, price, order_id)
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                return {"ok": False, "status": "Rejected", "reason": "no_provider_id"}
 
-        # Persist provider_order_id (status already set to Processing above)
-        cur.execute("""                UPDATE public.orders
-            SET provider_order_id=%s
-            WHERE id=%s
-        """, (str(provider_id), order_id))
-        return {"ok": True, "status": "Processing", "provider_order_id": provider_id}
-finally:
-    put_conn(conn)
-
+            # Persist provider_order_id (status already set to Processing above)
+            cur.execute("""                UPDATE public.orders
+                SET provider_order_id=%s
+                WHERE id=%s
+            """, (str(provider_id), order_id))
+            return {"ok": True, "status": "Processing", "provider_order_id": provider_id}
     finally:
         put_conn(conn)
-
 def _refund_if_needed(cur, user_id: int, price: float, order_id: int):
     # Correctly use the price parameter (eff_price might be used elsewhere).
     if price and price > 0:
