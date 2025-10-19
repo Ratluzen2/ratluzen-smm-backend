@@ -972,47 +972,22 @@ def _orders_for_uid(uid: str) -> List[dict]:
                 return []
             user_id = r[0]
             cur.execute("""
-                SELECT id, title, quantity, price, status,
-                       EXTRACT(EPOCH FROM created_at)*1000 AS created_at,
-                       link,
-                       COALESCE(provider_order_id, '') AS provider_order_id,
-                       COALESCE(payload, '{}'::jsonb) AS payload
+                SELECT id, title, quantity, price,
+                       status, EXTRACT(EPOCH FROM created_at)*1000, link
                 FROM public.orders
                 WHERE user_id=%s
                 ORDER BY id DESC
             """, (user_id,))
             rows = cur.fetchall()
-
-        items = []
-        for row in rows:
-            oid = row[0]
-            title = row[1]
-            quantity = row[2]
-            price = float(row[3] or 0)
-            status = row[4]
-            created_at = int(row[5] or 0)
-            link = row[6]
-            provider_oid = (row[7] or "").strip()
-            payload = row[8] if isinstance(row[8], dict) else {}
-
-            # Make provider code visible without client changes by appending to title
-            display_title = title
-            if provider_oid:
-                if "كود المزود:" not in (display_title or "") and "مزود:" not in (display_title or ""):
-                    display_title = f"{title} | كود المزود: {provider_oid}"
-
-            items.append({
-                "id": oid,
-                "title": display_title,
-                "quantity": quantity,
-                "price": price,
-                "status": status,
-                "created_at": created_at,
-                "link": link,
-                "provider_order_id": provider_oid,
-                "payload": payload
-            })
-        return items
+        return [{
+            "id": row[0],
+            "title": row[1],
+            "quantity": row[2],
+            "price": float(row[3] or 0),
+            "status": row[4],
+            "created_at": int(row[5] or 0),
+            "link": row[6]
+        } for row in rows]
     finally:
         put_conn(conn)
 
@@ -2776,3 +2751,23 @@ def _provider_poll_loop():
         except Exception as e:
             logger.warning("poll loop error: %s", e)
         time.sleep(max(0.5, ORDER_POLL_INTERVAL_SECONDS - (time.time() - t0)))
+
+
+def _safe_json(value):
+    if value is None:
+        return {}
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return {}
+
+
+def _postprocess_payload_raw(item: dict) -> dict:
+    """
+    If item contains 'payload_raw', convert it to 'payload' as JSON, otherwise leave as-is.
+    """
+    if 'payload_raw' in item and 'payload' not in item:
+        item['payload'] = _safe_json(item.pop('payload_raw'))
+    return item
