@@ -2539,6 +2539,135 @@ except Exception as _e:
     logger.warning("Failed to start KD1S poller: %s", _e)
 
 
+
+# =========================
+# KD1S API - create order and store provider_order_id
+# =========================
+from pydantic import BaseModel
+from typing import Optional, Any, Dict
+
+class ApiOrderIn(BaseModel):
+    uid: str            # user UID in our system
+    service: int        # KD1S service id
+    link: str           # target link
+    quantity: int       # requested quantity
+    title: Optional[str] = None
+    price: Optional[float] = None
+    extras: Optional[Dict[str, Any]] = None  # optional extra params to send
+
+@app.post("/api/orders/api/create")
+def api_create_order_kd1s(body: ApiOrderIn):
+    if not PROVIDER_API_KEY:
+        raise HTTPException(503, "Provider not configured")
+    # 1) resolve user_id
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (body.uid,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "user not found")
+            user_id = int(row[0])
+            # 2) insert local order (type=api), put details in payload
+            payload = {
+                "service": body.service,
+                "link": body.link,
+                "quantity": body.quantity,
+                "extras": body.extras or {},
+                "provider": "kd1s"
+            }
+            title = body.title or f"API Service {body.service}"
+            cur.execute("""
+                INSERT INTO public.orders (user_id, title, status, type, payload)
+                VALUES (%s, %s, %s, %s, %s::jsonb)
+                RETURNING id
+            """, (user_id, title, "Processing", "api", Json(payload)))
+            oid = int(cur.fetchone()[0])
+        # 3) submit to KD1S
+        try:
+            form = {
+                "key": PROVIDER_API_KEY,
+                "action": "add",
+                "service": str(body.service),
+                "link": body.link,
+                "quantity": str(body.quantity),
+            }
+            if body.extras:
+                for k, v in body.extras.items():
+                    if v is not None:
+                        form[k] = str(v)
+            r = requests.post(PROVIDER_API_URL, data=form, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            if "order" not in data:
+                # provider returned error
+                msg = data.get("error") or data.get("message") or "provider error"
+                with conn, conn.cursor() as cur:
+                    cur.execute("UPDATE public.orders SET status=%s, updated_at=NOW() WHERE id=%s", ("Rejected", oid))
+                raise HTTPException(502, f"Provider add failed: {msg}")
+            provider_oid = str(data["order"])
+            # 4) save provider_order_id and keep details in payload
+            with conn, conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE public.orders 
+                       SET provider_order_id=%s, 
+                           payload = payload || %s::jsonb, 
+                           updated_at=NOW()
+                     WHERE id=%s
+                """, (provider_oid, Json({"provider_order_id": provider_oid, "provider_response": data}), oid))
+            # 5) notify
+            try:
+                _notify_user(conn, user_id, oid, "تم استلام طلبك", f"رقم الطلب في المزود: {provider_oid}")
+            except Exception as e:
+                logger.warning("notify user after create failed: %s", e)
+            try:
+                _notify_owner_new_order(conn, oid)
+            except Exception as e:
+                logger.warning("notify owner after create failed: %s", e)
+            return {"ok": True, "order_id": oid, "provider_order_id": provider_oid}
+        except HTTPException:
+            raise
+        except Exception as e:
+            # provider exception
+            with conn, conn.cursor() as cur:
+                cur.execute("UPDATE public.orders SET status=%s, updated_at=NOW() WHERE id=%s", ("Rejected", oid))
+            raise HTTPException(502, f"Provider error: {e}")
+    finally:
+        put_conn(conn)
+
+
+
+@app.get("/api/orders/my/api")
+def my_api_orders(uid: str):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT o.id, o.title, o.status, COALESCE(o.provider_order_id,''), o.created_at, o.updated_at,
+                       COALESCE(o.payload, '{}'::jsonb)
+                FROM public.orders o
+                JOIN public.users u ON u.id = o.user_id
+                WHERE u.uid=%s AND COALESCE(o.type,'manual') IN ('provider','api','smm','service')
+                ORDER BY o.id DESC
+                LIMIT 200
+            """, (uid,))
+            rows = cur.fetchall()
+        items = []
+        for (oid, title, status, provider_oid, created_at, updated_at, payload) in rows:
+            items.append({
+                "id": oid,
+                "title": title,
+                "status": status,
+                "provider_order_id": provider_oid,
+                "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else created_at,
+                "updated_at": updated_at.isoformat() if hasattr(updated_at, "isoformat") else updated_at,
+                "payload": payload if isinstance(payload, dict) else {},
+            })
+        return {"ok": True, "orders": items}
+    finally:
+        put_conn(conn)
+
+
 # =============== Run local ===============
 if __name__ == "__main__":
     import uvicorn
