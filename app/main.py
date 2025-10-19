@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import threading
 import logging
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
@@ -2583,6 +2584,112 @@ def _provider_status(order_no: str) -> dict:
             "charge": charge, "remains": remains, "start_count": start, "currency": currency, "raw": data}
 
 
+
+# =========================
+# Background Provider Sync Worker
+# =========================
+_BG_THREAD_STARTED = False
+
+def _bg_provider_sync_once(limit:int=200, min_interval_sec:int=60):
+    """Run one sweep to update provider orders and queue notifications."""
+    finals = ("Done", "Rejected", "Refunded")
+    to_notify = []
+    now_ms = int(time.time() * 1000)
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            # Use advisory lock to ensure single sweep at a time across dyno restarts
+            try:
+                cur.execute("SELECT pg_try_advisory_lock(987654322)")
+                if not (cur.fetchone() or [False])[0]:
+                    return 0
+            except Exception:
+                pass
+
+            cur.execute("""
+                SELECT id, user_id, provider_order_id, status, payload, title, type
+                FROM public.orders
+                WHERE provider_order_id IS NOT NULL AND provider_order_id<>''
+                  AND status NOT IN ('Done','Rejected','Refunded')
+                ORDER BY id DESC
+                LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall() or []
+            updated = 0
+            for (oid, user_id, ono, status, payload, title, otype) in rows:
+                # throttle by provider_checked_at in payload
+                p = payload if isinstance(payload, dict) else {}
+                try:
+                    last = int(p.get("provider_checked_at") or 0)
+                except Exception:
+                    last = 0
+                if now_ms - last < (min_interval_sec * 1000):
+                    continue
+
+                md = _provider_status(ono)
+                # update provider_checked_at regardless of success
+                p = dict(p) if isinstance(p, dict) else {}
+                p["provider_checked_at"] = now_ms
+
+                if not md.get("ok"):
+                    # persist only the checked_at bump
+                    try:
+                        cur.execute("UPDATE public.orders SET payload=%s WHERE id=%s", (Json(p), oid))
+                    except Exception:
+                        pass
+                    continue
+
+                new_status = md.get("status") or "Processing"
+                p["provider_status"] = md.get("status_raw")
+                if md.get("charge") is not None: p["provider_charge"] = md.get("charge")
+                if md.get("remains") is not None: p["provider_remains"] = md.get("remains")
+                if md.get("start_count") is not None: p["start_count"] = md.get("start_count")
+                if md.get("currency"): p["currency"] = md.get("currency")
+
+                cur.execute("UPDATE public.orders SET status=%s, payload=%s WHERE id=%s",
+                            (new_status, Json(p), oid))
+                updated += 1
+
+                if new_status == "Done" and status != "Done":
+                    to_notify.append((user_id, oid, f"رقم الطلب: {ono}"))
+
+            # release lock
+            try:
+                cur.execute("SELECT pg_advisory_unlock(987654322)")
+            except Exception:
+                pass
+        # send notifications after commit
+        for (uid_i, oid_i, body_txt) in to_notify:
+            try:
+                _notify_user(None, uid_i, oid_i, "طلبك اكتمل", body_txt)
+            except Exception:
+                logger.exception("bg post-commit notify failed")
+        return updated
+    finally:
+        put_conn(conn)
+
+def _bg_provider_sync_loop():
+    interval = int(os.getenv("SYNC_PROVIDER_INTERVAL_SEC", "30"))
+    min_interval_sec = max(15, int(os.getenv("SYNC_PROVIDER_MIN_INTERVAL_SEC", "60")))
+    while True:
+        try:
+            _bg_provider_sync_once(limit=200, min_interval_sec=min_interval_sec)
+        except Exception as e:
+            logger.exception("bg provider sync error: %s", e)
+        time.sleep(interval)
+
+def _ensure_bg_thread():
+    global _BG_THREAD_STARTED
+    if _BG_THREAD_STARTED:
+        return
+    if os.getenv("SYNC_PROVIDER_BG", "1") != "1":
+        logger.info("Background provider sync disabled by SYNC_PROVIDER_BG")
+        _BG_THREAD_STARTED = True
+        return
+    t = threading.Thread(target=_bg_provider_sync_loop, name="provider-sync-worker", daemon=True)
+    t.start()
+    _BG_THREAD_STARTED = True
+    logger.info("Background provider sync worker started")
 @app.post("/api/orders/sync_provider")
 def sync_provider(uid: str, limit: int = 30):
     to_notify = []
