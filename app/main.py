@@ -2702,6 +2702,11 @@ def sync_provider(uid: str, limit: int = 30):
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
+            # Ensure single runner (avoid duplicate pushes)
+            try:
+                cur.execute("SELECT pg_try_advisory_lock(987654322)")
+            except Exception:
+                pass
             # find user id
             cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
             r = cur.fetchone()
@@ -2740,14 +2745,25 @@ def sync_provider(uid: str, limit: int = 30):
                     cur_payload["start_count"] = md.get("start_count")
                 if md.get("currency"):
                     cur_payload["currency"] = md.get("currency")
+                # decide notify once when moving to Done and not already notified
+                notify = (new_status == 'Done' and status != 'Done' and not bool(cur_payload.get('notified_done')))
+                if notify:
+                    cur_payload['notified_done'] = True
 
                 # persist
                 cur.execute("UPDATE public.orders SET status=%s, payload=%s WHERE id=%s",
                             (new_status, Json(cur_payload), oid))
                 updated.append({"id": oid, "status": new_status})
 
-                to_notify.append((user_id, oid, f"رقم الطلب: {ono}"))
+                if notify:
+                    to_notify.append((user_id, oid, f"رقم الطلب: {ono}"))
     finally:
+        # release advisory lock if held
+        try:
+            with conn, conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_unlock(987654322)")
+        except Exception:
+            pass
         put_conn(conn)
     # send notifications after commit
     for (uid_i, oid_i, body_txt) in to_notify:
