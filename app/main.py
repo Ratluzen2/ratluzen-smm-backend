@@ -957,6 +957,7 @@ for path in ASIACELL_PATHS[1:]:
             put_conn(conn)
 
 # Orders of a user
+
 def _orders_for_uid(uid: str) -> List[dict]:
     conn = get_conn()
     try:
@@ -968,7 +969,8 @@ def _orders_for_uid(uid: str) -> List[dict]:
             user_id = r[0]
             cur.execute("""
                 SELECT id, title, quantity, price,
-                       status, EXTRACT(EPOCH FROM created_at)*1000, link, COALESCE(provider_order_id::text, (payload->>'order_no')) AS order_no
+                       status, EXTRACT(EPOCH FROM created_at)*1000, link,
+                       COALESCE(provider_order_id::text, (payload->>'order_no')) AS order_no
                 FROM public.orders
                 WHERE user_id=%s
                 ORDER BY id DESC
@@ -984,7 +986,7 @@ def _orders_for_uid(uid: str) -> List[dict]:
             "link": r[6],
             "order_no": r[7]
         } for r in rows]
-finally:
+    finally:
         put_conn(conn)
 
 @app.get("/api/orders/my")
