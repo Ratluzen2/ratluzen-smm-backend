@@ -2,6 +2,7 @@ import os
 import json
 import time
 import logging
+import threading
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,6 +26,9 @@ FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "").strip()
 GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
 FCM_PROJECT_ID = os.getenv("FCM_PROJECT_ID", "").strip()  # optional override
 OWNER_UID = os.getenv("OWNER_UID", "OWNER-0001").strip()
+
+# Poll interval (seconds) for provider status checks (API orders only)
+ORDER_POLL_INTERVAL_SECONDS = int(os.getenv("ORDER_POLL_INTERVAL_SECONDS", "3"))
 
 PROVIDER_API_URL = os.getenv("PROVIDER_API_URL", "https://kd1s.com/api/v2")
 PROVIDER_API_KEY = os.getenv("PROVIDER_API_KEY", "25a9ceb07be0d8b2ba88e70dcbe92e06")
@@ -483,6 +487,33 @@ def _notify_owner_new_order(_conn_ignored, order_id: int):
                 logger.exception("owner notify (push) failed: %s", e)
     finally:
         put_conn(c)
+
+
+def _notify_owner_generic(_conn_ignored, title: str, body: str, order_id: int | None = None):
+    """
+    Insert a notification for OWNER and send push to all owner's devices.
+    """
+    c = get_conn()
+    try:
+        tokens = []
+        try:
+            with c, c.cursor() as cur:
+                owner_id = _ensure_owner_user_id(cur)
+                cur.execute(
+                    "INSERT INTO public.user_notifications(user_id, order_id, title, body, status) VALUES (%s,%s,%s,%s,'unread')",
+                    (owner_id, order_id, title, body)
+                )
+                tokens = _tokens_for_uid(cur, OWNER_UID)
+        except Exception as e:
+            logger.exception("owner notify (db) failed: %s", e)
+        for t in tokens:
+            try:
+                _fcm_send_push(t, title, body, order_id)
+            except Exception as e:
+                logger.exception("owner notify (push) failed: %s", e)
+    finally:
+        put_conn(c)
+
 
 def _needs_code(title: str, otype: Optional[str]) -> bool:
     t = (title or "").lower()
@@ -1226,6 +1257,39 @@ async def create_manual_paid_alias7(request: Request):
 @app.post("/api/orders/manualPaid")
 async def create_manual_paid_alias8(request: Request):
     return await create_manual_paid(request)
+
+
+
+# =========================
+# Provider polling helpers
+# =========================
+def _normalize_provider_status(raw: str) -> str:
+    s = (raw or "").strip().lower()
+    if s in ("completed", "complete", "done", "success", "finished"):
+        return "Done"
+    if s in ("partial",):
+        return "Partial"
+    if s in ("processing", "in progress", "in_progress", "inprogress", "pending", "queued"):
+        return "Processing"
+    if s in ("canceled", "cancelled", "rejected", "failed", "error"):
+        return "Cancelled"
+    return raw.capitalize() if raw else "Unknown"
+
+def _provider_fetch_status(order_id: str) -> tuple[str, dict]:
+    try:
+        resp = requests.post(
+            PROVIDER_API_URL,
+            data={"key": PROVIDER_API_KEY, "action": "status", "order": order_id},
+            timeout=12
+        )
+        if resp.status_code // 100 != 2:
+            return ("", {})
+        data = resp.json()
+        raw_status = data.get("status") or (data.get("order", {}) if isinstance(data.get("order"), dict) else {}).get("status")
+        return (_normalize_provider_status(raw_status), data if isinstance(data, dict) else {})
+    except Exception as e:
+        logger.warning("provider status fetch failed for %s: %s", order_id, e)
+        return ("", {})
 
 # =========================
 # Approve/Deliver/Reject
@@ -2479,6 +2543,100 @@ def test_push_owner(p: TestPushIn):
         return {"ok": True, "sent": sent, "owner_uid": OWNER_UID}
     finally:
         put_conn(conn)
+
+
+def _provider_poll_loop():
+    while True:
+        t0 = time.time()
+        try:
+            conn = get_conn()
+            try:
+                # advisory lock to avoid multiple pollers
+                with conn, conn.cursor() as cur:
+                    cur.execute("SELECT pg_try_advisory_lock(991001223)")
+                    got = cur.fetchone()[0] if cur.rowcount else False
+                if not got:
+                    time.sleep(min(1.0, ORDER_POLL_INTERVAL_SECONDS / 2))
+                    put_conn(conn)
+                    continue
+
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT o.id, o.user_id, o.title, o.provider_order_id, COALESCE(o.status,'Pending') AS status, COALESCE(o.type,'provider')
+                            FROM public.orders o
+                            WHERE o.provider_order_id IS NOT NULL
+                              AND COALESCE(o.type, 'provider') IN ('provider','api','smm','service')
+                              AND COALESCE(o.status,'Pending') NOT IN ('Done','Cancelled','Rejected','Refunded')
+                            ORDER BY o.id DESC
+                            LIMIT 250
+                        """)
+                        rows = cur.fetchall()
+
+                    for (oid, user_id, title, prov_oid, old_status, otype) in rows:
+                        ids = [s.strip() for s in str(prov_oid).split(",") if s.strip()]
+                        if not ids:
+                            continue
+                        new_status, raw = _provider_fetch_status(ids[0])
+                        if not new_status or new_status == old_status:
+                            continue
+
+                        # Update DB status (+merge some raw fields into payload when possible)
+                        with conn, conn.cursor() as cur:
+                            add_json = {}
+                            try:
+                                if isinstance(raw, dict):
+                                    for k in ("charge","start_count","remains","currency","status"):
+                                        if k in raw:
+                                            add_json[k] = raw[k]
+                            except Exception:
+                                pass
+
+                            if add_json:
+                                try:
+                                    cur.execute("SELECT pg_typeof(payload)::text FROM public.orders WHERE id=%s", (oid,))
+                                    tp = cur.fetchone()[0] if cur.rowcount else "jsonb"
+                                    if isinstance(tp, str) and tp.lower() == "jsonb":
+                                        cur.execute("UPDATE public.orders SET status=%s, payload = payload || %s::jsonb, updated_at=NOW() WHERE id=%s",
+                                                    (new_status, Json(add_json), oid))
+                                    else:
+                                        cur.execute("UPDATE public.orders SET status=%s, updated_at=NOW() WHERE id=%s", (new_status, oid))
+                                except Exception:
+                                    cur.execute("UPDATE public.orders SET status=%s, updated_at=NOW() WHERE id=%s", (new_status, oid))
+                            else:
+                                cur.execute("UPDATE public.orders SET status=%s, updated_at=NOW() WHERE id=%s", (new_status, oid))
+
+                        # Notify user and owner
+                        try:
+                            _notify_user(conn, int(user_id), int(oid), f"تم تحديث طلبك #{oid}", f"الحالة: {new_status}")
+                        except Exception as e:
+                            logger.warning("notify user on status change failed: %s", e)
+                        try:
+                            _notify_owner_generic(conn, f"تحديث حالة طلب {oid}", f"أصبحت {new_status}", int(oid))
+                        except Exception as e:
+                            logger.warning("notify owner on status change failed: %s", e)
+
+                finally:
+                    try:
+                        with conn, conn.cursor() as cur:
+                            cur.execute("SELECT pg_advisory_unlock(991001223)")
+                    except Exception:
+                        pass
+            finally:
+                put_conn(conn)
+        except Exception as e:
+            logger.warning("provider poll loop error: %s", e)
+        elapsed = time.time() - t0
+        time.sleep(max(0.5, ORDER_POLL_INTERVAL_SECONDS - elapsed))
+
+
+# Start provider polling thread (API orders only)
+try:
+    threading.Thread(target=_provider_poll_loop, daemon=True).start()
+    logger.info("Provider polling started every %ss", ORDER_POLL_INTERVAL_SECONDS)
+except Exception as _e:
+    logger.warning("Failed to start provider poller: %s", _e)
+
 
 # =============== Run local ===============
 if __name__ == "__main__":
