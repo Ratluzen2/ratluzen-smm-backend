@@ -10,7 +10,7 @@ import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor, Json
 
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -1247,7 +1247,7 @@ async def create_manual_paid_alias8(request: Request):
 # =========================
 
 @app.post("/api/admin/orders/{oid}/approve")
-def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+def admin_approve_order(oid: int, request: Request, background_tasks: BackgroundTasks, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     body = {}
     try:
         # Try to read body if present
@@ -1329,7 +1329,7 @@ def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[s
                 return {"ok": True, "status": "Done"}
 
 
-            # Provider-type: move to Processing immediately to avoid re-appearing in pending list
+            # Provider-type: move to Processing immediately; send to provider in background
             try:
                 cur_payload = payload if isinstance(payload, dict) else {}
                 try:
@@ -1340,20 +1340,11 @@ def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[s
                 cur_payload["approved_at"] = int(_t.time() * 1000)
                 cur.execute("UPDATE public.orders SET status='Processing', payload=%s WHERE id=%s", (Json(cur_payload), order_id))
             except Exception:
-                # best-effort
                 pass
 
-            # Send to provider
-            try:
-                resp = requests.post(
-                    PROVIDER_API_URL,
-                    data={"key": PROVIDER_API_KEY, "action": "add", "service": str(service_id), "link": link, "quantity": str(quantity)},
-                    timeout=25
-                )
-            except Exception:
-                _refund_if_needed(cur, user_id, price, order_id)
-                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
-                return {"ok": False, "status": "Rejected", "reason": "provider_unreachable"}
+            # schedule background send
+            background_tasks.add_task(_bg_send_to_provider_and_persist, order_id, user_id, int(service_id), link, int(quantity), float(price), title, payload)
+            return {"ok": True, "status": "Processing"}
 
             if resp.status_code // 100 != 2:
                 _refund_if_needed(cur, user_id, price, order_id)
@@ -2588,116 +2579,69 @@ def test_push_owner(p: TestPushIn):
     finally:
         put_conn(conn)
 
-
-# =========================
-# Background provider-status poller (FCM on final states)
-# =========================
-import threading as _thr
-import time as _time
-
-def _scan_provider_orders_and_notify_once(_batch_limit: int = 50):
-    # Scan a batch of provider-linked orders that are not final yet,
-    # refresh their status from the provider, persist changes, and send FCM
-    # once when they transition into a final state (Done / Rejected / Refunded).
-    finals = ("Done", "Rejected", "Refunded")
+# ---------------- Background helper: send order to provider safely ----------------
+def _bg_send_to_provider_and_persist(order_id: int, user_id: int, service_id: int, link: str, quantity: int, price: float, title: str, payload: Any):
     conn = get_conn()
     try:
-        with conn:
-            with conn.cursor() as cur:
-                # Lock a small batch to avoid racing with admin actions
-                cur.execute(
-                    """
-                    SELECT id, user_id, provider_order_id, status, payload, title
-                    FROM public.orders
-                    WHERE provider_order_id IS NOT NULL AND provider_order_id<>''
-                      AND status NOT IN ('Done','Rejected','Refunded')
-                    ORDER BY id DESC
-                    LIMIT %s
-                    FOR UPDATE SKIP LOCKED
-                    """,
-                    (_batch_limit,),
+        with conn, conn.cursor() as cur:
+            # lock the order to avoid double-send
+            cur.execute("SELECT status, provider_order_id FROM public.orders WHERE id=%s FOR UPDATE", (order_id,))
+            row = cur.fetchone()
+            if not row:
+                return
+            status, provider_order_id = row
+            if provider_order_id:
+                return  # already sent
+
+            try:
+                resp = requests.post(
+                    PROVIDER_API_URL,
+                    data={"key": PROVIDER_API_KEY, "action": "add", "service": str(service_id), "link": link, "quantity": str(quantity)},
+                    timeout=10
                 )
-                rows = cur.fetchall() or []
+            except Exception:
+                _refund_if_needed(cur, user_id, price, order_id)
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                try:
+                    _notify_user(conn, user_id, order_id, "تعذر إرسال طلبك للمزوّد", "سيتم إرجاع الرصيد إن وجد.")
+                except Exception:
+                    pass
+                return
 
-                for (oid, user_id, ono, old_status, payload, title) in rows:
-                    try:
-                        md = _provider_status(ono)
-                    except Exception:
-                        md = {"ok": False, "error": "provider_error"}
+            if resp.status_code // 100 != 2:
+                _refund_if_needed(cur, user_id, price, order_id)
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                try:
+                    _notify_user(conn, user_id, order_id, "تعذر إرسال طلبك للمزوّد", f"HTTP {resp.status_code}")
+                except Exception:
+                    pass
+                return
 
-                    if not md.get("ok"):
-                        # keep as-is; try later
-                        continue
+            try:
+                data = resp.json()
+            except Exception:
+                _refund_if_needed(cur, user_id, price, order_id)
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                try:
+                    _notify_user(conn, user_id, order_id, "تعذر قراءة ردّ المزوّد", "تم إرجاع الرصيد إن وجد.")
+                except Exception:
+                    pass
+                return
 
-                    new_status = md.get("status") or "Processing"
+            provider_id = data.get("order") or data.get("order_id")
+            if not provider_id:
+                _refund_if_needed(cur, user_id, price, order_id)
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                try:
+                    _notify_user(conn, user_id, order_id, "فشل إنشاء الطلب لدى المزوّد", "بدون رقم طلب.")
+                except Exception:
+                    pass
+                return
 
-                    # merge payload safely
-                    cur_payload = payload if isinstance(payload, dict) else {}
-                    try:
-                        cur_payload = dict(cur_payload)
-                    except Exception:
-                        cur_payload = {}
-                    cur_payload["provider_status"] = md.get("status_raw")
-                    if md.get("charge") is not None:
-                        cur_payload["provider_charge"] = md.get("charge")
-                    if md.get("remains") is not None:
-                        cur_payload["provider_remains"] = md.get("remains")
-                    if md.get("start_count") is not None:
-                        cur_payload["start_count"] = md.get("start_count")
-                    if md.get("currency"):
-                        cur_payload["currency"] = md.get("currency")
-
-                    # persist new status + payload
-                    cur.execute(
-                        "UPDATE public.orders SET status=%s, payload=%s WHERE id=%s",
-                        (new_status, Json(cur_payload), oid),
-                    )
-
-                    # if transitioned into final state, notify user via FCM
-                    if (new_status in finals) and (old_status not in finals):
-                        try:
-                            _notify_user(conn, user_id, oid, "تم تحديث طلبك", f"الحالة: {new_status}")
-                        except Exception:
-                            # never block the loop on FCM errors
-                            pass
+            # mark Processing (already marked usually) and persist provider_order_id
+            cur.execute("UPDATE public.orders SET status='Processing', provider_order_id=%s WHERE id=%s", (str(provider_id), order_id))
     finally:
         put_conn(conn)
-
-
-def _provider_poller_loop():
-    try:
-        interval = int(os.getenv("PROVIDER_POLL_INTERVAL_SECS", "5"))
-    except Exception:
-        interval = 5
-
-    # Allow disabling via env
-    enabled = (os.getenv("ENABLE_PROVIDER_POLL", "1") or "1").strip() not in ("0", "false", "False")
-    if not enabled:
-        logger.info("Provider poller disabled via ENABLE_PROVIDER_POLL")
-        return
-
-    logger.info("Starting provider poller thread: every %ss", interval)
-    while True:
-        try:
-            _scan_provider_orders_and_notify_once(_batch_limit=50)
-        except Exception as e:
-            try:
-                logger.exception("provider poller iteration failed: %s", e)
-            except Exception:
-                pass
-        # sleep last to avoid tight loop on immediate shutdown or exceptions
-        _time.sleep(interval)
-
-
-# Start the background poller as a daemon thread on import
-try:
-    _thr.Thread(target=_provider_poller_loop, name="provider-poller", daemon=True).start()
-except Exception as _e:
-    try:
-        logger.exception("failed to start provider poller: %s", _e)
-    except Exception:
-        pass
-
 
 # =============== Run local ===============
 if __name__ == "__main__":
