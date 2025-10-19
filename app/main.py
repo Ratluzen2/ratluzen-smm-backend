@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import psycopg2
+from psycopg2.extras import Json
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor, Json
 
@@ -2771,3 +2772,85 @@ def _postprocess_payload_raw(item: dict) -> dict:
     if 'payload_raw' in item and 'payload' not in item:
         item['payload'] = _safe_json(item.pop('payload_raw'))
     return item
+
+
+@app.post("/api/admin/orders/{oid}/approve")
+def admin_approve_and_submit_provider(oid: int):
+    """
+    Approve order and, if API/provider type without provider_order_id, submit to KD1S and save provider_order_id.
+    This endpoint is idempotent: if provider_order_id is already set, it won't re-submit.
+    """
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, user_id, COALESCE(type,'manual') AS type,
+                       COALESCE(provider_order_id,''),
+                       COALESCE(payload, '{}'::jsonb), COALESCE(link, ''), COALESCE(quantity, 0), COALESCE(title,'')
+                FROM public.orders
+                WHERE id=%s
+            """, (oid,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "Order not found")
+
+            order_id, user_id, otype, provider_oid, payload0, link0, qty0, title = row
+            payload = _safe_json(payload0)
+
+            # 1) approve/update status locally
+            new_status = "Processing" if otype in ("api","provider","smm","service") else "Approved"
+            cur.execute("UPDATE public.orders SET status=%s, updated_at=NOW() WHERE id=%s", (new_status, oid))
+
+        # 2) If api/provider -> submit to KD1S once
+        if otype in ("api","provider","smm","service") and (not provider_oid):
+            if not PROVIDER_API_KEY:
+                logger.warning("Approve: PROVIDER_API_KEY missing; cannot submit to provider for order %s", oid)
+            else:
+                service = payload.get("service") or payload.get("service_id") or payload.get("sid")
+                link = payload.get("link") or link0
+                quantity = int(payload.get("quantity") or qty0 or 0)
+                extras = payload.get("extras") or {}
+                if service and link and quantity > 0:
+                    form = {
+                        "key": PROVIDER_API_KEY,
+                        "action": "add",
+                        "service": str(service),
+                        "link": link,
+                        "quantity": str(quantity)
+                    }
+                    if isinstance(extras, dict):
+                        for k, v in extras.items():
+                            if v is not None:
+                                form[str(k)] = str(v)
+                    try:
+                        r = requests.post(PROVIDER_API_URL, data=form, timeout=15)
+                        r.raise_for_status()
+                        data = r.json()
+                        prov_id = str(data.get("order") or "")
+                        if prov_id:
+                            with get_conn() as conn2, conn2.cursor() as cur2:
+                                cur2.execute("""
+                                    UPDATE public.orders
+                                       SET provider_order_id=%s,
+                                           payload = (CASE WHEN pg_typeof(payload)::text='jsonb'
+                                                           THEN payload || %s::jsonb ELSE payload END),
+                                           updated_at=NOW()
+                                     WHERE id=%s
+                                """, (prov_id, Json({"provider_order_id": prov_id, "provider_response": data}), oid))
+                            try:
+                                _notify_user(get_conn(), int(user_id), int(oid), "تم تنفيذ طلبك", f"رقم المزود: {prov_id}")
+                            except Exception as ne:
+                                logger.warning("notify user after provider add failed: %s", ne)
+                        else:
+                            logger.warning("Approve: provider did not return 'order' for %s; response=%s", oid, data)
+                    except Exception as e:
+                        logger.warning("Approve: provider add error for %s: %s", oid, e)
+
+        try:
+            _notify_owner_new_order(get_conn(), oid)
+        except Exception:
+            pass
+
+        return {"ok": True, "id": oid}
+    finally:
+        put_conn(conn)
