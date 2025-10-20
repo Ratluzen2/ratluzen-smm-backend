@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 import psycopg2
 from psycopg2 import pool
+from psycopg2.pool import PoolError
 from psycopg2.extras import RealDictCursor, Json
 
 from fastapi import FastAPI, HTTPException, Header, Request, BackgroundTasks
@@ -29,12 +30,27 @@ OWNER_UID = os.getenv("OWNER_UID", "OWNER-0001").strip()
 PROVIDER_API_URL = os.getenv("PROVIDER_API_URL", "https://kd1s.com/api/v2")
 PROVIDER_API_KEY = os.getenv("PROVIDER_API_KEY", "25a9ceb07be0d8b2ba88e70dcbe92e06")
 
-POOL_MIN, POOL_MAX = 1, int(os.getenv("DB_POOL_MAX", "5"))
+# ---- Resilient DB connection pool (prevents PoolError exhaustion) ----
+POOL_MIN = int(os.getenv("DB_POOL_MIN", "1"))
+POOL_MAX = int(os.getenv("DB_POOL_MAX", "12"))
 dbpool: pool.SimpleConnectionPool = pool.SimpleConnectionPool(POOL_MIN, POOL_MAX, dsn=DATABASE_URL)
 
+def _rebuild_pool_safe() -> None:
+    global dbpool
+    try:
+        dbpool.closeall()
+    except Exception:
+        pass
+    dbpool = pool.SimpleConnectionPool(POOL_MIN, POOL_MAX, dsn=DATABASE_URL)
+
 def get_conn() -> psycopg2.extensions.connection:
-    """Get a healthy connection from the pool (auto-reopen if closed)."""
-    conn = dbpool.getconn()
+    """Get a healthy connection from the pool; rebuild on PoolError; replace bad/closed connections."""
+    try:
+        conn = dbpool.getconn()
+    except PoolError:
+        _rebuild_pool_safe()
+        conn = dbpool.getconn()
+    # health check
     try:
         if getattr(conn, "closed", 0):
             raise Exception("connection closed")
@@ -42,16 +58,24 @@ def get_conn() -> psycopg2.extensions.connection:
             cur.execute("SELECT 1")
     except Exception:
         try:
-            # Remove the bad connection from pool and close it
             dbpool.putconn(conn, close=True)
         except Exception:
             pass
-        # Get a fresh connection
-        conn = dbpool.getconn()
+        try:
+            conn = dbpool.getconn()
+        except PoolError:
+            _rebuild_pool_safe()
+            conn = dbpool.getconn()
     return conn
 
 def put_conn(conn: psycopg2.extensions.connection) -> None:
-    dbpool.putconn(conn)
+    try:
+        dbpool.putconn(conn)
+    except Exception:
+        try:
+            dbpool.putconn(conn, close=True)
+        except Exception:
+            pass
 
 # =========================
 # Logging
