@@ -2860,8 +2860,7 @@ async def admin_deliver_get(
                 "amount": amount,
                 "order_no": order_no or provider_order_no or ""
             }).encode("utf-8")
-    return __import__("asyncio").get_event_loop().await admin_deliver(oid, _DummyRequest(), x_admin_password, password)
-    )
+    return await admin_deliver(oid, _DummyRequest(), x_admin_password, password)
 
 @app.get("/api/admin/orders/{oid}/reject")
 async def admin_reject_get(
@@ -2877,8 +2876,7 @@ async def admin_reject_get(
         async def body(self):
             import json as _json
             return _json.dumps({"reason": reason or ""}).encode("utf-8")
-    return __import__("asyncio").get_event_loop().await admin_reject(oid, _DummyRequest(), x_admin_password, password)
-    )
+    return await admin_reject(oid, _DummyRequest(), x_admin_password, password)
 
 # PUBG/Ludo convenience GET endpoints (aliases)
 @app.get("/api/admin/pubg/{oid}/approve")
