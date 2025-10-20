@@ -275,10 +275,8 @@ def ensure_schema():
                     """)
 
                     # user_notifications
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS public.user_notifications(
-
--- user bans (persisted)
+                    
+# user_bans (persisted across reinstalls)
 cur.execute("""
     CREATE TABLE IF NOT EXISTS public.user_bans(
         uid        TEXT PRIMARY KEY,
@@ -289,7 +287,7 @@ cur.execute("""
 """)
 cur.execute("CREATE INDEX IF NOT EXISTS idx_user_bans_until ON public.user_bans(ban_until);")
 
--- asiacell attempts (rate limiting / repeat detection)
+# asiacell_attempts (rate limiting / repeat detection)
 cur.execute("""
     CREATE TABLE IF NOT EXISTS public.asiacell_attempts(
         id         BIGSERIAL PRIMARY KEY,
@@ -300,6 +298,9 @@ cur.execute("""
 """)
 cur.execute("CREATE INDEX IF NOT EXISTS idx_asiacell_attempts_uid_created ON public.asiacell_attempts(uid, created_at DESC);")
 cur.execute("CREATE INDEX IF NOT EXISTS idx_asiacell_attempts_uid_digits ON public.asiacell_attempts(uid, digits);")
+
+cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.user_notifications(
 
                             id BIGSERIAL PRIMARY KEY,
                             user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
