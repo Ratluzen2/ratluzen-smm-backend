@@ -391,85 +391,62 @@ async def _read_json_object(request: Request) -> Dict[str, Any]:
     return data
 
 
-def _notify_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
+def _notify_user(_conn_ignored, user_id: int, order_id: Optional[int], title: str, body: str):
     """
-    Insert notification row and send FCM. Reuse provided DB connection if possible
-    to avoid pool exhaustion and ensure atomicity with the caller's transaction.
+    SAFE: open a fresh DB connection (no recursive re-entry).
+    Inserts DB notification + pushes FCM to all user's devices.
     """
-    def _insert_and_get_tokens(cur):
-        cur.execute(
-            "INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at) "
-            "VALUES (%s,%s,%s,%s,'unread', NOW())",
-            (user_id, order_id, title, body)
-        )
-        cur.execute("SELECT uid FROM public.users WHERE id=%s", (user_id,))
-        r = cur.fetchone()
-        uid = r[0] if r else None
-        tokens = _tokens_for_uid(cur, uid) if uid else []
-        return tokens
-
-    tokens = []
-    # Try to use the provided connection first
-    if conn is not None:
-        try:
-            with conn.cursor() as cur:
-                tokens = _insert_and_get_tokens(cur)
-        except Exception as e:
-            try:
-                logger.exception("notify (reuse-conn) failed, fallback to new conn: %s", e)
-            except Exception:
-                pass
-            conn = None  # fallback
-
-    if conn is None:
-        c = get_conn()
+    c = get_conn()
+    try:
+        uid = None
+        tokens: List[str] = []
         try:
             with c, c.cursor() as cur:
-                tokens = _insert_and_get_tokens(cur)
+                cur.execute(
+                    "INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at) "
+                    "VALUES (%s,%s,%s,%s,'unread', NOW())",
+                    (user_id, order_id, title, body)
+                )
+                cur.execute("SELECT uid FROM public.users WHERE id=%s", (user_id,))
+                row = cur.fetchone()
+                uid = row[0] if row else None
+                if uid:
+                    tokens = _tokens_for_uid(cur, uid)
         except Exception as e:
-            try:
-                logger.exception("notify (new conn) failed: %s", e)
-            except Exception:
-                pass
-        finally:
-            try:
-                put_conn(c)
-            except Exception:
-                pass
+            logger.exception("notify user failed (DB): %s", e)
 
-    # Send FCM outside transaction
-    for t in tokens or []:
-        try:
-            _fcm_send_push(t, title, body, order_id)
-        except Exception as e:
+        for t in tokens:
             try:
-                logger.exception("notify push error: %s", e)
-            except Exception:
-                pass
+                _fcm_send_push(t, title, body, order_id)
+            except Exception as e:
+                logger.exception("notify user push error: %s", e)
+    finally:
+        put_conn(c)
+def _insert_user_inbox_safe(user_id: int, order_id: Optional[int], title: str, body: str) -> None:
+    """Insert a user notification row idempotently so it always appears in the app Inbox.
+    Avoids duplicates in a short window and never raises to callers.
+    """
+    SQL = """
+    INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
+    SELECT %s, %s, %s, %s, 'unread', NOW()
+    WHERE NOT EXISTS (
+      SELECT 1 FROM public.user_notifications
+      WHERE user_id = %s
+        AND COALESCE(order_id, -1) = COALESCE(%s, -1)
+        AND title = %s
+        AND created_at > NOW() - INTERVAL '10 minutes'
+    );
+    """
+    args = (user_id, order_id, title, body, user_id, order_id, title)
 
-def _insert_user_inbox_safe(user_id: int, order_id: Optional[int], title: str, body: str) -> None:
-def _insert_user_inbox_safe(user_id: int, order_id: Optional[int], title: str, body: str) -> None:
-    """
-    Insert a notification row into public.user_notifications, idempotently.
-    Uses a fresh DB connection so it's safe to call from anywhere.
-    """
     c = get_conn()
     try:
         with c, c.cursor() as cur:
             try:
-                cur.execute("""
-                    INSERT INTO public.user_notifications(user_id, order_id, title, body, status, created_at)
-                    SELECT %s,%s,%s,%s,'unread', NOW()
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM public.user_notifications
-                        WHERE user_id=%s AND COALESCE(order_id, -1)=COALESCE(%s, -1)
-                          AND title=%s AND body=%s
-                          AND created_at > NOW() - INTERVAL '10 minutes'
-                    )
-                """, (user_id, order_id, title, body, user_id, order_id, title, body))
-            except Exception as ee:
+                cur.execute(SQL, args)
+            except Exception as e:
                 try:
-                    logger.exception("inbox insert failed: %s", ee)
+                    logger.exception("inbox insert failed: %s", e)
                 except Exception:
                     pass
     finally:
@@ -1324,25 +1301,24 @@ async def create_manual_paid_alias8(request: Request):
 
 @app.post("/api/admin/orders/{oid}/approve")
 def admin_approve_order(oid: int, request: Request, background_tasks: BackgroundTasks, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    # Try to read minimal body only for optional provider order no
     body = {}
     try:
+        # Try to read body if present
         if hasattr(request, "_body") and request._body:
             try:
                 body = json.loads(request._body.decode())
             except Exception:
                 body = {}
+        else:
+            body = {}
     except Exception:
         body = {}
-
     provided_order_no = str((body.get("order_no") or body.get("provider_order_id") or body.get("order") or body.get("id") or "")).strip()
     _require_admin(_pick_admin_password(x_admin_password, password, body) or "")
-
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, user_id, service_id, link, quantity, price, status, provider_order_id, title, payload, type
+            cur.execute("""                SELECT id, user_id, service_id, link, quantity, price, status, provider_order_id, title, payload, type
                 FROM public.orders WHERE id=%s FOR UPDATE
             """, (oid,))
             row = cur.fetchone()
@@ -1355,63 +1331,104 @@ def admin_approve_order(oid: int, request: Request, background_tasks: Background
             if status not in ("Pending", "Processing"):
                 raise HTTPException(400, "invalid status")
 
-            # Manual/Topup orders: finalize immediately
-            if (otype or "").lower() in ("topup_card", "manual") or service_id is None:
-                # Optional: attach provided order number
-                current = payload if isinstance(payload, dict) else {}
-                try:
-                    current = dict(current)
-                except Exception:
-                    current = {}
-                if provided_order_no:
-                    try:
-                        cur.execute("UPDATE public.orders SET provider_order_id=%s WHERE id=%s", (provided_order_no, order_id))
-                    except Exception:
-                        pass
-                    current["order_no"] = str(provided_order_no)
+            # manual/topup_card doesn't call provider
 
-                # Mark done
-                if current:
-                    cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(current), order_id))
-                else:
-                    cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
 
-                # Notify (inbox + FCM)
+            if otype in ("topup_card", "manual") or service_id is None:
+
+
+                # mark done
+
+
+                cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
+
+
+                # notify user (FCM + inbox)
+
+
                 try:
+
+
                     title_txt = f"تم تنفيذ طلبك {title or ''}".strip()
+
+
                     body_txt = title or "تم التنفيذ"
+
+
                     try:
+
+
                         if isinstance(payload, dict) and payload.get("account_id"):
+
+
                             body_txt = f"{body_txt} | ID: {payload.get('account_id')}"
+
+
                     except Exception:
+
+
                         pass
+
+
                     _notify_user(conn, user_id, order_id, title_txt, body_txt)
-                    try:
-                        _insert_user_inbox_safe(user_id, order_id, title_txt, body_txt)
-                    except Exception:
-                        pass
+        try:
+            _insert_user_inbox_safe(user_id, order_id, title_txt, body_txt)
+        except Exception:
+            pass
+
+
                 except Exception:
+
+
                     pass
+
 
                 return {"ok": True, "status": "Done"}
 
-            # Provider orders: set Processing and send to provider in background
-            cur_payload = payload if isinstance(payload, dict) else {}
-            try:
-                cur_payload = dict(cur_payload)
-            except Exception:
-                cur_payload = {}
-            import time as _t
-            cur_payload["approved_at"] = int(_t.time() * 1000)
-            cur.execute("UPDATE public.orders SET status='Processing', payload=%s WHERE id=%s", (Json(cur_payload), order_id))
 
-            # Schedule provider call
+            # Provider-type: move to Processing immediately; send to provider in background
+            try:
+                cur_payload = payload if isinstance(payload, dict) else {}
+                try:
+                    cur_payload = dict(cur_payload)
+                except Exception:
+                    cur_payload = {}
+                import time as _t
+                cur_payload["approved_at"] = int(_t.time() * 1000)
+                cur.execute("UPDATE public.orders SET status='Processing', payload=%s WHERE id=%s", (Json(cur_payload), order_id))
+            except Exception:
+                pass
+
+            # schedule background send
             background_tasks.add_task(_bg_send_to_provider_and_persist, order_id, user_id, int(service_id), link, int(quantity), float(price), title, payload)
             return {"ok": True, "status": "Processing"}
+
+            if resp.status_code // 100 != 2:
+                _refund_if_needed(cur, user_id, price, order_id)
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                return {"ok": False, "status": "Rejected", "reason": "provider_http"}
+
+            try:
+                data = resp.json()
+            except Exception:
+                _refund_if_needed(cur, user_id, price, order_id)
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                return {"ok": False, "status": "Rejected", "reason": "bad_provider_json"}
+
+            provider_id = data.get("order") or data.get("order_id")
+            if not provider_id:
+                _refund_if_needed(cur, user_id, price, order_id)
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                return {"ok": False, "status": "Rejected", "reason": "no_provider_id"}
+
+            # Persist provider_order_id (status already set to Processing above)
+            cur.execute("""                UPDATE public.orders
+                SET provider_order_id=%s
+                WHERE id=%s
+            """, (str(provider_id), order_id))
+            return {"ok": True, "status": "Processing", "provider_order_id": provider_id}
     finally:
         put_conn(conn)
-
-def _refund_if_needed(cur, user_id: int, price: float, order_id: int):
 def _refund_if_needed(cur, user_id: int, price: float, order_id: int):
     # Correctly use the price parameter (eff_price might be used elsewhere).
     if price and price > 0:
