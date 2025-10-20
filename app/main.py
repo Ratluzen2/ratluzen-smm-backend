@@ -2796,3 +2796,89 @@ def admin_list_provider_pending(x_admin_password: Optional[str] = Header(None),
         return {"ok": True, "items": items}
     finally:
         put_conn(conn)
+
+
+# ========= GET aliases for admin approve/deliver/reject (compat for Android UI) =========
+from fastapi import Query
+
+@app.get("/api/admin/orders/{oid}/approve")
+def admin_approve_order_get(
+    oid: int,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    logger.info("GET approve called for oid=%s", oid)
+    return admin_approve_order(oid, BackgroundTasks(), x_admin_password, password)
+
+@app.get("/api/admin/orders/{oid}/deliver")
+def admin_deliver_get(
+    oid: int,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None,
+    code: Optional[str] = None,
+    amount: Optional[float] = None,
+    order_no: Optional[str] = None,
+    provider_order_no: Optional[str] = None
+):
+    logger.info("GET deliver called for oid=%s", oid)
+    # Build a minimal fake Request-like object for admin_deliver
+    class _DummyRequest:
+        async def json(self):
+            return {
+                "code": code or "",
+                "amount": amount,
+                "order_no": order_no or provider_order_no or ""
+            }
+        async def body(self):  # fallback path used by _read_json_object
+            import json as _json
+            return _json.dumps({
+                "code": code or "",
+                "amount": amount,
+                "order_no": order_no or provider_order_no or ""
+            }).encode("utf-8")
+    return __import__("asyncio").get_event_loop().run_until_complete(
+        admin_deliver(oid, _DummyRequest(), x_admin_password, password)
+    )
+
+@app.get("/api/admin/orders/{oid}/reject")
+def admin_reject_get(
+    oid: int,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None,
+    reason: Optional[str] = None
+):
+    logger.info("GET reject called for oid=%s", oid)
+    class _DummyRequest:
+        async def json(self):
+            return {"reason": reason or ""}
+        async def body(self):
+            import json as _json
+            return _json.dumps({"reason": reason or ""}).encode("utf-8")
+    return __import__("asyncio").get_event_loop().run_until_complete(
+        admin_reject(oid, _DummyRequest(), x_admin_password, password)
+    )
+
+# PUBG/Ludo convenience GET endpoints (aliases)
+@app.get("/api/admin/pubg/{oid}/approve")
+def admin_pubg_approve_get(oid: int, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_approve_order_get(oid, x_admin_password, password)
+
+@app.get("/api/admin/pubg/{oid}/deliver")
+def admin_pubg_deliver_get(oid: int, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_deliver_get(oid, x_admin_password, password)
+
+@app.get("/api/admin/pubg/{oid}/reject")
+def admin_pubg_reject_get(oid: int, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None, reason: Optional[str] = None):
+    return admin_reject_get(oid, x_admin_password, password, reason)
+
+@app.get("/api/admin/ludo/{oid}/approve")
+def admin_ludo_approve_get(oid: int, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_approve_order_get(oid, x_admin_password, password)
+
+@app.get("/api/admin/ludo/{oid}/deliver")
+def admin_ludo_deliver_get(oid: int, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_deliver_get(oid, x_admin_password, password)
+
+@app.get("/api/admin/ludo/{oid}/reject")
+def admin_ludo_reject_get(oid: int, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None, reason: Optional[str] = None):
+    return admin_reject_get(oid, x_admin_password, password, reason)
