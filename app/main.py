@@ -1,5 +1,4 @@
 import os
-from concurrent.futures import ThreadPoolExecutor
 import json
 import time
 import logging
@@ -9,10 +8,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 import psycopg2
 from psycopg2 import pool
-from psycopg2.pool import PoolError
 from psycopg2.extras import RealDictCursor, Json
 
-from fastapi import FastAPI, HTTPException, Header, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -31,27 +29,12 @@ OWNER_UID = os.getenv("OWNER_UID", "OWNER-0001").strip()
 PROVIDER_API_URL = os.getenv("PROVIDER_API_URL", "https://kd1s.com/api/v2")
 PROVIDER_API_KEY = os.getenv("PROVIDER_API_KEY", "25a9ceb07be0d8b2ba88e70dcbe92e06")
 
-# ---- Resilient DB connection pool (prevents PoolError exhaustion) ----
-POOL_MIN = int(os.getenv("DB_POOL_MIN", "1"))
-POOL_MAX = int(os.getenv("DB_POOL_MAX", "12"))
+POOL_MIN, POOL_MAX = 1, int(os.getenv("DB_POOL_MAX", "5"))
 dbpool: pool.SimpleConnectionPool = pool.SimpleConnectionPool(POOL_MIN, POOL_MAX, dsn=DATABASE_URL)
 
-def _rebuild_pool_safe() -> None:
-    global dbpool
-    try:
-        dbpool.closeall()
-    except Exception:
-        pass
-    dbpool = pool.SimpleConnectionPool(POOL_MIN, POOL_MAX, dsn=DATABASE_URL)
-
 def get_conn() -> psycopg2.extensions.connection:
-    """Get a healthy connection from the pool; rebuild on PoolError; replace bad/closed connections."""
-    try:
-        conn = dbpool.getconn()
-    except PoolError:
-        _rebuild_pool_safe()
-        conn = dbpool.getconn()
-    # health check
+    """Get a healthy connection from the pool (auto-reopen if closed)."""
+    conn = dbpool.getconn()
     try:
         if getattr(conn, "closed", 0):
             raise Exception("connection closed")
@@ -59,45 +42,17 @@ def get_conn() -> psycopg2.extensions.connection:
             cur.execute("SELECT 1")
     except Exception:
         try:
+            # Remove the bad connection from pool and close it
             dbpool.putconn(conn, close=True)
         except Exception:
             pass
-        try:
-            conn = dbpool.getconn()
-        except PoolError:
-            _rebuild_pool_safe()
-            conn = dbpool.getconn()
+        # Get a fresh connection
+        conn = dbpool.getconn()
     return conn
 
 def put_conn(conn: psycopg2.extensions.connection) -> None:
-    try:
-        dbpool.putconn(conn)
-    except Exception:
-        try:
-            dbpool.putconn(conn, close=True)
-        except Exception:
-            pass
+    dbpool.putconn(conn)
 
-# =========================
-# Background executor (non-blocking)
-_BG_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("WORKER_THREADS", "4")))
-
-def _bg_submit(fn, *args, **kwargs):
-    def _runner():
-        try:
-            fn(*args, **kwargs)
-        except Exception as e:
-            try:
-                logger.exception("background task failed: %s", e)
-            except Exception:
-                pass
-    try:
-        _BG_EXECUTOR.submit(_runner)
-    except Exception as e:
-        try:
-            logger.exception("executor submit failed: %s", e)
-        except Exception:
-            pass
 # =========================
 # Logging
 # =========================
@@ -467,39 +422,6 @@ def _notify_user(_conn_ignored, user_id: int, order_id: Optional[int], title: st
                 logger.exception("notify user push error: %s", e)
     finally:
         put_conn(c)
-def _insert_user_inbox_safe(user_id: int, order_id: Optional[int], title: str, body: str) -> None:
-    """Insert a user notification row idempotently so it always appears in the app Inbox.
-    Avoids duplicates in a short window and never raises to callers.
-    """
-    SQL = """
-    INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
-    SELECT %s, %s, %s, %s, 'unread', NOW()
-    WHERE NOT EXISTS (
-      SELECT 1 FROM public.user_notifications
-      WHERE user_id = %s
-        AND COALESCE(order_id, -1) = COALESCE(%s, -1)
-        AND title = %s
-        AND created_at > NOW() - INTERVAL '10 minutes'
-    );
-    """
-    args = (user_id, order_id, title, body, user_id, order_id, title)
-
-    c = get_conn()
-    try:
-        with c, c.cursor() as cur:
-            try:
-                cur.execute(SQL, args)
-            except Exception as e:
-                try:
-                    logger.exception("inbox insert failed: %s", e)
-                except Exception:
-                    pass
-    finally:
-        try:
-            put_conn(c)
-        except Exception:
-            pass
-
 
 def _ensure_user(cur, uid: str) -> int:
     cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
@@ -894,10 +816,6 @@ def create_provider_order(body: ProviderOrderIn):
         # now outside transaction (COMMITTED): safe to notify
         if user_id:
             _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {title}.")
-            try:
-                _insert_user_inbox_safe(user_id, oid, "تم استلام طلبك", "تم استلام طلبك")
-            except Exception:
-                pass
         _notify_owner_new_order(conn, oid)
         return {"ok": True, "order_id": oid}
     finally:
@@ -943,10 +861,6 @@ for path in PROVIDER_CREATE_PATHS:
             # After COMMIT: push notifications
             if user_id:
                 _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {p['service_name']}.")
-                try:
-                    _insert_user_inbox_safe(user_id, oid, "تم استلام طلبك", "تم استلام طلبك")
-                except Exception:
-                    pass
             _notify_owner_new_order(conn, oid)
             return {"ok": True, "order_id": oid}
         finally:
@@ -966,10 +880,6 @@ def create_manual_order(body: ManualOrderIn):
             """, (user_id, body.title))
             oid = cur.fetchone()[0]
         _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {body.title}.")
-        try:
-            _insert_user_inbox_safe(user_id, oid, "تم استلام طلبك", "تم استلام طلبك")
-        except Exception:
-            pass
         _notify_owner_new_order(conn, oid)
         return {"ok": True, "order_id": oid}
     finally:
@@ -1015,10 +925,6 @@ def submit_asiacell(body: AsiacellSubmitIn):
         # After COMMIT: push notifications
         if user_id:
             _notify_user(conn, user_id, oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
-            try:
-                _insert_user_inbox_safe(user_id, oid, "تم استلام طلبك", "تم استلام طلبك")
-            except Exception:
-                pass
         _notify_owner_new_order(conn, oid)
         return {"ok": True, "order_id": oid, "status": "received"}
     finally:
@@ -1061,36 +967,21 @@ def _orders_for_uid(uid: str) -> List[dict]:
             user_id = r[0]
             cur.execute("""
                 SELECT id, title, quantity, price,
-                       status, EXTRACT(EPOCH FROM created_at)*1000, link,
-                       COALESCE(provider_order_id::text, (COALESCE(NULLIF(payload,''),'{}')::jsonb->>'order_no')) AS order_no
+                       status, EXTRACT(EPOCH FROM created_at)*1000, link
                 FROM public.orders
                 WHERE user_id=%s
                 ORDER BY id DESC
             """, (user_id,))
             rows = cur.fetchall()
-        out = []
-        for row in rows:
-            _id, _title, _qty, _price, _status, _created, _link, _ono = row
-            _price = float(_price or 0)
-            _created = int(_created or 0)
-            # display id prefers provider order number
-            display_id = str(_ono) if (_ono and str(_ono).strip()) else str(_id)
-            # append order_no to title if available
-            if _ono and str(_ono).strip():
-                if 'رقم الطلب' not in (_title or ''):
-                    _title = f"{_title} | رقم الطلب: {str(_ono)}"
-            out.append({
-            "id": _id,
-            "display_id": display_id,
-            "title": _title,
-            "quantity": _qty,
-            "price": _price,
-            "status": _status,
-            "created_at": _created,
-            "link": _link,
-            "order_no": _ono
-        })
-        return out
+        return [{
+            "id": row[0],
+            "title": row[1],
+            "quantity": row[2],
+            "price": float(row[3] or 0),
+            "status": row[4],
+            "created_at": int(row[5] or 0),
+            "link": row[6]
+        } for row in rows]
     finally:
         put_conn(conn)
 
@@ -1297,10 +1188,6 @@ async def create_manual_paid(request: Request):
         # optional: immediate user notification (order received)
         body = title + (f" | ID: {account_id}" if account_id else "")
         _notify_user(conn, user_id, oid, "تم استلام طلبك", body)
-        try:
-            _insert_user_inbox_safe(user_id, oid, "تم استلام طلبك", "تم استلام طلبك")
-        except Exception:
-            pass
         _notify_owner_new_order(conn, oid)
 
         return {"ok": True, "order_id": oid, "charged": float(price)}
@@ -1343,84 +1230,85 @@ async def create_manual_paid_alias8(request: Request):
 # =========================
 # Approve/Deliver/Reject
 # =========================
-
 @app.post("/api/admin/orders/{oid}/approve")
-def admin_approve_order(
-    oid: int,
-    background_tasks: BackgroundTasks,
-    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
-    password: Optional[str] = None
-):
-    """Approve an order.
-    - Manual / topup_card (or service_id is NULL): mark Done immediately and notify the user (FCM + Inbox).
-    - Provider type: move to Processing and send to provider in a background task.
-    """
-    _require_admin(_pick_admin_password(x_admin_password, password, {}) or "")
+def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    body = {}
+    try:
+        body = json.loads(request._body.decode()) if hasattr(request, "_body") and request._body else {}
+    except Exception:
+        try:
+            body = request._json  # type: ignore
+        except Exception:
+            body = {}
+    _require_admin(_pick_admin_password(x_admin_password, password, body) or "")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, user_id, service_id, link, quantity, price, status, provider_order_id, title, payload, COALESCE(type,'')
-                FROM public.orders
-                WHERE id=%s
-                FOR UPDATE
-                """,
-                (oid,)
-            )
+            cur.execute("""
+                SELECT id, user_id, service_id, link, quantity, price, status, provider_order_id, title, payload, type
+                FROM public.orders WHERE id=%s FOR UPDATE
+            """, (oid,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "order not found")
 
             (order_id, user_id, service_id, link, quantity, price, status, provider_order_id, title, payload, otype) = row
-            price = float(price or 0.0)
+            price = float(price or 0)
 
             if status not in ("Pending", "Processing"):
                 raise HTTPException(400, "invalid status")
 
-            # Manual / topup_card or no service id: mark Done and notify
-            if (otype or "").lower() in ("topup_card", "manual") or service_id is None:
+            # manual/topup_card doesn't call provider
+            if otype in ("topup_card", "manual") or service_id is None:
                 cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
-
-                title_txt = f"تم تنفيذ طلبك {title or ''}".strip()
-                body_txt = title or "تم التنفيذ"
-                try:
-                    if isinstance(payload, dict) and payload.get("account_id"):
-                        body_txt = f"{body_txt} | ID: {payload.get('account_id')}"
-                except Exception:
-                    pass
-
-                try:
-                    _notify_user(conn, user_id, order_id, title_txt, body_txt)
-                    try:
-                        _insert_user_inbox_safe(user_id, order_id, title_txt, body_txt)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-
                 return {"ok": True, "status": "Done"}
 
-            # Provider path: set Processing and enqueue background send
-            cur_payload = payload if isinstance(payload, dict) else {}
             try:
-                cur_payload = dict(cur_payload)
+                resp = requests.post(
+                    PROVIDER_API_URL,
+                    data={"key": PROVIDER_API_KEY, "action": "add", "service": str(service_id), "link": link, "quantity": str(quantity)},
+                    timeout=25
+                )
             except Exception:
-                cur_payload = {}
-            import time as _t
-            cur_payload["approved_at"] = int(_t.time() * 1000)
+                _refund_if_needed(cur, user_id, price, order_id)
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                return {"ok": False, "status": "Rejected", "reason": "provider_unreachable"}
+
+            if resp.status_code // 100 != 2:
+                _refund_if_needed(cur, user_id, price, order_id)
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                return {"ok": False, "status": "Rejected", "reason": "provider_http"}
 
             try:
-                cur.execute("UPDATE public.orders SET status='Processing', payload=%s WHERE id=%s", (Json(cur_payload), order_id))
+                data = resp.json()
             except Exception:
-                cur.execute("UPDATE public.orders SET status='Processing' WHERE id=%s", (order_id,))
+                _refund_if_needed(cur, user_id, price, order_id)
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                return {"ok": False, "status": "Rejected", "reason": "bad_provider_json"}
 
-        _bg_submit(_bg_send_to_provider_and_persist_safe, order_id, user_id, int(service_id)
-, link, int(quantity), float(price), title, payload
-        )
-        return {"ok": True, "status": "Processing"}
+            provider_id = data.get("order") or data.get("order_id")
+            if not provider_id:
+                _refund_if_needed(cur, user_id, price, order_id)
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                return {"ok": False, "status": "Rejected", "reason": "no_provider_id"}
+
+            cur.execute("""
+                UPDATE public.orders
+                SET provider_order_id=%s, status='Processing'
+                WHERE id=%s
+            """, (str(provider_id), order_id))
+            return {"ok": True, "status": "Processing", "provider_order_id": provider_id}
     finally:
         put_conn(conn)
+
+def _refund_if_needed(cur, user_id: int, price: float, order_id: int):
+    # Correctly use the price parameter (eff_price might be used elsewhere).
+    if price and price > 0:
+        cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(price), user_id))
+        cur.execute("""
+            INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+            VALUES(%s,%s,%s,%s)
+        """, (user_id, Decimal(price), "order_refund", Json({"order_id": order_id})))
 
 @app.post("/api/admin/orders/{oid}/deliver")
 async def admin_deliver(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
@@ -1429,9 +1317,6 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: Optional[s
 
     code_val = (data.get("code") or "").strip()
     amount   = data.get("amount")
-
-    # Optional: provider order number supplied by admin
-    provided_order_no = (data.get("order_no") or data.get("provider_order_no") or data.get("provider_order_id") or "").strip()
 
     conn = get_conn()
     try:
@@ -1464,30 +1349,6 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: Optional[s
                 except Exception:
                     pass
 
-            # Attach/Generate order_no:
-            # - If admin provided one, use it and also set provider_order_id.
-            # - Else, for non-API orders (type != 'provider'), generate a numeric order_no similar length to last provider id (fallback 9).
-            if provided_order_no:
-                try:
-                    cur.execute("UPDATE public.orders SET provider_order_id=%s WHERE id=%s", (provided_order_no, order_id))
-                except Exception:
-                    pass
-                if isinstance(current, dict):
-                    current["order_no"] = str(provided_order_no)
-            else:
-                if (otype or "").lower() != "provider":
-                    try:
-                        cur.execute("SELECT provider_order_id FROM public.orders WHERE provider_order_id IS NOT NULL AND provider_order_id <> '' ORDER BY id DESC LIMIT 1")
-                        rr = cur.fetchone()
-                        pref_len = len(str(rr[0])) if rr and rr[0] else 9
-                    except Exception:
-                        pref_len = 9
-                    if pref_len < 6 or pref_len > 18:
-                        pref_len = 9
-                    import random
-                    gen_no = "".join(random.choice("0123456789") for _ in range(pref_len))
-                    if isinstance(current, dict):
-                        current["order_no"] = gen_no
             # Persist order as Done
             if current:
                 if is_jsonb:
@@ -1521,10 +1382,6 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: Optional[s
             body_txt = title or "تم التنفيذ"
 
         _notify_user(conn, user_id, order_id, title_txt, body_txt)
-        try:
-            _insert_user_inbox_safe(user_id, order_id, title_txt, body_txt)
-        except Exception:
-            pass
         return {"ok": True, "status": "Done"}
     finally:
         put_conn(conn)
@@ -1793,7 +1650,8 @@ def admin_pending_balances(x_admin_password: Optional[str] = Header(None, alias=
 def admin_pending_services_endpoint(
     x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
     password: Optional[str] = None,
-    limit: int = 100, after: int = 0):
+    limit: int = 100
+):
     _require_admin(x_admin_password or password or "")
     conn = get_conn()
     try:
@@ -1814,11 +1672,9 @@ def admin_pending_services_endpoint(
                 FROM public.orders o
                 JOIN public.users u ON u.id = o.user_id
                 WHERE COALESCE(o.status, 'Pending') = 'Pending'
-                AND COALESCE(o.provider_order_id::text,'') = ''
-                AND o.id > %s
                 ORDER BY COALESCE(o.created_at, NOW()) DESC
                 LIMIT %s
-            """, (int(after), int(limit)))
+            """, (int(limit),))
             rows = cur.fetchall()
 
         out: List[Dict[str, Any]] = []
@@ -2624,316 +2480,8 @@ def test_push_owner(p: TestPushIn):
     finally:
         put_conn(conn)
 
-# ---------------- Background helper: send order to provider safely ----------------
-def _bg_send_to_provider_and_persist(order_id: int, user_id: int, service_id: int, link: str, quantity: int, price: float, title: str, payload: Any):
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            # lock the order to avoid double-send
-            cur.execute("SELECT status, provider_order_id FROM public.orders WHERE id=%s FOR UPDATE", (order_id,))
-            row = cur.fetchone()
-            if not row:
-                return
-            status, provider_order_id = row
-            if provider_order_id:
-                return  # already sent
-
-            try:
-                resp = requests.post(
-                    PROVIDER_API_URL,
-                    data={"key": PROVIDER_API_KEY, "action": "add", "service": str(service_id), "link": link, "quantity": str(quantity)},
-                    timeout=10
-                )
-            except Exception:
-                _refund_if_needed(cur, user_id, price, order_id)
-                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
-                try:
-                    _notify_user(conn, user_id, order_id, "تعذر إرسال طلبك للمزوّد", "سيتم إرجاع الرصيد إن وجد.")
-                except Exception:
-                    pass
-                return
-
-            if resp.status_code // 100 != 2:
-                _refund_if_needed(cur, user_id, price, order_id)
-                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
-                try:
-                    _notify_user(conn, user_id, order_id, "تعذر إرسال طلبك للمزوّد", f"HTTP {resp.status_code}")
-                except Exception:
-                    pass
-                return
-
-            try:
-                data = resp.json()
-            except Exception:
-                _refund_if_needed(cur, user_id, price, order_id)
-                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
-                try:
-                    _notify_user(conn, user_id, order_id, "تعذر قراءة ردّ المزوّد", "تم إرجاع الرصيد إن وجد.")
-                except Exception:
-                    pass
-                return
-
-            provider_id = data.get("order") or data.get("order_id")
-            if not provider_id:
-                _refund_if_needed(cur, user_id, price, order_id)
-                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
-                try:
-                    _notify_user(conn, user_id, order_id, "فشل إنشاء الطلب لدى المزوّد", "بدون رقم طلب.")
-                except Exception:
-                    pass
-                return
-
-            # mark Processing (already marked usually) and persist provider_order_id
-            cur.execute("UPDATE public.orders SET status='Processing', provider_order_id=%s WHERE id=%s", (str(provider_id), order_id))
-    finally:
-        put_conn(conn)
-
 # =============== Run local ===============
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
-
-# =========================
-# Provider status helpers
-# =========================
-def _map_provider_status(s: str) -> str:
-    s = (s or "").strip().lower()
-    if s in ("completed", "complete", "finished", "success", "done"):
-        return "Done"
-    if s in ("processing", "in progress", "in_progress"):
-        return "Processing"
-    if s in ("pending", "queued", "waiting"):
-        return "Pending"
-    if s in ("partial", "refunded"):
-        return "Refunded"
-    if s in ("canceled", "cancelled", "rejected", "fail", "failed"):
-        return "Rejected"
-    return "Processing"
-
-def _provider_status(order_no: str) -> dict:
-    url = PROVIDER_API_URL
-    key = PROVIDER_API_KEY
-    # Many SMM panels use 'status' endpoint with fields 'status', 'charge', 'start_count', 'remains'
-    try:
-        resp = requests.post(url, data={"key": key, "action": "status", "order": str(order_no)}, timeout=20)
-    except Exception:
-        return {"ok": False, "error": "provider_unreachable"}
-    if resp.status_code // 100 != 2:
-        return {"ok": False, "error": "provider_http", "code": resp.status_code}
-    try:
-        data = resp.json()
-    except Exception:
-        return {"ok": False, "error": "bad_provider_json", "text": resp.text[:200]}
-    # normalize
-    status_raw = str(data.get("status") or data.get("order_status") or "").strip()
-    charge = data.get("charge")
-    remains = data.get("remains")
-    start = data.get("start_count") or data.get("start") or data.get("startcount")
-    currency = data.get("currency") or None
-    return {"ok": True, "status_raw": status_raw, "status": _map_provider_status(status_raw),
-            "charge": charge, "remains": remains, "start_count": start, "currency": currency, "raw": data}
-
-
-@app.post("/api/orders/sync_provider")
-def sync_provider(uid: str, limit: int = 30):
-    """For a given user, refresh statuses of provider-linked orders that are not final."""
-    # final statuses (no more polling): Done, Rejected, Refunded
-    finals = ("Done", "Rejected", "Refunded")
-    updated = []
-    errors = []
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            # find user id
-            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
-            r = cur.fetchone()
-            if not r:
-                return {"ok": True, "updated": [], "errors": []}
-            user_id = r[0]
-            # pick candidate orders
-            cur.execute("""
-                SELECT id, provider_order_id, status, payload, title, type
-                FROM public.orders
-                WHERE user_id=%s AND provider_order_id IS NOT NULL AND provider_order_id<>''
-                  AND status NOT IN ('Done','Rejected','Refunded')
-                ORDER BY id DESC
-                LIMIT %s
-            """, (user_id, limit))
-            rows = cur.fetchall() or []
-
-            for (oid, ono, status, payload, title, otype) in rows:
-                md = _provider_status(ono)
-                if not md.get("ok"):
-                    errors.append({"id": oid, "error": md.get("error","provider_error")})
-                    continue
-                new_status = md.get("status") or "Processing"
-                # update payload
-                cur_payload = payload if isinstance(payload, dict) else {}
-                try:
-                    cur_payload = dict(cur_payload)
-                except Exception:
-                    cur_payload = {}
-                cur_payload["provider_status"] = md.get("status_raw")
-                if md.get("charge") is not None:
-                    cur_payload["provider_charge"] = md.get("charge")
-                if md.get("remains") is not None:
-                    cur_payload["provider_remains"] = md.get("remains")
-                if md.get("start_count") is not None:
-                    cur_payload["start_count"] = md.get("start_count")
-                if md.get("currency"):
-                    cur_payload["currency"] = md.get("currency")
-
-                # persist
-                cur.execute("UPDATE public.orders SET status=%s, payload=%s WHERE id=%s",
-                            (new_status, Json(cur_payload), oid))
-                updated.append({"id": oid, "status": new_status})
-
-                # push notify if moved to a final state
-                if new_status in finals and status not in finals:
-                    try:
-                        _notify_user(conn, user_id, oid, "تم تحديث طلبك", f"الحالة: {new_status}")
-                        try:
-                            _insert_user_inbox_safe(user_id, oid, "تم تحديث طلبك", f"الحالة: {new_status}")
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-
-    finally:
-        put_conn(conn)
-    return {"ok": True, "updated": updated, "errors": errors}
-
-
-@app.get("/api/admin/orders/provider/pending")
-def admin_list_provider_pending(x_admin_password: Optional[str] = Header(None),
-                                password: Optional[str] = None,
-                                limit: int = 200):
-    _require_admin(_pick_admin_password(x_admin_password, password, {}) or "")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, user_id, title, quantity, price, link,
-                       EXTRACT(EPOCH FROM created_at)*1000 AS created_at,
-                       payload
-                FROM public.orders
-                WHERE type='provider'
-                  AND COALESCE(status,'Pending') = 'Pending'
-                  AND COALESCE(provider_order_id::text,'') = ''
-                ORDER BY id DESC
-                LIMIT %s
-            """, (limit,))
-            rows = cur.fetchall() or []
-        items = []
-        for r in rows:
-            items.append({
-                "id": r[0],
-                "user_id": r[1],
-                "title": r[2],
-                "quantity": r[3],
-                "price": float(r[4] or 0),
-                "link": r[5],
-                "created_at": int(r[6] or 0),
-                "payload": r[7] if isinstance(r[7], dict) else {}
-            })
-        return {"ok": True, "items": items}
-    finally:
-        put_conn(conn)
-
-
-# ========= GET aliases for admin approve/deliver/reject (compat for Android UI) =========
-from fastapi import Query
-
-@app.get("/api/admin/orders/{oid}/approve")
-def admin_approve_order_get(
-    oid: int,
-    background_tasks: BackgroundTasks,
-    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
-    password: Optional[str] = None
-):
-    logger.info("GET approve called for oid=%s", oid)
-    return admin_approve_order(oid, background_tasks, x_admin_password, password)
-
-@app.get("/api/admin/orders/{oid}/deliver")
-async def admin_deliver_get(
-    oid: int,
-    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
-    password: Optional[str] = None,
-    code: Optional[str] = None,
-    amount: Optional[float] = None,
-    order_no: Optional[str] = None,
-    provider_order_no: Optional[str] = None
-):
-    logger.info("GET deliver called for oid=%s", oid)
-    # Build a minimal fake Request-like object for admin_deliver
-    class _DummyRequest:
-        async def json(self):
-            return {
-                "code": code or "",
-                "amount": amount,
-                "order_no": order_no or provider_order_no or ""
-            }
-        async def body(self):  # fallback path used by _read_json_object
-            import json as _json
-            return _json.dumps({
-                "code": code or "",
-                "amount": amount,
-                "order_no": order_no or provider_order_no or ""
-            }).encode("utf-8")
-    return await admin_deliver(oid, _DummyRequest(), x_admin_password, password)
-
-@app.get("/api/admin/orders/{oid}/reject")
-async def admin_reject_get(
-    oid: int,
-    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
-    password: Optional[str] = None,
-    reason: Optional[str] = None
-):
-    logger.info("GET reject called for oid=%s", oid)
-    class _DummyRequest:
-        async def json(self):
-            return {"reason": reason or ""}
-        async def body(self):
-            import json as _json
-            return _json.dumps({"reason": reason or ""}).encode("utf-8")
-    return await admin_reject(oid, _DummyRequest(), x_admin_password, password)
-
-# PUBG/Ludo convenience GET endpoints (aliases)
-@app.get("/api/admin/pubg/{oid}/approve")
-def admin_pubg_approve_get(oid: int, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    return admin_approve_order_get(oid, x_admin_password, password)
-
-@app.get("/api/admin/pubg/{oid}/deliver")
-def admin_pubg_deliver_get(oid: int, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    return admin_deliver_get(oid, x_admin_password, password)
-
-@app.get("/api/admin/pubg/{oid}/reject")
-def admin_pubg_reject_get(oid: int, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None, reason: Optional[str] = None):
-    return admin_reject_get(oid, x_admin_password, password, reason)
-
-@app.get("/api/admin/ludo/{oid}/approve")
-def admin_ludo_approve_get(oid: int, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    return admin_approve_order_get(oid, x_admin_password, password)
-
-@app.get("/api/admin/ludo/{oid}/deliver")
-def admin_ludo_deliver_get(oid: int, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    return admin_deliver_get(oid, x_admin_password, password)
-
-@app.get("/api/admin/ludo/{oid}/reject")
-def admin_ludo_reject_get(oid: int, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None, reason: Optional[str] = None):
-    return admin_reject_get(oid, x_admin_password, password, reason)
-
-
-
-def _bg_send_to_provider_and_persist_safe(order_id, user_id, service_id, link, quantity, price, title, payload):
-    conn = get_conn()
-    try:
-        _bg_send_to_provider_and_persist(order_id, user_id, service_id, link, quantity, price, title, payload)
-    except Exception as e:
-        try:
-            logger.exception("bg provider task failed: %s", e)
-        except Exception:
-            pass
-    finally:
-        put_conn(conn)
