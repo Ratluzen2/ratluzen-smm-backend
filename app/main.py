@@ -2828,11 +2828,12 @@ from fastapi import Query
 @app.get("/api/admin/orders/{oid}/approve")
 def admin_approve_order_get(
     oid: int,
+    background_tasks: BackgroundTasks,
     x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
     password: Optional[str] = None
 ):
     logger.info("GET approve called for oid=%s", oid)
-    return admin_approve_order(oid, BackgroundTasks(), x_admin_password, password)
+    return admin_approve_order(oid, background_tasks, x_admin_password, password)
 
 @app.get("/api/admin/orders/{oid}/deliver")
 async def admin_deliver_get(
