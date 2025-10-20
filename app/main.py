@@ -2825,17 +2825,14 @@ def admin_list_provider_pending(x_admin_password: Optional[str] = Header(None),
 # ========= GET aliases for admin approve/deliver/reject (compat for Android UI) =========
 from fastapi import Query
 
-
 @app.get("/api/admin/orders/{oid}/approve")
 def admin_approve_order_get(
     oid: int,
-    background_tasks: BackgroundTasks,
     x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
     password: Optional[str] = None
 ):
     logger.info("GET approve called for oid=%s", oid)
-    return admin_approve_order(oid, background_tasks, x_admin_password, password)
-
+    return admin_approve_order(oid, BackgroundTasks(), x_admin_password, password)
 
 @app.get("/api/admin/orders/{oid}/deliver")
 async def admin_deliver_get(
@@ -2848,22 +2845,23 @@ async def admin_deliver_get(
     provider_order_no: Optional[str] = None
 ):
     logger.info("GET deliver called for oid=%s", oid)
+    # Build a minimal fake Request-like object for admin_deliver
     class _DummyRequest:
         async def json(self):
             return {
                 "code": code or "",
                 "amount": amount,
-                "order_no": (order_no or provider_order_no or "")
+                "order_no": order_no or provider_order_no or ""
             }
-        async def body(self):
+        async def body(self):  # fallback path used by _read_json_object
             import json as _json
             return _json.dumps({
                 "code": code or "",
                 "amount": amount,
-                "order_no": (order_no or provider_order_no or "")
+                "order_no": order_no or provider_order_no or ""
             }).encode("utf-8")
-    return await admin_deliver(oid, _DummyRequest(), x_admin_password, password)
-
+    return __import__("asyncio").get_event_loop().await admin_deliver(oid, _DummyRequest(), x_admin_password, password)
+    )
 
 @app.get("/api/admin/orders/{oid}/reject")
 async def admin_reject_get(
@@ -2879,8 +2877,10 @@ async def admin_reject_get(
         async def body(self):
             import json as _json
             return _json.dumps({"reason": reason or ""}).encode("utf-8")
-    return await admin_reject(oid, _DummyRequest(), x_admin_password, password)
+    return __import__("asyncio").get_event_loop().await admin_reject(oid, _DummyRequest(), x_admin_password, password)
+    )
 
+# PUBG/Ludo convenience GET endpoints (aliases)
 @app.get("/api/admin/pubg/{oid}/approve")
 def admin_pubg_approve_get(oid: int, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     return admin_approve_order_get(oid, x_admin_password, password)
