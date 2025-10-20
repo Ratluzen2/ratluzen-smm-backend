@@ -13,6 +13,7 @@ from psycopg2.extras import RealDictCursor, Json
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+import datetime
 
 # =========================
 # Settings
@@ -349,6 +350,22 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"]
 )
 
+
+@app.get("/api/users/ban/status")
+def ban_status(uid: str):
+    uid = (uid or "").strip()
+    if not uid:
+        raise HTTPException(status_code=422, detail="uid required")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            b = _active_ban(cur, uid)
+            if b:
+                until_ms = int(b["until"].timestamp() * 1000)
+                return {"ok": True, "banned": True, "reason": b["reason"], "until_ms": until_ms}
+            return {"ok": True, "banned": False, "reason": "", "until_ms": 0}
+    finally:
+        put_conn(conn)
 # ===== Helpers =====
 
 def _tokens_for_uid(cur, uid: str):
@@ -896,6 +913,31 @@ def _asiacell_submit_core(cur, uid: str, card_digits: str) -> int:
     return cur.fetchone()[0]
 
 def _extract_digits(raw: Any) -> str:
+
+def _active_ban(cur, uid: str):
+    cur.execute("SELECT reason, ban_until FROM public.user_bans WHERE uid=%s", (uid,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    reason, until = row[0], row[1]
+    now = datetime.datetime.utcnow()
+    # If ban expired, clean up
+    if until and until > now:
+        return {"reason": reason or "", "until": until}
+    cur.execute("DELETE FROM public.user_bans WHERE uid=%s", (uid,))
+    return None
+
+def _apply_ban(cur, uid: str, minutes: int, reason: str):
+    until = datetime.datetime.utcnow() + datetime.timedelta(minutes=minutes)
+    cur.execute(
+        """
+        INSERT INTO public.user_bans(uid, reason, ban_until, created_at)
+        VALUES (%s,%s,%s,NOW())
+        ON CONFLICT (uid) DO UPDATE SET reason=EXCLUDED.reason, ban_until=EXCLUDED.ban_until, created_at=NOW()
+        """,
+        (uid, reason, until)
+    )
+    return until
     return "".join(ch for ch in str(raw) if ch.isdigit())
 
 ASIACELL_PATHS = [
@@ -910,12 +952,38 @@ ASIACELL_PATHS = [
 
 @app.post("/api/wallet/asiacell/submit")
 def submit_asiacell(body: AsiacellSubmitIn):
+
     digits = _extract_digits(body.card)
     if len(digits) not in (14, 16):
         raise HTTPException(422, "invalid card length")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
+            # active ban?
+            b = _active_ban(cur, body.uid)
+            if b:
+                until_ms = int(b["until"].timestamp() * 1000)
+                raise HTTPException(status_code=403, detail={"banned": True, "reason": b["reason"], "until_ms": until_ms})
+
+            # record attempt
+            cur.execute("INSERT INTO public.asiacell_attempts(uid, digits) VALUES(%s,%s)", (body.uid, digits))
+
+            # speed: 3 attempts within 60s => ban 60 min
+            cur.execute("SELECT COUNT(*) FROM public.asiacell_attempts WHERE uid=%s AND created_at > NOW() - INTERVAL '60 seconds'", (body.uid,))
+            cnt_min = int(cur.fetchone()[0])
+            if cnt_min >= 3:
+                until = _apply_ban(cur, body.uid, minutes=60, reason="speed")
+                until_ms = int(until.timestamp() * 1000)
+                raise HTTPException(status_code=403, detail={"banned": True, "reason": "speed", "until_ms": until_ms})
+
+            # repeat: same card 3 times in 24h => ban 60 min
+            cur.execute("SELECT COUNT(*) FROM public.asiacell_attempts WHERE uid=%s AND digits=%s AND created_at > NOW() - INTERVAL '24 hours'", (body.uid, digits))
+            cnt_same = int(cur.fetchone()[0])
+            if cnt_same >= 3:
+                until = _apply_ban(cur, body.uid, minutes=60, reason="repeat")
+                until_ms = int(until.timestamp() * 1000)
+                raise HTTPException(status_code=403, detail={"banned": True, "reason": "repeat", "until_ms": until_ms})
+
             oid = _asiacell_submit_core(cur, body.uid, digits)
             # collect user_id for notify after commit
             cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
