@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DATABASE_URL_NEON")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is required")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "2000")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "").strip()
 GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
 FCM_PROJECT_ID = os.getenv("FCM_PROJECT_ID", "").strip()  # optional override
