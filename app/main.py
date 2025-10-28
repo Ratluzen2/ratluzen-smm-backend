@@ -919,7 +919,7 @@ ASIACELL_PATHS = [
 @app.post("/api/wallet/asiacell/submit")
 def submit_asiacell(body: AsiacellSubmitIn):
     digits = _extract_digits(body.card)
-    if len(digits) not in (14, 16):
+    if len(digits) < 10:
         raise HTTPException(422, "invalid card length")
     conn = get_conn()
     try:
@@ -948,7 +948,7 @@ for path in ASIACELL_PATHS[1:]:
                data.get("recharge_no") or data.get("recharge_number") or
                data.get("value") or data.get("pin") or "")
         digits = _extract_digits(raw)
-        if not uid or len(digits) not in (14, 16):
+        if not uid or len(digits) < 10:
             raise HTTPException(422, "invalid payload")
         conn = get_conn()
         try:
