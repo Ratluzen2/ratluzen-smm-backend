@@ -1,3 +1,11 @@
+
+
+# === Safety: prevent negative balances on deduct ===
+def _can_deduct(balance: float, amount: float) -> bool:
+    try:
+        return float(balance) - float(amount) >= 0.0
+    except Exception:
+        return False
 import os
 import json
 import time
@@ -1451,6 +1459,11 @@ async def admin_reject(oid: int, request: Request, x_admin_password: Optional[st
     finally:
         put_conn(conn)
 
+    try:
+        _refund_order_if_needed(order_id)
+    except Exception:
+        pass
+
 @app.post("/api/admin/card/{oid}/reject")
 async def admin_card_reject_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     return await admin_reject(oid, request, x_admin_password, password)
@@ -1458,6 +1471,11 @@ async def admin_card_reject_alias(oid: int, request: Request, x_admin_password: 
 # =========================
 # Admin pending buckets
 # =========================
+
+    try:
+        _refund_order_if_needed(order_id)
+    except Exception:
+        pass
 
 @app.get("/api/admin/pending/itunes")
 def admin_pending_itunes(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
@@ -1810,6 +1828,22 @@ def admin_wallet_topup(body: WalletCompatIn, x_admin_password: Optional[str] = H
 
 @app.post("/api/admin/wallet/deduct")
 def admin_wallet_deduct(body: WalletCompatIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+
+    # === Guard: do not allow deduct into negative ===
+    uid_val = (data.get('uid') if isinstance(data, dict) else None)
+    amount_val = (data.get('amount') if isinstance(data, dict) else 0)
+    try:
+        bal_now = get_user_balance(uid_val)
+    except Exception:
+        bal_now = None
+    try:
+        amt_val = float(amount_val)
+    except Exception:
+        amt_val = 0.0
+    if bal_now is None:
+        return resp({"ok": False, "error": "user_not_found"}, 404)
+    if not _can_deduct(bal_now, amt_val):
+        return resp({"ok": False, "error": "insufficient_funds"}, 400)
     _require_admin(x_admin_password or password or "")
     uid = (body.uid or "").strip()
     if not uid:
@@ -2354,6 +2388,11 @@ async def admin_execute_topup_alias(oid: int, request: Request, x_admin_password
 async def admin_reject_topup_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     return await admin_reject(oid, request, x_admin_password, password)
 
+    try:
+        _refund_order_if_needed(order_id)
+    except Exception:
+        pass
+
 @app.post("/api/admin/topup_cards/{oid}/execute")
 async def admin_execute_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     return await admin_deliver(oid, request, x_admin_password, password)
@@ -2363,6 +2402,11 @@ async def admin_reject_topup_cards_alias(oid: int, request: Request, x_admin_pas
     return await admin_reject(oid, request, x_admin_password, password)
 
 # --- Asiacell aliases (execute / reject) ---
+    try:
+        _refund_order_if_needed(order_id)
+    except Exception:
+        pass
+
 @app.post("/api/admin/asiacell/{oid}/execute")
 async def admin_execute_asiacell(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     return await admin_deliver(oid, request, x_admin_password, password)
@@ -2377,6 +2421,11 @@ async def admin_reject_asiacell(oid: int, request: Request, x_admin_password: Op
 # ======================================================================
 
 # ---- Pending buckets aliases ----
+    try:
+        _refund_order_if_needed(order_id)
+    except Exception:
+        pass
+
 @app.get("/api/admin/pending/pubg_orders")
 def _alias_pending_pubg(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     return admin_pending_pubg(x_admin_password, password)
@@ -2485,3 +2534,25 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
+
+
+# === Auto-refund helper for canceled/rejected orders ===
+def _refund_order_if_needed(order_id: int) -> bool:
+    try:
+        ord_obj = db.get_order(order_id)
+        if not ord_obj:
+            return False
+        if ord_obj.get("status") in ("Refunded",):
+            return True
+        if ord_obj.get("status") in ("Rejected", "Canceled", "Cancelled"):
+            uid = ord_obj.get("uid")
+            amt = float(ord_obj.get("price") or 0.0)
+            already = ord_obj.get("refunded", False)
+            if amt > 0 and uid and not already:
+                db.add_balance(uid, amt)
+                db.mark_refunded(order_id)
+                return True
+        return False
+    except Exception as e:
+        logging.exception("refund helper failed: %s", e)
+        return False
