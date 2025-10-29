@@ -1244,6 +1244,14 @@ def notifications_count_alias(uid: str, status: str = "unread"):
     # alias for convenience
     return notifications_count(uid=uid, status=status)
 
+
+# Alias endpoint to fetch notifications by uid directly (for clients that can't switch off OWNER-0001 quickly)
+@app.get("/api/notifications/list")
+def notifications_list_alias(uid: str, status: str = "all", limit: int = 50):
+    """Return notifications for a given uid. status: unread|read|all"""
+    return get_user_notifications_by_uid(uid, status=status, limit=limit)
+
+
 @app.post("/api/user/{uid}/notifications/mark_all_read")
 def notifications_mark_all_read(uid: str):
     """Mark all unread notifications for the given uid as read and return how many were updated."""
@@ -2655,5 +2663,38 @@ def public_announcements_latest():
         if not row:
             return {}
         return {"title": row[0], "body": row[1], "created_at": int(row[2] or 0)}
+    finally:
+        put_conn(conn)
+
+
+def get_user_notifications_by_uid(uid: str, status: str = "all", limit: int = 50):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            user = cur.fetchone()
+            if not user:
+                return {"items": [], "status": status}
+            user_id = user["id"]
+            if status not in ("unread", "read", "all"):
+                status = "all"
+            if status == "all":
+                cur.execute("""
+                    SELECT id, title, body, status, created_at, read_at
+                      FROM public.user_notifications
+                     WHERE user_id=%s
+                     ORDER BY id DESC
+                     LIMIT %s
+                """, (user_id, limit))
+            else:
+                cur.execute("""
+                    SELECT id, title, body, status, created_at, read_at
+                      FROM public.user_notifications
+                     WHERE user_id=%s AND status=%s
+                     ORDER BY id DESC
+                     LIMIT %s
+                """, (user_id, status, limit))
+            rows = cur.fetchall() or []
+            return {"items": rows, "status": status}
     finally:
         put_conn(conn)
