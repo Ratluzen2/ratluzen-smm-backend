@@ -307,6 +307,7 @@ def ensure_schema():
                         ALTER TABLE public.user_notifications
                         ADD COLUMN IF NOT EXISTS meta JSONB DEFAULT '{}'::jsonb;
                     """)
+                    """)
 CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);")
 
                     cur.execute("""
@@ -353,7 +354,6 @@ CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifica
         put_conn(conn)
 # run at startup
 ensure_schema()
-
 def _tokens_for_uid(cur, uid: str):
     """Return list of FCM tokens for a uid from user_devices or fallback to users.fcm_token"""
     try:
