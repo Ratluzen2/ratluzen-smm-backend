@@ -210,37 +210,6 @@ def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[i
             "Authorization": f"key={server_key}",
             "Content-Type": "application/json"
         }
-
-    # --- Shadow log v2: persist notification for user's UID even if code path didn't write DB ---
-    try:
-        conn = get_conn()
-        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            user_row = None
-            # 1) Try users table by token
-            cur.execute("SELECT id FROM public.users WHERE TRIM(COALESCE(fcm_token,''))=%s", (fcm_token or "").strip(),)
-            user_row = cur.fetchone()
-            # 2) Try user_devices mapping
-            if not user_row:
-                cur.execute("SELECT user_id AS id FROM public.user_devices WHERE TRIM(COALESCE(fcm_token,''))=%s ORDER BY id DESC LIMIT 1", ((fcm_token or "").strip(),))
-                user_row = cur.fetchone()
-
-            if user_row:
-                user_id = user_row["id"]
-                # dedupe: same title/body/order_id within last 3 minutes
-                cur.execute(\"\"\"
-                    SELECT id FROM public.user_notifications
-                     WHERE user_id=%s AND title=%s AND body=%s AND COALESCE(order_id,-1)=COALESCE(%s,-1)
-                       AND created_at > NOW() - INTERVAL '3 minutes'
-                     ORDER BY id DESC LIMIT 1
-                \"\"\", (user_id, title, body, order_id))
-                if not cur.fetchone():
-                    cur.execute(\"\"\"
-                        INSERT INTO public.user_notifications(user_id, title, body, status, order_id, meta, created_at)
-                        VALUES (%s,%s,%s,'unread',%s,%s,NOW())
-                    \"\"\", (user_id, title, body, order_id, json.dumps({"source":"fcm_shadow"})))
-    except Exception as _ex:
-        logger.warning("Shadow log v2 insert failed: %s", _ex)
-    # --- end shadow log v2 ---
         payload = {"to": fcm_token, "priority": "high", "notification": {"title": title, "body": body}, "data": {
                 "title": title,
                 "body": body,
@@ -2769,23 +2738,3 @@ def notifications_mark_all_read(uid: str):
 @app.get("/api/notifications/list")
 def notifications_list_alias(uid: str, status: str = "all", limit: int = 50):
     return get_user_notifications_by_uid(uid, status=status, limit=limit)
-
-
-# -- appendix --
-
-def _resolve_user_id(uid: Optional[str]=None, fcm_token: Optional[str]=None):
-    if not uid and not fcm_token:
-        raise HTTPException(400, "uid or fcm_token required")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if uid:
-                cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
-            else:
-                cur.execute("SELECT user_id AS id FROM public.user_devices WHERE TRIM(COALESCE(fcm_token,''))=%s ORDER BY id DESC LIMIT 1", ((fcm_token or "").strip(),))
-            r = cur.fetchone()
-            if not r:
-                raise HTTPException(404, "user not found")
-            return r["id"]
-    finally:
-        put_conn(conn)
