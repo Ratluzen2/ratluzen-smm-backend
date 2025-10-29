@@ -124,7 +124,7 @@ def _fcm_get_access_token_v1(sa_info: dict) -> Optional[str]:
         logger.info("pyjwt flow not available or failed: %s", e)
     return None
 
-def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int], sa_info: dict, project_id: Optional[str] = None, extra: dict | None = None):
+def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int], sa_info: dict, project_id: Optional[str] = None, extra: dict | None = None, extra=extra):
     try:
         access_token = _fcm_get_access_token_v1(sa_info)
         if not access_token:
@@ -139,7 +139,11 @@ def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int],
             "message": {
                 "token": fcm_token,
                 "notification": {"title": title, "body": body},
-                "data": { "title": title, "body": body, "order_id": str(order_id or ""), **(extra or {}) }
+                "data": {
+                    "title": title,
+                    "body": body,
+                    "order_id": str(order_id or ""),
+                }
             }
         }
         resp = requests.post(url, headers={
@@ -151,62 +155,17 @@ def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int],
     except Exception as ex:
         logger.exception("FCM v1 send exception: %s", ex)
 
-
-# -------------- Notifications unified helper --------------
-def _notify_user_and_log(uid: str, title: str, body: str, *, order_id: Optional[int]=None, status: str="unread", meta: Optional[dict]=None):
-    """
-    Create user_notifications row (always), then push FCM in background (non-blocking).
-    This guarantees that the app can fetch notifications by UID even if FCM fails.
-    """
-    conn = get_conn()
-    nid = None
-    try:
-        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id, fcm_token FROM public.users WHERE uid=%s", (uid,))
-            u = cur.fetchone()
-            if not u:
-                return None
-            user_id = u["id"]
-            cur.execute(
-                """
-                INSERT INTO public.user_notifications(user_id, title, body, status, order_id, meta, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, NOW())
-                RETURNING id
-                """,
-                (user_id, title, body, status, order_id, json.dumps(meta or {}))
-            )
-            nid = cur.fetchone()["id"]
-            fcm_token = (u.get("fcm_token") or "").strip()
-    finally:
-        put_conn(conn)
-
-    # fire-and-forget FCM
-    if fcm_token:
-        _run_async(lambda: _fcm_send_legacy(fcm_token=fcm_token, title=title, body=body, order_id=order_id, server_key=FCM_SERVER_KEY))
-    return nid
-
-def notify_user_order_received(uid: str, order_id: int, service_name: str):
-    title = "تم استلام طلبك"
-    body = f"تم استلام طلب {service_name}."
-    return _notify_user_and_log(uid, title, body, order_id=order_id, status="unread", meta={"type": "order_received"})
-
-def notify_user_order_done(uid: str, order_id: int, service_name: str, code: Optional[str]=None, amount: Optional[str]=None):
-    title = "تم تنفيذ طلبك"
-    tail = f" الكود: {code}" if code else (f" المبلغ: {amount}" if amount else "")
-    body = f"تم تنفيذ طلبك {service_name}.{tail}"
-    return _notify_user_and_log(uid, title, body, order_id=order_id, status="unread", meta={"type": "order_done", "code": code, "amount": amount})
-
-def notify_user_order_rejected(uid: str, order_id: int, service_name: str, reason: Optional[str]=None):
-    title = "تم رفض طلبك"
-    body = f"تم رفض طلب {service_name}." + (f" السبب: {reason}" if reason else "")
-    return _notify_user_and_log(uid, title, body, order_id=order_id, status="unread", meta={"type": "order_rejected", "reason": reason})
-def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[int], server_key: str, extra: dict | None = None):
+def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[int], server_key: str, extra: dict | None = None, extra=extra):
     try:
         headers = {
             "Authorization": f"key={server_key}",
             "Content-Type": "application/json"
         }
-        payload = {"to": fcm_token, "priority": "high", "notification": {"title": title, "body": body}, "data": { "title": title, "body": body, "order_id": str(order_id or ""), **(extra or {}) }
+        payload = {"to": fcm_token, "priority": "high", "notification": {"title": title, "body": body}, "data": {
+                "title": title,
+                "body": body,
+                "order_id": str(order_id or ""),
+            }
         }
         resp = requests.post("https://fcm.googleapis.com/fcm/send", headers=headers, json=payload, timeout=10)
         if resp.status_code not in (200, 201):
@@ -222,7 +181,7 @@ def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Op
     if sa_json:
         try:
             info = json.loads(sa_json)
-            _fcm_send_v1(fcm_token, title, body, order_id, info, project_id=(FCM_PROJECT_ID or None), extra=extra)
+            _fcm_send_v1(fcm_token, title, body, order_id, info, project_id=(FCM_PROJECT_ID or None, extra=extra))
             return
         except Exception as e:
             logger.info("Invalid GOOGLE_APPLICATION_CREDENTIALS_JSON: %s", e)
@@ -343,11 +302,12 @@ def ensure_schema():
                         );
                     """)
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_user_created ON public.user_notifications(user_id, created_at DESC);")
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);")
+                    cur.execute("
                     cur.execute("""
                         ALTER TABLE public.user_notifications
                         ADD COLUMN IF NOT EXISTS meta JSONB DEFAULT '{}'::jsonb;
                     """)
+CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);")
 
                     cur.execute("""
                         CREATE OR REPLACE FUNCTION public.wallet_txns_notify()
@@ -467,8 +427,8 @@ def _notify_user(_conn_ignored, user_id: int, order_id: Optional[int], title: st
         try:
             with c, c.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO public.user_notifications (user_id, order_id, title, body, status, meta, created_at) "
-                    "VALUES (%s,%s,%s,%s,%s,%s, NOW())",
+                    "INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at) "
+                    "VALUES (%s,%s,%s,%s,'unread', NOW())",
                     (user_id, order_id, title, body, status, Json(meta or {}))
                 )
                 cur.execute("SELECT uid FROM public.users WHERE id=%s", (user_id,))
@@ -481,7 +441,7 @@ def _notify_user(_conn_ignored, user_id: int, order_id: Optional[int], title: st
 
         for t in tokens:
             try:
-                _fcm_send_push(t, title, body, order_id, extra=None)
+                _fcm_send_push(t, title, body, order_id, extra=(meta or {}))
             except Exception as e:
                 logger.exception("notify user push error: %s", e)
     finally:
@@ -620,7 +580,7 @@ def _push_user(conn, user_id: int, order_id: Optional[int], title: str, body: st
         logger.exception("push_user DB read failed: %s", e)
     try:
         for t in tokens:
-            _fcm_send_push(t, title, body, order_id, extra=None)
+            _fcm_send_push(t, title, body, order_id, extra=(meta or {}))
     except Exception as e:
         logger.exception("push_user send failed: %s", e)
 
@@ -1099,9 +1059,7 @@ def list_user_notifications(uid: str, status: str = "unread", limit: int = 50):
                 where += " AND status=%s"
                 params.append(status)
             cur.execute(f"""
-                SELECT id, user_id, order_id, title, body, status, meta,
-                       EXTRACT(EPOCH FROM created_at)*1000 AS created_at,
-                       EXTRACT(EPOCH FROM read_at)*1000   AS read_at
+                SELECT id, user_id, order_id, title, body, status, meta, EXTRACT(EPOCH FROM created_at)*1000 AS created_at, EXTRACT(EPOCH FROM read_at)*1000 AS read_at
                 FROM public.user_notifications
                 {where}
                 ORDER BY id DESC
@@ -1445,7 +1403,7 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: Optional[s
         else:
             body_txt = title or "تم التنفيذ"
 
-        _notify_user(conn, user_id, order_id, title_txt, body_txt, meta={ 'service_name': title, 'code': code_val if code_val else '', 'amount': str(amount) if amount is not None else '', 'status': 'Done' })
+        _notify_user(conn, user_id, order_id, title_txt, body_txt, meta={'service_name': title, 'amount': str(amount) if 'amount' in locals() and amount is not None else '', 'code': code_val if 'code_val' in locals() and code_val else '', 'status': 'Done'})
         return {"ok": True, "status": "Done"}
     finally:
         put_conn(conn)
@@ -1510,7 +1468,7 @@ async def admin_reject(oid: int, request: Request, x_admin_password: Optional[st
             else:
                 cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
 
-        _notify_user(conn, user_id, order_id, "تم رفض طلبك", reason or "عذرًا، تم رفض هذا الطلب", meta={ 'service_name': title, 'reason': reason or '', 'status': 'Rejected' })
+        _notify_user(conn, user_id, order_id, 'تم رفض طلبك', reason or 'تم رفض الطلب', meta={'service_name': title, 'reason': reason or '', 'status': 'Rejected'})
         return {"ok": True, "status": "Rejected"}
     finally:
         put_conn(conn)
@@ -2652,42 +2610,8 @@ def public_announcements_latest():
     finally:
         put_conn(conn)
 
-
-def get_user_notifications_by_uid(uid: str, status: str = "all", limit: int = 50):
-    conn = get_conn()
-    try:
-        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
-            user = cur.fetchone()
-            if not user:
-                return {"items": [], "status": status}
-            user_id = user["id"]
-            if status not in ("unread", "read", "all"):
-                status = "all"
-            if status == "all":
-                cur.execute("""
-                    SELECT id, title, body, status, order_id, meta, created_at, read_at
-                      FROM public.user_notifications
-                     WHERE user_id=%s
-                     ORDER BY id DESC
-                     LIMIT %s
-                """, (user_id, limit))
-            else:
-                cur.execute("""
-                    SELECT id, title, body, status, order_id, meta, created_at, read_at
-                      FROM public.user_notifications
-                     WHERE user_id=%s AND status=%s
-                     ORDER BY id DESC
-                     LIMIT %s
-                """, (user_id, status, limit))
-            rows = cur.fetchall() or []
-            return {"items": rows, "status": status}
-    finally:
-        put_conn(conn)
-
-
 @app.get("/api/user/by-uid/{uid}/notifications/count")
-def notifications_count(uid: str, status: str = "unread"):
+def notifications_count_by_uid(uid: str, status: str = "unread"):
     conn = get_conn()
     try:
         with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -2696,7 +2620,7 @@ def notifications_count(uid: str, status: str = "unread"):
             if not r:
                 return {"count": 0, "status": status}
             user_id = r["id"]
-            if status not in ("unread", "read", "all"):
+            if status not in ("unread","read","all"):
                 status = "unread"
             if status == "all":
                 cur.execute("SELECT COUNT(1) AS c FROM public.user_notifications WHERE user_id=%s", (user_id,))
@@ -2707,12 +2631,8 @@ def notifications_count(uid: str, status: str = "unread"):
     finally:
         put_conn(conn)
 
-@app.get("/api/notifications/count")
-def notifications_count_alias(uid: str, status: str = "unread"):
-    return notifications_count(uid=uid, status=status)
-
 @app.post("/api/user/{uid}/notifications/mark_all_read")
-def notifications_mark_all_read(uid: str):
+def mark_all_read(uid: str):
     conn = get_conn()
     try:
         with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -2726,11 +2646,6 @@ def notifications_mark_all_read(uid: str):
                    SET status='read', read_at=NOW()
                  WHERE user_id=%s AND status='unread'
             """, (user_id,))
-            updated = cur.rowcount or 0
-            return {"ok": True, "updated": int(updated)}
+            return {"ok": True, "updated": int(cur.rowcount or 0)}
     finally:
         put_conn(conn)
-
-@app.get("/api/notifications/list")
-def notifications_list_alias(uid: str, status: str = "all", limit: int = 50):
-    return get_user_notifications_by_uid(uid, status=status, limit=limit)
