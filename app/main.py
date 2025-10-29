@@ -151,16 +151,7 @@ def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int],
             "Content-Type": "application/json"
         }, json=message, timeout=10)
         if resp.status_code not in (200, 201):
-            txt = resp.text or ''
-            logger.warning("FCM v1 send failed (%s): %s", resp.status_code, txt[:300])
-            # Auto-clean invalid tokens
-            low = txt.upper()
-            if 'UNREGISTERED' in low or 'REGISTRATION_TOKEN' in low:
-                try:
-                    _cleanup_bad_token(fcm_token)
-                    logger.info("FCM v1: cleaned up UNREGISTERED token")
-                except Exception as _e:
-                    logger.warning("cleanup token failed: %s", _e)
+            logger.warning("FCM v1 send failed (%s): %s", resp.status_code, resp.text[:300])
     except Exception as ex:
         logger.exception("FCM v1 send exception: %s", ex)
 
@@ -176,26 +167,9 @@ def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[i
                 "order_id": str(order_id or ""),
             }
         }
-        resp = requests.post("https://fcm.googleapis.com/fcm/send",
-            headers=headers, json=payload, timeout=10)
-        # Legacy may return 200 with error body; check both
-        try:
-            data = resp.json()
-        except Exception:
-            data = None
+        resp = requests.post("https://fcm.googleapis.com/fcm/send", headers=headers, json=payload, timeout=10)
         if resp.status_code not in (200, 201):
-            logger.warning("FCM legacy send failed (%s): %s", resp.status_code, (resp.text or "")[:300])
-        # clean up NotRegistered/InvalidRegistration
-        try:
-            if data and isinstance(data, dict) and data.get("results"):
-                for r in data.get("results", []):
-                    err = (r.get("error") or "").lower()
-                    if err in ("notregistered", "not_registered", "invalidregistration", "invalid_registration"):
-                        _cleanup_bad_token(fcm_token)
-                        logger.info("FCM legacy: cleaned up invalid token")
-                        break
-        except Exception as _e:
-            logger.warning("legacy cleanup check failed: %s", _e)
+            logger.warning("FCM legacy send failed (%s): %s", resp.status_code, resp.text[:300])
     except Exception as ex:
         logger.exception("FCM legacy send exception: %s", ex)
 
@@ -409,24 +383,6 @@ def _all_fcm_tokens(cur):
         if t not in seen:
             seen.add(t); out.append(t)
     return out
-def _cleanup_bad_token(bad_token: str):
-    """Remove invalid/unregistered FCM token from DB to prevent repeated failures."""
-    if not bad_token:
-        return
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            try:
-                cur.execute("DELETE FROM public.user_devices WHERE fcm_token=%s", (bad_token,))
-            except Exception:
-                pass
-            try:
-                cur.execute("UPDATE public.users SET fcm_token=NULL WHERE fcm_token=%s", (bad_token,))
-            except Exception:
-                pass
-    finally:
-        put_conn(conn)
-
 
 def _require_admin(passwd: str):
     if passwd != ADMIN_PASSWORD:
@@ -1258,6 +1214,57 @@ async def create_manual_paid(request: Request):
         put_conn(conn)
 
 # Additional compat aliases for manual_paid (covering multiple potential paths from the app)
+# -------------------------
+# Notifications: count & mark_all_read
+# -------------------------
+@app.get("/api/user/by-uid/{uid}/notifications/count")
+def notifications_count(uid: str, status: str = "unread"):
+    """Return notification count for a user by status: unread|read|all"""
+    conn = get_conn()
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                return {"count": 0, "status": status}
+            user_id = r["id"]
+            if status not in ("unread", "read", "all"):
+                status = "unread"
+            if status == "all":
+                cur.execute("SELECT COUNT(1) AS c FROM public.user_notifications WHERE user_id=%s", (user_id,))
+            else:
+                cur.execute("SELECT COUNT(1) AS c FROM public.user_notifications WHERE user_id=%s AND status=%s", (user_id, status))
+            row = cur.fetchone() or {"c": 0}
+            return {"count": int(row["c"]), "status": status}
+    finally:
+        put_conn(conn)
+
+@app.get("/api/notifications/count")
+def notifications_count_alias(uid: str, status: str = "unread"):
+    # alias for convenience
+    return notifications_count(uid=uid, status=status)
+
+@app.post("/api/user/{uid}/notifications/mark_all_read")
+def notifications_mark_all_read(uid: str):
+    """Mark all unread notifications for the given uid as read and return how many were updated."""
+    conn = get_conn()
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                raise HTTPException(404, "user not found")
+            user_id = r["id"]
+            cur.execute("""
+                UPDATE public.user_notifications
+                   SET status='read', read_at=NOW()
+                 WHERE user_id=%s AND status='unread'
+            """, (user_id,))
+            updated = cur.rowcount or 0
+            return {"ok": True, "updated": int(updated)}
+    finally:
+        put_conn(conn)
+
 @app.post("/api/create/manual_paid")
 async def create_manual_paid_alias1(request: Request):
     return await create_manual_paid(request)
@@ -2650,28 +2657,3 @@ def public_announcements_latest():
         return {"title": row[0], "body": row[1], "created_at": int(row[2] or 0)}
     finally:
         put_conn(conn)
-
-@app.get("/api/user/by-uid/{uid}/notifications/count")
-def user_notifications_count(uid: str, status: str = "unread"):
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
-            r = cur.fetchone()
-            if not r:
-                return {"count": 0, "status": status}
-            user_id = r[0]
-            if status not in ("unread","read","all"):
-                status = "unread"
-            if status == "all":
-                cur.execute("SELECT COUNT(1) FROM public.user_notifications WHERE user_id=%s", (user_id,))
-            else:
-                cur.execute("SELECT COUNT(1) FROM public.user_notifications WHERE user_id=%s AND status=%s", (user_id, status))
-            cnt = int(cur.fetchone()[0])
-            return {"count": cnt, "status": status}
-    finally:
-        put_conn(conn)
-
-@app.get("/api/notifications/count")
-def notifications_count_alias(uid: str, status: str = "unread"):
-    return user_notifications_count(uid, status)
