@@ -155,61 +155,38 @@ def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int],
     except Exception as ex:
         logger.exception("FCM v1 send exception: %s", ex)
 
-
-# -------------- Notifications unified helper --------------
-def _notify_user_and_log(uid: str, title: str, body: str, *, order_id: Optional[int]=None, status: str="unread", meta: Optional[dict]=None):
-    """
-    Create user_notifications row (always), then push FCM in background (non-blocking).
-    This guarantees that the app can fetch notifications by UID even if FCM fails.
-    """
-    conn = get_conn()
-    nid = None
-    try:
-        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id, fcm_token FROM public.users WHERE uid=%s", (uid,))
-            u = cur.fetchone()
-            if not u:
-                return None
-            user_id = u["id"]
-            cur.execute(
-                """
-                INSERT INTO public.user_notifications(user_id, title, body, status, order_id, meta, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, NOW())
-                RETURNING id
-                """,
-                (user_id, title, body, status, order_id, json.dumps(meta or {}))
-            )
-            nid = cur.fetchone()["id"]
-            fcm_token = (u.get("fcm_token") or "").strip()
-    finally:
-        put_conn(conn)
-
-    # fire-and-forget FCM
-    if fcm_token:
-        _run_async(lambda: _fcm_send_legacy(fcm_token=fcm_token, title=title, body=body, order_id=order_id, server_key=FCM_SERVER_KEY))
-    return nid
-
-def notify_user_order_received(uid: str, order_id: int, service_name: str):
-    title = "تم استلام طلبك"
-    body = f"تم استلام طلب {service_name}."
-    return _notify_user_and_log(uid, title, body, order_id=order_id, status="unread", meta={"type": "order_received"})
-
-def notify_user_order_done(uid: str, order_id: int, service_name: str, code: Optional[str]=None, amount: Optional[str]=None):
-    title = "تم تنفيذ طلبك"
-    tail = f" الكود: {code}" if code else (f" المبلغ: {amount}" if amount else "")
-    body = f"تم تنفيذ طلبك {service_name}.{tail}"
-    return _notify_user_and_log(uid, title, body, order_id=order_id, status="unread", meta={"type": "order_done", "code": code, "amount": amount})
-
-def notify_user_order_rejected(uid: str, order_id: int, service_name: str, reason: Optional[str]=None):
-    title = "تم رفض طلبك"
-    body = f"تم رفض طلب {service_name}." + (f" السبب: {reason}" if reason else "")
-    return _notify_user_and_log(uid, title, body, order_id=order_id, status="unread", meta={"type": "order_rejected", "reason": reason})
 def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[int], server_key: str):
     try:
         headers = {
             "Authorization": f"key={server_key}",
             "Content-Type": "application/json"
         }
+
+    # --- DB shadow log so notifications always appear in app list ---
+    try:
+        conn = get_conn()
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # find user by token (latest wins)
+            cur.execute("SELECT id FROM public.users WHERE TRIM(COALESCE(fcm_token,''))=%s", (fcm_token.strip(),))
+            u = cur.fetchone()
+            if u:
+                user_id = u["id"]
+                # de-duplicate burst: if identical title/body/order_id in last 2 minutes, skip insert
+                cur.execute(\"\"\"
+                    SELECT id FROM public.user_notifications
+                     WHERE user_id=%s AND title=%s AND body=%s AND COALESCE(order_id, -1)=COALESCE(%s, -1)
+                       AND created_at > NOW() - INTERVAL '2 minutes'
+                     ORDER BY id DESC LIMIT 1
+                \"\"\", (user_id, title, body, order_id))
+                existed = cur.fetchone()
+                if not existed:
+                    cur.execute(\"\"\"
+                        INSERT INTO public.user_notifications(user_id, title, body, status, order_id, meta, created_at)
+                        VALUES (%s, %s, %s, 'unread', %s, %s, NOW())
+                    \"\"\", (user_id, title, body, order_id, json.dumps({"source": "fcm_send_legacy"}) ))
+    except Exception as db_ex:
+        logger.warning("Shadow log insert failed: %s", db_ex)
+    # --- end DB shadow log ---
         payload = {"to": fcm_token, "priority": "high", "notification": {"title": title, "body": body}, "data": {
                 "title": title,
                 "body": body,
@@ -2655,86 +2632,3 @@ def public_announcements_latest():
         return {"title": row[0], "body": row[1], "created_at": int(row[2] or 0)}
     finally:
         put_conn(conn)
-
-
-def get_user_notifications_by_uid(uid: str, status: str = "all", limit: int = 50):
-    conn = get_conn()
-    try:
-        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
-            user = cur.fetchone()
-            if not user:
-                return {"items": [], "status": status}
-            user_id = user["id"]
-            if status not in ("unread", "read", "all"):
-                status = "all"
-            if status == "all":
-                cur.execute("""
-                    SELECT id, title, body, status, order_id, meta, created_at, read_at
-                      FROM public.user_notifications
-                     WHERE user_id=%s
-                     ORDER BY id DESC
-                     LIMIT %s
-                """, (user_id, limit))
-            else:
-                cur.execute("""
-                    SELECT id, title, body, status, order_id, meta, created_at, read_at
-                      FROM public.user_notifications
-                     WHERE user_id=%s AND status=%s
-                     ORDER BY id DESC
-                     LIMIT %s
-                """, (user_id, status, limit))
-            rows = cur.fetchall() or []
-            return {"items": rows, "status": status}
-    finally:
-        put_conn(conn)
-
-
-@app.get("/api/user/by-uid/{uid}/notifications/count")
-def notifications_count(uid: str, status: str = "unread"):
-    conn = get_conn()
-    try:
-        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
-            r = cur.fetchone()
-            if not r:
-                return {"count": 0, "status": status}
-            user_id = r["id"]
-            if status not in ("unread", "read", "all"):
-                status = "unread"
-            if status == "all":
-                cur.execute("SELECT COUNT(1) AS c FROM public.user_notifications WHERE user_id=%s", (user_id,))
-            else:
-                cur.execute("SELECT COUNT(1) AS c FROM public.user_notifications WHERE user_id=%s AND status=%s", (user_id, status))
-            row = cur.fetchone() or {"c": 0}
-            return {"count": int(row["c"]), "status": status}
-    finally:
-        put_conn(conn)
-
-@app.get("/api/notifications/count")
-def notifications_count_alias(uid: str, status: str = "unread"):
-    return notifications_count(uid=uid, status=status)
-
-@app.post("/api/user/{uid}/notifications/mark_all_read")
-def notifications_mark_all_read(uid: str):
-    conn = get_conn()
-    try:
-        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
-            r = cur.fetchone()
-            if not r:
-                raise HTTPException(404, "user not found")
-            user_id = r["id"]
-            cur.execute("""
-                UPDATE public.user_notifications
-                   SET status='read', read_at=NOW()
-                 WHERE user_id=%s AND status='unread'
-            """, (user_id,))
-            updated = cur.rowcount or 0
-            return {"ok": True, "updated": int(updated)}
-    finally:
-        put_conn(conn)
-
-@app.get("/api/notifications/list")
-def notifications_list_alias(uid: str, status: str = "all", limit: int = 50):
-    return get_user_notifications_by_uid(uid, status=status, limit=limit)
