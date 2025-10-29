@@ -139,11 +139,7 @@ def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int],
             "message": {
                 "token": fcm_token,
                 "notification": {"title": title, "body": body},
-                "data": {
-                    "title": title,
-                    "body": body,
-                    "order_id": str(order_id or ""),
-                }
+                "data": { "title": title, "body": body, "order_id": str(order_id or ""), **(extra or {}) }
             }
         }
         resp = requests.post(url, headers={
@@ -210,11 +206,7 @@ def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[i
             "Authorization": f"key={server_key}",
             "Content-Type": "application/json"
         }
-        payload = {"to": fcm_token, "priority": "high", "notification": {"title": title, "body": body}, "data": {
-                "title": title,
-                "body": body,
-                "order_id": str(order_id or ""),
-            }
+        payload = {"to": fcm_token, "priority": "high", "notification": {"title": title, "body": body}, "data": { "title": title, "body": body, "order_id": str(order_id or ""), **(extra or {}) }
         }
         resp = requests.post("https://fcm.googleapis.com/fcm/send", headers=headers, json=payload, timeout=10)
         if resp.status_code not in (200, 201):
@@ -222,7 +214,7 @@ def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[i
     except Exception as ex:
         logger.exception("FCM legacy send exception: %s", ex)
 
-def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Optional[int]):
+def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Optional[int], extra: dict | None = None):
     if not fcm_token:
         return
     # Prefer v1 via Service Account JSON stored in env
@@ -351,7 +343,10 @@ def ensure_schema():
                         );
                     """)
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_user_created ON public.user_notifications(user_id, created_at DESC);")
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);
+
+                    ALTER TABLE public.user_notifications
+                    ADD COLUMN IF NOT EXISTS meta JSONB DEFAULT '{}'::jsonb;")
 
                     cur.execute("""
                         CREATE OR REPLACE FUNCTION public.wallet_txns_notify()
@@ -459,7 +454,7 @@ async def _read_json_object(request: Request) -> Dict[str, Any]:
     return data
 
 
-def _notify_user(_conn_ignored, user_id: int, order_id: Optional[int], title: str, body: str):
+def _notify_user(_conn_ignored, user_id: int, order_id: Optional[int], title: str, body: str, meta: dict | None = None, status: str = 'unread'):
     """
     SAFE: open a fresh DB connection (no recursive re-entry).
     Inserts DB notification + pushes FCM to all user's devices.
@@ -473,7 +468,7 @@ def _notify_user(_conn_ignored, user_id: int, order_id: Optional[int], title: st
                 cur.execute(
                     "INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at) "
                     "VALUES (%s,%s,%s,%s,'unread', NOW())",
-                    (user_id, order_id, title, body)
+                    (user_id, order_id, title, body, status, Json(meta or {}))
                 )
                 cur.execute("SELECT uid FROM public.users WHERE id=%s", (user_id,))
                 row = cur.fetchone()
@@ -485,7 +480,7 @@ def _notify_user(_conn_ignored, user_id: int, order_id: Optional[int], title: st
 
         for t in tokens:
             try:
-                _fcm_send_push(t, title, body, order_id)
+                _fcm_send_push(t, title, body, order_id, extra=(meta or {}))
             except Exception as e:
                 logger.exception("notify user push error: %s", e)
     finally:
@@ -624,7 +619,7 @@ def _push_user(conn, user_id: int, order_id: Optional[int], title: str, body: st
         logger.exception("push_user DB read failed: %s", e)
     try:
         for t in tokens:
-            _fcm_send_push(t, title, body, order_id)
+            _fcm_send_push(t, title, body, order_id, extra=(meta or {}))
     except Exception as e:
         logger.exception("push_user send failed: %s", e)
 
@@ -1103,7 +1098,7 @@ def list_user_notifications(uid: str, status: str = "unread", limit: int = 50):
                 where += " AND status=%s"
                 params.append(status)
             cur.execute(f"""
-                SELECT id, user_id, order_id, title, body, status,
+                SELECT id, user_id, order_id, title, body, status, meta,
                        EXTRACT(EPOCH FROM created_at)*1000 AS created_at,
                        EXTRACT(EPOCH FROM read_at)*1000   AS read_at
                 FROM public.user_notifications
@@ -1449,7 +1444,7 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: Optional[s
         else:
             body_txt = title or "تم التنفيذ"
 
-        _notify_user(conn, user_id, order_id, title_txt, body_txt)
+        _notify_user(conn, user_id, order_id, title_txt, body_txt, meta={ 'service_name': title, 'code': code_val if code_val else '', 'amount': str(amount) if amount is not None else '', 'status': 'Done' })
         return {"ok": True, "status": "Done"}
     finally:
         put_conn(conn)
@@ -1514,7 +1509,7 @@ async def admin_reject(oid: int, request: Request, x_admin_password: Optional[st
             else:
                 cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
 
-        _notify_user(conn, user_id, order_id, "تم رفض طلبك", reason or "عذرًا، تم رفض هذا الطلب")
+        _notify_user(conn, user_id, order_id, "تم رفض طلبك", reason or "عذرًا، تم رفض هذا الطلب", meta={ 'service_name': title, 'reason': reason or '', 'status': 'Rejected' })
         return {"ok": True, "status": "Rejected"}
     finally:
         put_conn(conn)
