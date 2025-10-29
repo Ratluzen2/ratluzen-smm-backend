@@ -340,9 +340,9 @@ def ensure_schema():
                             END IF;
                         END $$;
                     """)
-
 # announcements (app-wide broadcasts)
-cur.execute("""                        CREATE TABLE IF NOT EXISTS public.announcements(
+cur.execute("""
+    CREATE TABLE IF NOT EXISTS public.announcements(
         id          BIGSERIAL PRIMARY KEY,
         title       TEXT NULL,
         body        TEXT NOT NULL,
@@ -351,6 +351,7 @@ cur.execute("""                        CREATE TABLE IF NOT EXISTS public.announc
     );
 """)
 cur.execute("CREATE INDEX IF NOT EXISTS idx_ann_created ON public.announcements(created_at DESC);")
+
 
                 finally:
                     cur.execute("SELECT pg_advisory_unlock(987654321)")
@@ -384,6 +385,29 @@ def _tokens_for_uid(cur, uid: str):
     cur.execute("SELECT fcm_token FROM public.users WHERE uid=%s", (uid,))
     r = cur.fetchone()
     return [r[0]] if r and r[0] else []
+
+
+
+def _all_fcm_tokens(cur):
+    tokens = []
+    try:
+        cur.execute("SELECT DISTINCT fcm_token FROM public.user_devices WHERE COALESCE(fcm_token,'')<>''")
+        tokens += [r[0] for r in cur.fetchall() if r and r[0]]
+    except Exception:
+        pass
+    try:
+        cur.execute("SELECT DISTINCT fcm_token FROM public.users WHERE COALESCE(fcm_token,'')<>''")
+        tokens += [r[0] for r in cur.fetchall() if r and r[0]]
+    except Exception:
+        pass
+    # deduplicate
+    seen = set()
+    out = []
+    for t in tokens:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
 def _require_admin(passwd: str):
     if passwd != ADMIN_PASSWORD:
@@ -2541,110 +2565,6 @@ def test_push_owner(p: TestPushIn):
     finally:
         put_conn(conn)
 
-
-
-# =========================
-# Announcements (App-wide)
-# =========================
-class AnnouncementIn(BaseModel):
-    title: Optional[str] = None
-    body: str
-
-@app.post("/api/admin/announcement/create")
-def admin_announcement_create(body: AnnouncementIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    """
-    Create a new broadcast announcement:
-      Body: { "title": "اختياري", "body": "النص" }
-      Auth: x-admin-password header (or "password" query)
-    - Stores in DB (public.announcements)
-    - Inserts a single user_notifications row per user (unread)
-    - Sends FCM to all registered devices
-    """
-    _require_admin(x_admin_password or password or "")
-    title = (body.title or "إعلان جديد").strip()
-    msg   = (body.body or "").strip()
-    if not msg:
-        raise HTTPException(422, "body is required")
-
-    conn = get_conn()
-    try:
-        tokens = []
-        created_ms = 0
-        with conn, conn.cursor() as cur:
-            # store announcement
-            cur.execute(
-                "INSERT INTO public.announcements(title, body, is_active) VALUES(%s,%s,TRUE) RETURNING EXTRACT(EPOCH FROM created_at)*1000",
-                (title if title else None, msg)
-            )
-            created_ms = int(cur.fetchone()[0] or 0)
-
-            # insert notification row per user in one SQL (efficient)
-            try:
-                cur.execute("""
-                    INSERT INTO public.user_notifications(user_id, order_id, title, body, status, created_at)
-                    SELECT id, NULL, %s, %s, 'unread', NOW()
-                    FROM public.users
-                """, (title, msg))
-            except Exception:
-                pass
-
-            # collect tokens
-            try:
-                tokens = _all_fcm_tokens(cur)
-            except Exception:
-                tokens = []
-
-        # push outside transaction
-        sent = 0
-        for t in tokens:
-            try:
-                _fcm_send_push(t, title, msg, None)
-                sent += 1
-            except Exception:
-                pass
-        return {"ok": True, "created_at": created_ms, "sent": sent}
-    finally:
-        put_conn(conn)
-
-@app.get("/api/public/announcements")
-def public_announcements(limit: int = 50):
-    """
-    Returns the latest announcements for the home screen.
-    """
-    try:
-        limit = max(1, min(int(limit), 200))
-    except Exception:
-        limit = 50
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT COALESCE(NULLIF(title,''), NULL) AS title, body, EXTRACT(EPOCH FROM created_at)*1000 AS created_at "
-                "FROM public.announcements WHERE is_active IS TRUE ORDER BY id DESC LIMIT %s",
-                (limit,)
-            )
-            rows = cur.fetchall()
-        return [{"title": r[0], "body": r[1], "created_at": int(r[2] or 0)} for r in rows]
-    finally:
-        put_conn(conn)
-
-@app.get("/api/public/announcements/latest")
-def public_announcements_latest():
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT COALESCE(NULLIF(title,''), NULL) AS title, body, EXTRACT(EPOCH FROM created_at)*1000 AS created_at "
-                "FROM public.announcements WHERE is_active IS TRUE ORDER BY id DESC LIMIT 1"
-            )
-            row = cur.fetchone()
-        if not row:
-            return {}
-        return {"title": row[0], "body": row[1], "created_at": int(row[2] or 0)}
-    finally:
-        put_conn(conn)
-
-
 # =============== Run local ===============
 if __name__ == "__main__":
     import uvicorn
@@ -2674,26 +2594,91 @@ def _refund_order_if_needed(order_id: int) -> bool:
         return False
 
 
-def _all_fcm_tokens(cur):
-    """
-    Collects all distinct FCM tokens from user_devices (preferred) and users.fcm_token (fallback).
-    """
-    tokens = []
+
+# =========================
+# Announcements (App-wide)
+# =========================
+class AnnouncementIn(BaseModel):
+    title: Optional[str] = None
+    body: str
+
+@app.post("/api/admin/announcement/create")
+def admin_announcement_create(body: AnnouncementIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    title = (body.title or "إعلان جديد").strip()
+    msg   = (body.body or "").strip()
+    if not msg:
+        raise HTTPException(422, "body is required")
+    conn = get_conn()
     try:
-        cur.execute("SELECT DISTINCT fcm_token FROM public.user_devices WHERE COALESCE(fcm_token,'')<>''")
-        tokens += [r[0] for r in cur.fetchall() if r and r[0]]
-    except Exception:
-        pass
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO public.announcements(title, body, is_active) VALUES(%s,%s,TRUE) RETURNING EXTRACT(EPOCH FROM created_at)*1000",
+                    (title if body.title else None, msg)
+                )
+                created_ms = int(cur.fetchone()[0] or 0)
+                try:
+                    cur.execute("SELECT id FROM public.users")
+                    rows = cur.fetchall()
+                    for (uid,) in rows:
+                        try:
+                            cur.execute(
+                                "INSERT INTO public.user_notifications(user_id, order_id, title, body, status, created_at) VALUES(%s,NULL,%s,%s,'unread',NOW())",
+                                (uid, title, msg)
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                try:
+                    tokens = _all_fcm_tokens(cur)
+                except Exception:
+                    tokens = []
+        sent = 0
+        for t in tokens:
+            try:
+                _fcm_send_push(t, title, msg, None)
+                sent += 1
+            except Exception:
+                pass
+        return {"ok": True, "created_at": created_ms, "sent": sent}
+    finally:
+        put_conn(conn)
+
+@app.get("/api/public/announcements")
+def public_announcements(limit: int = 50):
     try:
-        cur.execute("SELECT DISTINCT fcm_token FROM public.users WHERE COALESCE(fcm_token,'')<>''")
-        tokens += [r[0] for r in cur.fetchall() if r and r[0]]
+        limit = max(1, min(int(limit), 200))
     except Exception:
-        pass
-    # de-duplicate preserving order
-    seen = set()
-    out = []
-    for t in tokens:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
+        limit = 50
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COALESCE(NULLIF(title,''), NULL) AS title, body, EXTRACT(EPOCH FROM created_at)*1000 AS created_at "
+                    "FROM public.announcements WHERE is_active IS TRUE ORDER BY id DESC LIMIT %s",
+                    (limit,)
+                )
+                rows = cur.fetchall()
+        return [{"title": r[0], "body": r[1], "created_at": int(r[2] or 0)} for r in rows]
+    finally:
+        put_conn(conn)
+
+@app.get("/api/public/announcements/latest")
+def public_announcements_latest():
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COALESCE(NULLIF(title,''), NULL) AS title, body, EXTRACT(EPOCH FROM created_at)*1000 AS created_at "
+                    "FROM public.announcements WHERE is_active IS TRUE ORDER BY id DESC LIMIT 1"
+                )
+                row = cur.fetchone()
+        if not row:
+            return {}
+        return {"title": row[0], "body": row[1], "created_at": int(row[2] or 0)}
+    finally:
+        put_conn(conn)
