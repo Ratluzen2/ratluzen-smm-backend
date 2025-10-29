@@ -181,7 +181,7 @@ def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Op
     if sa_json:
         try:
             info = json.loads(sa_json)
-            _fcm_send_v1(fcm_token, title, body, order_id, info, project_id=(FCM_PROJECT_ID or None, extra=extra))
+            _fcm_send_v1(fcm_token, title, body, order_id, info, project_id=(FCM_PROJECT_ID or None), extra=extra)
             return
         except Exception as e:
             logger.info("Invalid GOOGLE_APPLICATION_CREDENTIALS_JSON: %s", e)
@@ -307,7 +307,7 @@ def ensure_schema():
                         ALTER TABLE public.user_notifications
                         ADD COLUMN IF NOT EXISTS meta JSONB DEFAULT '{}'::jsonb;
                     """)
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);")
+CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);")
 
                     cur.execute("""
                         CREATE OR REPLACE FUNCTION public.wallet_txns_notify()
