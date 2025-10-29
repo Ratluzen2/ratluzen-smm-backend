@@ -12,6 +12,7 @@ import time
 import logging
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional
 
 import requests
 import psycopg2
@@ -180,197 +181,176 @@ def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Op
 # =========================
 # Schema & Triggers
 # =========================
+
 def ensure_schema():
     conn = get_conn()
     try:
         with conn:
             with conn.cursor() as cur:
-                # global advisory lock to avoid race on first boot
+                # advisory lock to serialize migrations
                 cur.execute("SELECT pg_advisory_lock(987654321)")
                 try:
-                    cur.execute("CREATE SCHEMA IF NOT EXISTS public;")
+                cur.execute("""
+                                        CREATE TABLE IF NOT EXISTS public.users(
+                                            id         SERIAL PRIMARY KEY,
+                                            uid        TEXT UNIQUE NOT NULL,
+                                            balance    NUMERIC(18,4) NOT NULL DEFAULT 0,
+                                            is_banned  BOOLEAN NOT NULL DEFAULT FALSE,
+                                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                                            fcm_token  TEXT
+                                        );
+                                    """)
 
-                    # users
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS public.users(
-                            id         SERIAL PRIMARY KEY,
-                            uid        TEXT UNIQUE NOT NULL,
-                            balance    NUMERIC(18,4) NOT NULL DEFAULT 0,
-                            is_banned  BOOLEAN NOT NULL DEFAULT FALSE,
-                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                            fcm_token  TEXT
-                        );
-                    """)
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_uid ON public.users(uid);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_users_uid ON public.users(uid);")
 
-                    # user_devices (multi-device FCM tokens)
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS public.user_devices(
-                            id BIGSERIAL PRIMARY KEY,
-                            uid TEXT NOT NULL,
-                            fcm_token TEXT NOT NULL UNIQUE,
-                            platform TEXT DEFAULT 'android',
-                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                        );
-                    """)
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_devices_uid ON public.user_devices(uid);")
+                cur.execute("""
+                                        CREATE TABLE IF NOT EXISTS public.user_devices(
+                                            id BIGSERIAL PRIMARY KEY,
+                                            uid TEXT NOT NULL,
+                                            fcm_token TEXT NOT NULL UNIQUE,
+                                            platform TEXT DEFAULT 'android',
+                                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                                        );
+                                    """)
 
-                    # wallet_txns
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS public.wallet_txns(
-                            id         SERIAL PRIMARY KEY,
-                            user_id    INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-                            amount     NUMERIC(18,4) NOT NULL,
-                            reason     TEXT,
-                            meta       JSONB,
-                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                        );
-                    """)
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_wallet_txns_user ON public.wallet_txns(user_id);")
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_wallet_txns_created ON public.wallet_txns(created_at);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_user_devices_uid ON public.user_devices(uid);")
 
-                    # orders
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS public.orders(
-                            id                 SERIAL PRIMARY KEY,
-                            user_id            INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-                            title              TEXT NOT NULL,
-                            service_id         BIGINT,
-                            link               TEXT,
-                            quantity           INTEGER NOT NULL DEFAULT 0,
-                            price              NUMERIC(18,4) NOT NULL DEFAULT 0,
-                            status             TEXT NOT NULL DEFAULT 'Pending',
-                            provider_order_id  TEXT,
-                            payload            JSONB DEFAULT '{}'::jsonb,
-                            created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                            type               TEXT
-                        );
-                    """)
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON public.orders(user_id);")
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders(status);")
-                    cur.execute("ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS type TEXT;")
-                    cur.execute("UPDATE public.orders SET type='provider' WHERE type IS NULL;")
-                    cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET DEFAULT 'provider';")
-                    cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET NOT NULL;")
-                    cur.execute("UPDATE public.orders SET payload='{}'::jsonb WHERE payload IS NULL;")
+                cur.execute("""
+                                        CREATE TABLE IF NOT EXISTS public.wallet_txns(
+                                            id         SERIAL PRIMARY KEY,
+                                            user_id    INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                                            amount     NUMERIC(18,4) NOT NULL,
+                                            reason     TEXT,
+                                            meta       JSONB,
+                                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                                        );
+                                    """)
 
-                    # service overrides tables
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS public.service_id_overrides(
-                            ui_key TEXT PRIMARY KEY,
-                            service_id BIGINT NOT NULL,
-                            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                        );
-                    """)
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS public.service_pricing_overrides(
-                            ui_key TEXT PRIMARY KEY,
-                            price_per_k NUMERIC(18,6) NOT NULL,
-                            min_qty INTEGER NOT NULL,
-                            max_qty INTEGER NOT NULL,
-                            mode TEXT NOT NULL DEFAULT 'per_k',
-                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                        );
-                    """)
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS public.order_pricing_overrides(
-                            order_id BIGINT PRIMARY KEY,
-                            price NUMERIC(18,6) NOT NULL,
-                            mode TEXT NOT NULL DEFAULT 'flat',
-                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                        );
-                    """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_wallet_txns_user ON public.wallet_txns(user_id);")
 
-                    # user_notifications
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS public.user_notifications(
-                            id BIGSERIAL PRIMARY KEY,
-                            user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-                            order_id INTEGER NULL REFERENCES public.orders(id) ON DELETE SET NULL,
-                            title TEXT NOT NULL,
-                            body  TEXT NOT NULL,
-                            status TEXT NOT NULL DEFAULT 'unread',
-                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                            read_at    TIMESTAMPTZ NULL
-                        );
-                    """)
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_user_created ON public.user_notifications(user_id, created_at DESC);")
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_wallet_txns_created ON public.wallet_txns(created_at);")
 
-                    # trigger: notify on wallet_txns insert (skip asiacell_topup or meta.no_notify)
-                    cur.execute("""
-                        CREATE OR REPLACE FUNCTION public.wallet_txns_notify()
-                        RETURNS trigger AS $$
-                        DECLARE
-                            t TEXT := 'تم تعديل رصيدك';
-                            b TEXT;
-                        BEGIN
-                            IF NEW.reason = 'asiacell_topup' THEN
-                                RETURN NEW;
-                            END IF;
-                            IF NEW.meta IS NOT NULL AND (NEW.meta ? 'no_notify') AND (NEW.meta->>'no_notify')::boolean IS TRUE THEN
-                                RETURN NEW;
-                            END IF;
+                cur.execute("""
+                                        CREATE TABLE IF NOT EXISTS public.orders(
+                                            id                 SERIAL PRIMARY KEY,
+                                            user_id            INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                                            title              TEXT NOT NULL,
+                                            service_id         BIGINT,
+                                            link               TEXT,
+                                            quantity           INTEGER NOT NULL DEFAULT 0,
+                                            price              NUMERIC(18,4) NOT NULL DEFAULT 0,
+                                            status             TEXT NOT NULL DEFAULT 'Pending',
+                                            provider_order_id  TEXT,
+                                            payload            JSONB DEFAULT '{}'::jsonb,
+                                            created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                                            type               TEXT
+                                        );
+                                    """)
 
-                            IF NEW.amount > 0 THEN
-                                b := 'تم إضافة ' || NEW.amount::text;
-                            ELSIF NEW.amount < 0 THEN
-                                b := 'تم خصم ' || ABS(NEW.amount)::text;
-                            ELSE
-                                RETURN NEW;
-                            END IF;
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON public.orders(user_id);")
 
-                            INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
-                            VALUES (NEW.user_id, NULL, t, b, 'unread', NOW());
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders(status);")
 
-                            RETURN NEW;
-                        END;
-                        $$ LANGUAGE plpgsql;
-                    """)
-                    cur.execute("""
-                        DO $$
-                        BEGIN
-                            IF NOT EXISTS (
-                                SELECT 1 FROM pg_trigger WHERE tgname = 'wallet_txns_notify_ai'
-                            ) THEN
-                                CREATE TRIGGER wallet_txns_notify_ai
-                                AFTER INSERT ON public.wallet_txns
-                                FOR EACH ROW
-                                EXECUTE FUNCTION public.wallet_txns_notify();
-                            END IF;
-                        END $$;
-                    """)
-# announcements (app-wide broadcasts)
-cur.execute("""
-    CREATE TABLE IF NOT EXISTS public.announcements(
-        id          BIGSERIAL PRIMARY KEY,
-        title       TEXT NULL,
-        body        TEXT NOT NULL,
-        is_active   BOOLEAN NOT NULL DEFAULT TRUE,
-        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-""")
-cur.execute("CREATE INDEX IF NOT EXISTS idx_ann_created ON public.announcements(created_at DESC);")
+                cur.execute("ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS type TEXT;")
 
+                cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET DEFAULT 'provider';")
 
+                cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET NOT NULL;")
+
+                cur.execute("""
+                                        CREATE TABLE IF NOT EXISTS public.service_id_overrides(
+                                            ui_key TEXT PRIMARY KEY,
+                                            service_id BIGINT NOT NULL,
+                                            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                                        );
+                                    """)
+
+                cur.execute("""
+                                        CREATE TABLE IF NOT EXISTS public.service_pricing_overrides(
+                                            ui_key TEXT PRIMARY KEY,
+                                            price_per_k NUMERIC(18,6) NOT NULL,
+                                            min_qty INTEGER NOT NULL,
+                                            max_qty INTEGER NOT NULL,
+                                            mode TEXT NOT NULL DEFAULT 'per_k',
+                                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                                        );
+                                    """)
+
+                cur.execute("""
+                                        CREATE TABLE IF NOT EXISTS public.order_pricing_overrides(
+                                            order_id BIGINT PRIMARY KEY,
+                                            price NUMERIC(18,6) NOT NULL,
+                                            mode TEXT NOT NULL DEFAULT 'flat',
+                                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                                        );
+                                    """)
+
+                cur.execute("""
+                                        CREATE TABLE IF NOT EXISTS public.user_notifications(
+                                            id BIGSERIAL PRIMARY KEY,
+                                            user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                                            order_id INTEGER NULL REFERENCES public.orders(id) ON DELETE SET NULL,
+                                            title TEXT NOT NULL,
+                                            body  TEXT NOT NULL,
+                                            status TEXT NOT NULL DEFAULT 'unread',
+                                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                                            read_at    TIMESTAMPTZ NULL
+                                        );
+                                    """)
+
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_user_created ON public.user_notifications(user_id, created_at DESC);")
+
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);")
+
+                cur.execute("""
+                                        CREATE OR REPLACE FUNCTION public.wallet_txns_notify()
+                                        RETURNS trigger AS $$
+                                        DECLARE
+                                            t TEXT := 'تم تعديل رصيدك';
+                                            b TEXT;
+                                        BEGIN
+                                            IF NEW.reason = 'asiacell_topup' THEN
+                                                RETURN NEW;
+                                            END IF;
+                                            IF NEW.meta IS NOT NULL AND (NEW.meta ? 'no_notify') AND (NEW.meta->>'no_notify')::boolean IS TRUE THEN
+                                                RETURN NEW;
+                                            END IF;
+
+                                            IF NEW.amount > 0 THEN
+                                                b := 'تم إضافة ' || NEW.amount::text;
+                                            ELSIF NEW.amount < 0 THEN
+                                                b := 'تم خصم ' || ABS(NEW.amount)::text;
+                                            ELSE
+                                                RETURN NEW;
+                                            END IF;
+
+                                            INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
+                                            VALUES (NEW.user_id, NULL, t, b, 'unread', NOW());
+
+                                            RETURN NEW;
+                                        END;
+                                        $$ LANGUAGE plpgsql;
+                                    """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.announcements(
+                        id          BIGSERIAL PRIMARY KEY,
+                        title       TEXT NULL,
+                        body        TEXT NOT NULL,
+                        is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+                        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                """)
+
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_ann_created ON public.announcements(created_at DESC);")
                 finally:
+                    # unlock
                     cur.execute("SELECT pg_advisory_unlock(987654321)")
     finally:
         put_conn(conn)
 
+# run at startup
 ensure_schema()
-
-# =========================
-# FastAPI
-# =========================
-app = FastAPI(title="SMM Backend", version="1.9.3")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"]
-)
-
-# ===== Helpers =====
 
 def _tokens_for_uid(cur, uid: str):
     """Return list of FCM tokens for a uid from user_devices or fallback to users.fcm_token"""
@@ -401,12 +381,10 @@ def _all_fcm_tokens(cur):
     except Exception:
         pass
     # deduplicate
-    seen = set()
-    out = []
+    seen = set(); out = []
     for t in tokens:
         if t not in seen:
-            seen.add(t)
-            out.append(t)
+            seen.add(t); out.append(t)
     return out
 
 def _require_admin(passwd: str):
@@ -2594,10 +2572,7 @@ def _refund_order_if_needed(order_id: int) -> bool:
         return False
 
 
-
-# =========================
-# Announcements (App-wide)
-# =========================
+# =============== Announcements ===============
 class AnnouncementIn(BaseModel):
     title: Optional[str] = None
     body: str
@@ -2618,23 +2593,16 @@ def admin_announcement_create(body: AnnouncementIn, x_admin_password: Optional[s
                     (title if body.title else None, msg)
                 )
                 created_ms = int(cur.fetchone()[0] or 0)
+                # optional per-user rows
                 try:
-                    cur.execute("SELECT id FROM public.users")
-                    rows = cur.fetchall()
-                    for (uid,) in rows:
-                        try:
-                            cur.execute(
-                                "INSERT INTO public.user_notifications(user_id, order_id, title, body, status, created_at) VALUES(%s,NULL,%s,%s,'unread',NOW())",
-                                (uid, title, msg)
-                            )
-                        except Exception:
-                            pass
+                    cur.execute("INSERT INTO public.user_notifications(user_id, order_id, title, body, status, created_at) SELECT id, NULL, %s, %s, 'unread', NOW() FROM public.users", (title, msg))
                 except Exception:
                     pass
                 try:
                     tokens = _all_fcm_tokens(cur)
                 except Exception:
                     tokens = []
+        # push outside transaction
         sent = 0
         for t in tokens:
             try:
