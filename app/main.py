@@ -197,7 +197,6 @@ cur.execute("""
     );
 """)
 cur.execute("CREATE INDEX IF NOT EXISTS idx_ann_created ON public.announcements(created_at DESC);")
-            pass
                 # global advisory lock to avoid race on first boot
                 cur.execute("SELECT pg_advisory_lock(987654321)")
                 try:
@@ -588,7 +587,8 @@ def _push_user(conn, user_id: int, order_id: Optional[int], title: str, body: st
     """Push FCM to all user's devices (user_devices + fallback), without inserting DB row."""
     tokens = []
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute("SELECT uid FROM public.users WHERE id=%s", (user_id,))
             r = cur.fetchone()
             uid = r[0] if r else None
@@ -652,7 +652,8 @@ def root():
 def health():
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute("SELECT 1")
         return {"ok": True, "ts": int(time.time()*1000)}
     finally:
@@ -668,7 +669,8 @@ def upsert_user(body: UpsertUserIn):
         raise HTTPException(422, "uid required")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             _ensure_user(cur, uid)
         return {"ok": True, "uid": uid}
     finally:
@@ -690,7 +692,8 @@ def api_users_fcm_token(body: FcmTokenIn):
         raise HTTPException(422, "uid and fcm token required")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
             r = cur.fetchone()
             if not r:
@@ -721,7 +724,8 @@ def api_users_fcm_token(body: FcmTokenIn):
 def wallet_balance(uid: str):
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute("SELECT balance FROM public.users WHERE uid=%s", (uid,))
             r = cur.fetchone()
         return {"ok": True, "balance": float(r[0] if r else 0.0)}
@@ -844,7 +848,8 @@ def create_provider_order(body: ProviderOrderIn):
     conn = get_conn()
     try:
         # create order & collect data inside txn
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             oid = _create_provider_order_core(
                 cur, body.uid, body.service_id, body.service_name,
                 body.link, body.quantity, body.price
@@ -893,8 +898,9 @@ for path in PROVIDER_CREATE_PATHS:
         conn = get_conn()
         try:
             # Do all DB writes first
-            with conn, conn.cursor() as cur:
-                oid = _create_provider_order_core(cur, p["uid"], p["service_id"], p["service_name"], p["link"], p["quantity"], p["price"])
+            with conn:
+        with conn.cursor() as cur:
+            oid = _create_provider_order_core(cur, p["uid"], p["service_id"], p["service_name"], p["link"], p["quantity"], p["price"])
                 # collect user_id for notify after commit
                 cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
                 ur = cur.fetchone()
@@ -913,7 +919,8 @@ for path in PROVIDER_CREATE_PATHS:
 def create_manual_order(body: ManualOrderIn):
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             user_id = _ensure_user(cur, body.uid)
             cur.execute("""
                 INSERT INTO public.orders(user_id, title, quantity, price, status, payload, type)
@@ -957,7 +964,8 @@ def submit_asiacell(body: AsiacellSubmitIn):
         raise HTTPException(422, "invalid card length")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             oid = _asiacell_submit_core(cur, body.uid, digits)
             # collect user_id for notify after commit
             cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
@@ -986,8 +994,9 @@ for path in ASIACELL_PATHS[1:]:
             raise HTTPException(422, "invalid payload")
         conn = get_conn()
         try:
-            with conn, conn.cursor() as cur:
-                oid = _asiacell_submit_core(cur, uid, digits)
+            with conn:
+        with conn.cursor() as cur:
+            oid = _asiacell_submit_core(cur, uid, digits)
                 cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
                 r = cur.fetchone()
                 if r:
@@ -1001,7 +1010,8 @@ for path in ASIACELL_PATHS[1:]:
 def _orders_for_uid(uid: str) -> List[dict]:
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
             r = cur.fetchone()
             if not r:
@@ -1193,7 +1203,8 @@ async def create_manual_paid(request: Request):
         title = f"{title} | ID: {account_id}"
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             # ensure user & balance
             cur.execute("SELECT id, balance, is_banned FROM public.users WHERE uid=%s", (uid,))
             r = cur.fetchone()
@@ -1285,7 +1296,8 @@ def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[s
     _require_admin(_pick_admin_password(x_admin_password, password, body) or "")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute("""
                 SELECT id, user_id, service_id, link, quantity, price, status, provider_order_id, title, payload, type
                 FROM public.orders WHERE id=%s FOR UPDATE
@@ -1362,7 +1374,8 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: Optional[s
 
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute("SELECT id, user_id, price, status, payload, title, COALESCE(type,'') FROM public.orders WHERE id=%s FOR UPDATE", (oid,))
             row = cur.fetchone()
             if not row:
@@ -1448,7 +1461,8 @@ async def admin_reject(oid: int, request: Request, x_admin_password: Optional[st
 
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute("SELECT id, user_id, price, status, payload, title, COALESCE(type,'') FROM public.orders WHERE id=%s FOR UPDATE", (oid,))
             row = cur.fetchone()
             if not row:
@@ -1516,7 +1530,8 @@ def admin_pending_itunes(x_admin_password: Optional[str] = Header(None, alias="x
     _require_admin(x_admin_password or password or "")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute("""
                 SELECT o.id, o.title, o.quantity, o.price, o.status,
                        EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
@@ -1545,7 +1560,8 @@ def admin_pending_pubg(x_admin_password: Optional[str] = Header(None, alias="x-a
     _require_admin(x_admin_password or password or "")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute("""
                 SELECT o.id, o.title, o.quantity, o.price, o.status,
                        EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
@@ -1583,7 +1599,8 @@ def admin_pending_ludo(x_admin_password: Optional[str] = Header(None, alias="x-a
     _require_admin(x_admin_password or password or "")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute("""
                 SELECT o.id, o.title, o.quantity, o.price, o.status,
                        EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
@@ -1620,7 +1637,8 @@ def admin_pending_cards(x_admin_password: Optional[str] = Header(None, alias="x-
     _require_admin(x_admin_password or password or "")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute("""
                 SELECT o.id, u.uid, COALESCE((COALESCE(NULLIF(o.payload,''),'{}')::jsonb->>'card'), '') AS card,
                        EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at
@@ -1640,7 +1658,8 @@ def admin_pending_balances(x_admin_password: Optional[str] = Header(None, alias=
     _require_admin(x_admin_password or password or "")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute(r"""
                 SELECT o.id, o.title, o.quantity, o.price, o.status,
                        EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
@@ -1707,7 +1726,8 @@ def admin_pending_services_endpoint(
     _require_admin(x_admin_password or password or "")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute("""
                 SELECT
                     o.id,
@@ -1778,7 +1798,8 @@ async def admin_wallet_adjust(uid: str, request: Request, x_admin_password: Opti
 
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
             r = cur.fetchone()
             if not r:
@@ -1838,7 +1859,8 @@ def admin_wallet_topup(body: WalletCompatIn, x_admin_password: Optional[str] = H
 
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
             r = cur.fetchone()
             if not r:
@@ -1891,7 +1913,8 @@ def admin_wallet_deduct(body: WalletCompatIn, x_admin_password: Optional[str] = 
 
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
             r = cur.fetchone()
             if not r:
@@ -1919,7 +1942,8 @@ def admin_users_count(x_admin_password: Optional[str] = Header(None, alias="x-ad
     _require_admin(x_admin_password or password or "")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM public.users")
             n = int(cur.fetchone()[0])
         if str(plain) == "1":
@@ -1964,7 +1988,8 @@ def admin_users_balances(
 
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute(
                 f"""
                 SELECT id, uid, balance, is_banned,
@@ -2025,7 +2050,8 @@ def admin_users_balances_meta(
 
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             cur.execute(f"SELECT COUNT(*) FROM public.users {where}", params)
             total = int(cur.fetchone()[0])
             cur.execute(
@@ -2086,7 +2112,8 @@ def admin_list_service_ids(
     _require_admin(x_admin_password or password or "")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             _ensure_overrides_table(cur)
             cur.execute("SELECT ui_key, service_id FROM public.service_id_overrides ORDER BY ui_key")
             rows = cur.fetchall()
@@ -2105,7 +2132,8 @@ def admin_set_service_id(
         raise HTTPException(422, "invalid payload")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             _ensure_overrides_table(cur)
             cur.execute("""
                 INSERT INTO public.service_id_overrides(ui_key, service_id)
@@ -2127,7 +2155,8 @@ def admin_clear_service_id(
         raise HTTPException(422, "invalid payload")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             _ensure_overrides_table(cur)
             cur.execute("DELETE FROM public.service_id_overrides WHERE ui_key=%s", (body.ui_key,))
         return {"ok": True}
@@ -2170,7 +2199,8 @@ def admin_list_pricing(
     _require_admin(x_admin_password or password or "")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             _ensure_pricing_table(cur)
             cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode, 'per_k') FROM public.service_pricing_overrides ORDER BY ui_key")
             rows = cur.fetchall()
@@ -2192,7 +2222,8 @@ def admin_set_pricing(
         raise HTTPException(422, "invalid range")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             _ensure_pricing_table(cur)
             _ensure_pricing_mode_column(cur)
             cur.execute("""
@@ -2215,7 +2246,8 @@ def admin_clear_pricing(
         raise HTTPException(422, "invalid payload")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             _ensure_pricing_table(cur)
             _ensure_pricing_mode_column(cur)
             cur.execute("DELETE FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
@@ -2231,7 +2263,8 @@ def admin_clear_pricing(
 def public_pricing_version():
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             _ensure_pricing_table(cur)
             try:
                 _ensure_pricing_mode_column(cur)
@@ -2266,7 +2299,7 @@ def admin_announcement_create(body: AnnouncementIn, x_admin_password: Optional[s
                     (body.title, body.body)
                 )
                 rid, created_ms = cur.fetchone()
-                # Per-user notification rows (optional)
+                # Optional: per-user row in user_notifications
                 try:
                     cur.execute("SELECT uid FROM public.users WHERE COALESCE(uid,'')<>''")
                     for (uid,) in cur.fetchall():
@@ -2279,12 +2312,11 @@ def admin_announcement_create(body: AnnouncementIn, x_admin_password: Optional[s
                             pass
                 except Exception:
                     pass
-                # Collect tokens
+                # gather tokens
                 try:
                     tokens = _all_fcm_tokens(cur)
                 except Exception:
                     tokens = []
-        # Push outside transaction
         title = body.title or "إعلان جديد"
         msg = body.body
         sent = 0
@@ -2341,7 +2373,8 @@ def public_pricing_bulk(keys: str):
         return {"map": {}, "keys": []}
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             _ensure_pricing_table(cur)
             try:
                 _ensure_pricing_mode_column(cur)
@@ -2395,7 +2428,8 @@ def admin_set_order_pricing(
         raise HTTPException(422, "invalid payload")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             _ensure_order_pricing_table(cur)
             # fetch order to validate status and category
             cur.execute("SELECT id, title, status FROM public.orders WHERE id=%s", (int(body.order_id),))
@@ -2431,7 +2465,8 @@ def admin_clear_order_pricing(
         raise HTTPException(422, "invalid payload")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             _ensure_order_pricing_table(cur)
             cur.execute("DELETE FROM public.order_pricing_overrides WHERE order_id=%s", (int(body.order_id),))
         return {"ok": True}
@@ -2459,7 +2494,8 @@ def admin_set_order_quantity(
         raise HTTPException(422, "quantity must be > 0")
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             # Validate order
             cur.execute("SELECT id, title, status FROM public.orders WHERE id=%s", (int(body.order_id),))
             row = cur.fetchone()
@@ -2637,7 +2673,8 @@ class TestPushIn(BaseModel):
 def test_push_owner(p: TestPushIn):
     conn = get_conn()
     try:
-        with conn, conn.cursor() as cur:
+        with conn:
+        with conn.cursor() as cur:
             owner_id = _ensure_owner_user_id(cur)
             cur.execute(
                 "INSERT INTO public.user_notifications(user_id, order_id, title, body, status) VALUES (%s,%s,%s,%s,'unread')",
