@@ -2242,34 +2242,11 @@ def public_pricing_version():
     finally:
         put_conn(conn)
 
-@app.get("/api/public/pricing/bulk")
-def public_pricing_bulk(keys: str):
-    if not keys:
-        return {"map": {}, "keys": []}
-    key_list = [k.strip() for k in keys.split(",") if k.strip()]
-    if not key_list:
-        return {"map": {}, "keys": []}
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            _ensure_pricing_table(cur)
-            try:
-                _ensure_pricing_mode_column(cur)
-            except Exception:
-                pass
-            cur.execute(
-                "SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), EXTRACT(EPOCH FROM updated_at)*1000 FROM public.service_pricing_overrides WHERE ui_key = ANY(%s)",
-                (key_list,)
-            )
-            rows = cur.fetchall()
-            out = {}
-            for r in rows:
-                out[r[0]] = {
-                    "price_per_k": float(r[1]),
-                    "min_qty": int(r[2]),
-                    "max_qty": int(r[3]),
-                    "
+@app.get("/api/public/pricing/bulk"
 
+
+from typing import Optional
+from pydantic import BaseModel
 
 class AnnouncementIn(BaseModel):
     title: str | None = None
@@ -2286,26 +2263,23 @@ def admin_announcement_create(body: AnnouncementIn, x_admin_password: Optional[s
                 (body.title, body.body)
             )
             rid, created_ms = cur.fetchone()
-            # optional: create per-user notification rows (lightweight text-only)
+            # per-user notifications (optional)
             try:
                 cur.execute("SELECT uid FROM public.users WHERE COALESCE(uid,'')<>''")
-                uids = [r[0] for r in cur.fetchall()] if cur.rowcount is not None else []
-                for u in uids[:100000]:
+                for (uid,) in cur.fetchall():
                     try:
                         cur.execute(
                             "INSERT INTO public.user_notifications(uid, title, message, status, created_at) VALUES(%s,%s,%s,'new', NOW())",
-                            (u, body.title or 'إعلان جديد', body.body)
+                            (uid, body.title or 'إعلان جديد', body.body)
                         )
                     except Exception:
                         pass
             except Exception:
                 pass
-            # tokens for push
             try:
                 tokens = _all_fcm_tokens(cur)
             except Exception:
                 tokens = []
-        # push outside transaction
         sent = 0
         title = body.title or "إعلان جديد"
         msg = body.body
@@ -2351,7 +2325,33 @@ def public_ann_latest():
     finally:
         put_conn(conn)
 
-mode": r[4] or "per_k",
+)
+def public_pricing_bulk(keys: str):
+    if not keys:
+        return {"map": {}, "keys": []}
+    key_list = [k.strip() for k in keys.split(",") if k.strip()]
+    if not key_list:
+        return {"map": {}, "keys": []}
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table(cur)
+            try:
+                _ensure_pricing_mode_column(cur)
+            except Exception:
+                pass
+            cur.execute(
+                "SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), EXTRACT(EPOCH FROM updated_at)*1000 FROM public.service_pricing_overrides WHERE ui_key = ANY(%s)",
+                (key_list,)
+            )
+            rows = cur.fetchall()
+            out = {}
+            for r in rows:
+                out[r[0]] = {
+                    "price_per_k": float(r[1]),
+                    "min_qty": int(r[2]),
+                    "max_qty": int(r[3]),
+                    "mode": r[4] or "per_k",
                     "updated_at": int(r[5] or 0)
                 }
             return {"map": out, "keys": key_list}
