@@ -307,7 +307,7 @@ def ensure_schema():
                         ALTER TABLE public.user_notifications
                         ADD COLUMN IF NOT EXISTS meta JSONB DEFAULT '{}'::jsonb;
                     """)
-CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);")
 
                     cur.execute("""
                         CREATE OR REPLACE FUNCTION public.wallet_txns_notify()
