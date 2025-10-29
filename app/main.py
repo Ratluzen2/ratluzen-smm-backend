@@ -302,7 +302,7 @@ def ensure_schema():
                         );
                     """)
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_user_created ON public.user_notifications(user_id, created_at DESC);")
-                    cur.execute("
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);")
                     cur.execute("""
                         ALTER TABLE public.user_notifications
                         ADD COLUMN IF NOT EXISTS meta JSONB DEFAULT '{}'::jsonb;
