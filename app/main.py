@@ -12,6 +12,7 @@ import time
 import logging
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional
 
 import requests
 import psycopg2
@@ -22,6 +23,17 @@ from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+
+
+# --- FastAPI app & CORS ---
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # =========================
 # Settings
 # =========================
@@ -149,6 +161,31 @@ def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[i
             "Authorization": f"key={server_key}",
             "Content-Type": "application/json"
         }
+
+    # --- DB shadow log so notifications always appear in app list ---
+    try:
+        conn = get_conn()
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # match user by current token
+            cur.execute("SELECT id FROM public.users WHERE TRIM(COALESCE(fcm_token,''))=%s", (fcm_token.strip(),))
+            u = cur.fetchone()
+            if u:
+                user_id = u["id"]
+                # avoid duplicate spam (same title/body/order_id within 2 minutes)
+                cur.execute(\"\"\"
+                    SELECT id FROM public.user_notifications
+                     WHERE user_id=%s AND title=%s AND body=%s AND COALESCE(order_id,-1)=COALESCE(%s,-1)
+                       AND created_at > NOW() - INTERVAL '2 minutes'
+                     ORDER BY id DESC LIMIT 1
+                \"\"\", (user_id, title, body, order_id))
+                if not cur.fetchone():
+                    cur.execute(\"\"\"
+                        INSERT INTO public.user_notifications(user_id, title, body, status, order_id, meta, created_at)
+                        VALUES (%s, %s, %s, 'unread', %s, %s, NOW())
+                    \"\"\", (user_id, title, body, order_id, json.dumps({"source": "fcm"})))
+    except Exception as _ex:
+        logger.warning("Shadow log insert failed: %s", _ex)
+    # --- end DB shadow log ---
         payload = {"to": fcm_token, "priority": "high", "notification": {"title": title, "body": body}, "data": {
                 "title": title,
                 "body": body,
@@ -180,17 +217,16 @@ def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Op
 # =========================
 # Schema & Triggers
 # =========================
+
+
 def ensure_schema():
     conn = get_conn()
     try:
         with conn:
             with conn.cursor() as cur:
-                # global advisory lock to avoid race on first boot
+                # advisory lock to serialize migrations
                 cur.execute("SELECT pg_advisory_lock(987654321)")
                 try:
-                    cur.execute("CREATE SCHEMA IF NOT EXISTS public;")
-
-                    # users
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS public.users(
                             id         SERIAL PRIMARY KEY,
@@ -201,9 +237,9 @@ def ensure_schema():
                             fcm_token  TEXT
                         );
                     """)
+
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_users_uid ON public.users(uid);")
 
-                    # user_devices (multi-device FCM tokens)
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS public.user_devices(
                             id BIGSERIAL PRIMARY KEY,
@@ -215,7 +251,6 @@ def ensure_schema():
                     """)
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_devices_uid ON public.user_devices(uid);")
 
-                    # wallet_txns
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS public.wallet_txns(
                             id         SERIAL PRIMARY KEY,
@@ -229,7 +264,6 @@ def ensure_schema():
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_wallet_txns_user ON public.wallet_txns(user_id);")
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_wallet_txns_created ON public.wallet_txns(created_at);")
 
-                    # orders
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS public.orders(
                             id                 SERIAL PRIMARY KEY,
@@ -249,12 +283,9 @@ def ensure_schema():
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON public.orders(user_id);")
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders(status);")
                     cur.execute("ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS type TEXT;")
-                    cur.execute("UPDATE public.orders SET type='provider' WHERE type IS NULL;")
                     cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET DEFAULT 'provider';")
                     cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET NOT NULL;")
-                    cur.execute("UPDATE public.orders SET payload='{}'::jsonb WHERE payload IS NULL;")
 
-                    # service overrides tables
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS public.service_id_overrides(
                             ui_key TEXT PRIMARY KEY,
@@ -262,6 +293,7 @@ def ensure_schema():
                             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                         );
                     """)
+
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS public.service_pricing_overrides(
                             ui_key TEXT PRIMARY KEY,
@@ -272,6 +304,7 @@ def ensure_schema():
                             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                         );
                     """)
+
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS public.order_pricing_overrides(
                             order_id BIGINT PRIMARY KEY,
@@ -281,7 +314,6 @@ def ensure_schema():
                         );
                     """)
 
-                    # user_notifications
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS public.user_notifications(
                             id BIGSERIAL PRIMARY KEY,
@@ -297,7 +329,6 @@ def ensure_schema():
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_user_created ON public.user_notifications(user_id, created_at DESC);")
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);")
 
-                    # trigger: notify on wallet_txns insert (skip asiacell_topup or meta.no_notify)
                     cur.execute("""
                         CREATE OR REPLACE FUNCTION public.wallet_txns_notify()
                         RETURNS trigger AS $$
@@ -311,7 +342,6 @@ def ensure_schema():
                             IF NEW.meta IS NOT NULL AND (NEW.meta ? 'no_notify') AND (NEW.meta->>'no_notify')::boolean IS TRUE THEN
                                 RETURN NEW;
                             END IF;
-
                             IF NEW.amount > 0 THEN
                                 b := 'تم إضافة ' || NEW.amount::text;
                             ELSIF NEW.amount < 0 THEN
@@ -319,45 +349,30 @@ def ensure_schema():
                             ELSE
                                 RETURN NEW;
                             END IF;
-
                             INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
                             VALUES (NEW.user_id, NULL, t, b, 'unread', NOW());
-
                             RETURN NEW;
                         END;
                         $$ LANGUAGE plpgsql;
                     """)
+
                     cur.execute("""
-                        DO $$
-                        BEGIN
-                            IF NOT EXISTS (
-                                SELECT 1 FROM pg_trigger WHERE tgname = 'wallet_txns_notify_ai'
-                            ) THEN
-                                CREATE TRIGGER wallet_txns_notify_ai
-                                AFTER INSERT ON public.wallet_txns
-                                FOR EACH ROW
-                                EXECUTE FUNCTION public.wallet_txns_notify();
-                            END IF;
-                        END $$;
+                        CREATE TABLE IF NOT EXISTS public.announcements(
+                            id          BIGSERIAL PRIMARY KEY,
+                            title       TEXT NULL,
+                            body        TEXT NOT NULL,
+                            is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+                            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        );
                     """)
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_ann_created ON public.announcements(created_at DESC);")
                 finally:
+                    # unlock
                     cur.execute("SELECT pg_advisory_unlock(987654321)")
     finally:
         put_conn(conn)
-
+# run at startup
 ensure_schema()
-
-# =========================
-# FastAPI
-# =========================
-app = FastAPI(title="SMM Backend", version="1.9.3")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"]
-)
-
-# ===== Helpers =====
 
 def _tokens_for_uid(cur, uid: str):
     """Return list of FCM tokens for a uid from user_devices or fallback to users.fcm_token"""
@@ -372,6 +387,27 @@ def _tokens_for_uid(cur, uid: str):
     cur.execute("SELECT fcm_token FROM public.users WHERE uid=%s", (uid,))
     r = cur.fetchone()
     return [r[0]] if r and r[0] else []
+
+
+
+def _all_fcm_tokens(cur):
+    tokens = []
+    try:
+        cur.execute("SELECT DISTINCT fcm_token FROM public.user_devices WHERE COALESCE(fcm_token,'')<>''")
+        tokens += [r[0] for r in cur.fetchall() if r and r[0]]
+    except Exception:
+        pass
+    try:
+        cur.execute("SELECT DISTINCT fcm_token FROM public.users WHERE COALESCE(fcm_token,'')<>''")
+        tokens += [r[0] for r in cur.fetchall() if r and r[0]]
+    except Exception:
+        pass
+    # deduplicate
+    seen = set(); out = []
+    for t in tokens:
+        if t not in seen:
+            seen.add(t); out.append(t)
+    return out
 
 def _require_admin(passwd: str):
     if passwd != ADMIN_PASSWORD:
@@ -1458,12 +1494,6 @@ async def admin_reject(oid: int, request: Request, x_admin_password: Optional[st
         return {"ok": True, "status": "Rejected"}
     finally:
         put_conn(conn)
-
-    try:
-        _refund_order_if_needed(order_id)
-    except Exception:
-        pass
-
 @app.post("/api/admin/card/{oid}/reject")
 async def admin_card_reject_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     return await admin_reject(oid, request, x_admin_password, password)
@@ -1471,12 +1501,6 @@ async def admin_card_reject_alias(oid: int, request: Request, x_admin_password: 
 # =========================
 # Admin pending buckets
 # =========================
-
-    try:
-        _refund_order_if_needed(order_id)
-    except Exception:
-        pass
-
 @app.get("/api/admin/pending/itunes")
 def admin_pending_itunes(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(x_admin_password or password or "")
@@ -1826,24 +1850,9 @@ def admin_wallet_topup(body: WalletCompatIn, x_admin_password: Optional[str] = H
     finally:
         put_conn(conn)
 
+
 @app.post("/api/admin/wallet/deduct")
 def admin_wallet_deduct(body: WalletCompatIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-
-    # === Guard: do not allow deduct into negative ===
-    uid_val = (data.get('uid') if isinstance(data, dict) else None)
-    amount_val = (data.get('amount') if isinstance(data, dict) else 0)
-    try:
-        bal_now = get_user_balance(uid_val)
-    except Exception:
-        bal_now = None
-    try:
-        amt_val = float(amount_val)
-    except Exception:
-        amt_val = 0.0
-    if bal_now is None:
-        return resp({"ok": False, "error": "user_not_found"}, 404)
-    if not _can_deduct(bal_now, amt_val):
-        return resp({"ok": False, "error": "insufficient_funds"}, 400)
     _require_admin(x_admin_password or password or "")
     uid = (body.uid or "").strip()
     if not uid:
@@ -1858,18 +1867,20 @@ def admin_wallet_deduct(body: WalletCompatIn, x_admin_password: Optional[str] = 
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            cur.execute("SELECT id, balance FROM public.users WHERE uid=%s", (uid,))
             r = cur.fetchone()
             if not r:
                 raise HTTPException(404, "user not found")
-            user_id = r[0]
+            user_id, bal = int(r[0]), float(r[1] or 0)
+            if bal < amt:
+                raise HTTPException(400, "insufficient funds")
 
             cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (Decimal(amt), user_id))
             cur.execute(
-                """
+                '''
                 INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
                 VALUES(%s,%s,%s,%s)
-                """,
+                ''',
                 (user_id, Decimal(-amt), body.reason or "manual_deduct", Json({"compat": "deduct"}))
             )
         _push_user(conn, user_id, None, "تم خصم رصيد", f"تم خصم {amt} من رصيدك.")
@@ -2387,12 +2398,6 @@ async def admin_execute_topup_alias(oid: int, request: Request, x_admin_password
 @app.post("/api/admin/topup/{oid}/reject")
 async def admin_reject_topup_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     return await admin_reject(oid, request, x_admin_password, password)
-
-    try:
-        _refund_order_if_needed(order_id)
-    except Exception:
-        pass
-
 @app.post("/api/admin/topup_cards/{oid}/execute")
 async def admin_execute_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     return await admin_deliver(oid, request, x_admin_password, password)
@@ -2402,11 +2407,6 @@ async def admin_reject_topup_cards_alias(oid: int, request: Request, x_admin_pas
     return await admin_reject(oid, request, x_admin_password, password)
 
 # --- Asiacell aliases (execute / reject) ---
-    try:
-        _refund_order_if_needed(order_id)
-    except Exception:
-        pass
-
 @app.post("/api/admin/asiacell/{oid}/execute")
 async def admin_execute_asiacell(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     return await admin_deliver(oid, request, x_admin_password, password)
@@ -2421,11 +2421,6 @@ async def admin_reject_asiacell(oid: int, request: Request, x_admin_password: Op
 # ======================================================================
 
 # ---- Pending buckets aliases ----
-    try:
-        _refund_order_if_needed(order_id)
-    except Exception:
-        pass
-
 @app.get("/api/admin/pending/pubg_orders")
 def _alias_pending_pubg(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     return admin_pending_pubg(x_admin_password, password)
@@ -2556,3 +2551,236 @@ def _refund_order_if_needed(order_id: int) -> bool:
     except Exception as e:
         logging.exception("refund helper failed: %s", e)
         return False
+
+
+# =============== Announcements ===============
+class AnnouncementIn(BaseModel):
+    title: Optional[str] = None
+    body: str
+
+@app.post("/api/admin/announcement/create")
+def admin_announcement_create(body: AnnouncementIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    title = (body.title or "إعلان جديد").strip()
+    msg   = (body.body or "").strip()
+    if not msg:
+        raise HTTPException(422, "body is required")
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO public.announcements(title, body, is_active) VALUES(%s,%s,TRUE) RETURNING EXTRACT(EPOCH FROM created_at)*1000",
+                    (title if body.title else None, msg)
+                )
+                created_ms = int(cur.fetchone()[0] or 0)
+                # optional per-user rows
+                try:
+                    cur.execute("INSERT INTO public.user_notifications(user_id, order_id, title, body, status, created_at) SELECT id, NULL, %s, %s, 'unread', NOW() FROM public.users", (title, msg))
+                except Exception:
+                    pass
+                try:
+                    tokens = _all_fcm_tokens(cur)
+                except Exception:
+                    tokens = []
+        # push outside transaction
+        sent = 0
+        for t in tokens:
+            try:
+                _fcm_send_push(t, title, msg, None)
+                sent += 1
+            except Exception:
+                pass
+        return {"ok": True, "created_at": created_ms, "sent": sent}
+    finally:
+        put_conn(conn)
+
+@app.get("/api/public/announcements")
+def public_announcements(limit: int = 50):
+    try:
+        limit = max(1, min(int(limit), 200))
+    except Exception:
+        limit = 50
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COALESCE(NULLIF(title,''), NULL) AS title, body, EXTRACT(EPOCH FROM created_at)*1000 AS created_at "
+                    "FROM public.announcements WHERE is_active IS TRUE ORDER BY id DESC LIMIT %s",
+                    (limit,)
+                )
+                rows = cur.fetchall()
+        return [{"title": r[0], "body": r[1], "created_at": int(r[2] or 0)} for r in rows]
+    finally:
+        put_conn(conn)
+
+@app.get("/api/public/announcements/latest")
+def public_announcements_latest():
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COALESCE(NULLIF(title,''), NULL) AS title, body, EXTRACT(EPOCH FROM created_at)*1000 AS created_at "
+                    "FROM public.announcements WHERE is_active IS TRUE ORDER BY id DESC LIMIT 1"
+                )
+                row = cur.fetchone()
+        if not row:
+            return {}
+        return {"title": row[0], "body": row[1], "created_at": int(row[2] or 0)}
+    finally:
+        put_conn(conn)
+
+
+# === Notifications Appendix ===
+
+# -------------- Notifications unified helper --------------
+def _notify_user_and_log(uid: str, title: str, body: str, *, order_id: Optional[int]=None, status: str="unread", meta: Optional[dict]=None):
+    """Create user_notifications row, then send FCM in background (non-blocking)."""
+    conn = get_conn()
+    nid = None
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, fcm_token FROM public.users WHERE uid=%s", (uid,))
+            u = cur.fetchone()
+            if not u:
+                return None
+            user_id = u["id"]
+            cur.execute(
+                """
+                INSERT INTO public.user_notifications(user_id, title, body, status, order_id, meta, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                RETURNING id
+                """,
+                (user_id, title, body, status, order_id, json.dumps(meta or {}))
+            )
+            nid = cur.fetchone()["id"]
+            fcm_token = (u.get("fcm_token") or "").strip()
+    finally:
+        put_conn(conn)
+    if fcm_token:
+        _run_async(lambda: _fcm_send_legacy(fcm_token=fcm_token, title=title, body=body, order_id=order_id, server_key=FCM_SERVER_KEY))
+    return nid
+
+def notify_user_order_received(uid: str, order_id: int, service_name: str):
+    return _notify_user_and_log(uid, "تم استلام طلبك", f"تم استلام طلب {service_name}.", order_id=order_id, status="unread", meta={"type":"order_received"})
+
+def notify_user_order_done(uid: str, order_id: int, service_name: str, code: Optional[str]=None, amount: Optional[str]=None):
+    tail = f" الكود: {code}" if code else (f" المبلغ: {amount}" if amount else "")
+    return _notify_user_and_log(uid, "تم تنفيذ طلبك", f"تم تنفيذ طلبك {service_name}.{tail}", order_id=order_id, status="unread", meta={"type":"order_done","code":code,"amount":amount})
+
+def notify_user_order_rejected(uid: str, order_id: int, service_name: str, reason: Optional[str]=None):
+    rsn = f" السبب: {reason}" if reason else ""
+    return _notify_user_and_log(uid, "تم رفض طلبك", f"تم رفض طلب {service_name}.{rsn}", order_id=order_id, status="unread", meta={"type":"order_rejected","reason":reason})
+
+def get_user_notifications_by_uid(uid: str, status: str = "all", limit: int = 50):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            user = cur.fetchone()
+            if not user:
+                return {"items": [], "status": status}
+            user_id = user["id"]
+            if status not in ("unread", "read", "all"):
+                status = "all"
+            if status == "all":
+                cur.execute("""
+                    SELECT id, title, body, status, order_id, meta, created_at, read_at
+                      FROM public.user_notifications
+                     WHERE user_id=%s
+                     ORDER BY id DESC
+                     LIMIT %s
+                """, (user_id, limit))
+            else:
+                cur.execute("""
+                    SELECT id, title, body, status, order_id, meta, created_at, read_at
+                      FROM public.user_notifications
+                     WHERE user_id=%s AND status=%s
+                     ORDER BY id DESC
+                     LIMIT %s
+                """, (user_id, status, limit))
+            rows = cur.fetchall() or []
+            return {"items": rows, "status": status}
+    finally:
+        put_conn(conn)
+
+def _resolve_user_id(uid: Optional[str]=None, fcm_token: Optional[str]=None):
+    if not uid and not fcm_token:
+        raise HTTPException(400, "uid or fcm_token required")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if uid:
+                cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            else:
+                cur.execute("SELECT id FROM public.users WHERE TRIM(COALESCE(fcm_token,''))=%s", (fcm_token or "").strip(),)
+            r = cur.fetchone()
+            if not r:
+                raise HTTPException(404, "user not found")
+            return r["id"]
+    finally:
+        put_conn(conn)
+
+@app.get("/api/notifications/list")
+def notifications_list(uid: Optional[str] = None, fcm_token: Optional[str] = None, status: str = "all", limit: int = 50):
+    """List notifications for a user resolved by uid or fcm_token."""
+    user_id = _resolve_user_id(uid=uid, fcm_token=fcm_token)
+    conn = get_conn()
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if status not in ("unread","read","all"):
+                status = "all"
+            if status == "all":
+                cur.execute("""
+                    SELECT id, title, body, status, order_id, meta, created_at, read_at
+                      FROM public.user_notifications WHERE user_id=%s
+                      ORDER BY id DESC LIMIT %s
+                """, (user_id, limit))
+            else:
+                cur.execute("""
+                    SELECT id, title, body, status, order_id, meta, created_at, read_at
+                      FROM public.user_notifications WHERE user_id=%s AND status=%s
+                      ORDER BY id DESC LIMIT %s
+                """, (user_id, status, limit))
+            return {"items": cur.fetchall() or [], "status": status}
+    finally:
+        put_conn(conn)
+
+@app.get("/api/notifications/count")
+def notifications_count(uid: Optional[str] = None, fcm_token: Optional[str] = None, status: str = "unread"):
+    """Count notifications by status for user resolved by uid or fcm_token."""
+    user_id = _resolve_user_id(uid=uid, fcm_token=fcm_token)
+    conn = get_conn()
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if status not in ("unread","read","all"):
+                status = "unread"
+            if status == "all":
+                cur.execute("SELECT COUNT(1) AS c FROM public.user_notifications WHERE user_id=%s", (user_id,))
+            else:
+                cur.execute("SELECT COUNT(1) AS c FROM public.user_notifications WHERE user_id=%s AND status=%s", (user_id, status))
+            row = cur.fetchone() or {"c": 0}
+            return {"count": int(row["c"]), "status": status}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/user/{uid}/notifications/mark_all_read")
+def notifications_mark_all_read(uid: str):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                raise HTTPException(404, "user not found")
+            user_id = r["id"]
+            cur.execute("""
+                UPDATE public.user_notifications
+                   SET status='read', read_at=NOW()
+                 WHERE user_id=%s AND status='unread'
+            """, (user_id,))
+            return {"ok": True, "updated": int(cur.rowcount or 0)}
+    finally:
+        put_conn(conn)
