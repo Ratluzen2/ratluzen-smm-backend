@@ -79,25 +79,6 @@ def put_conn(conn: psycopg2.extensions.connection) -> None:
 logger = logging.getLogger("smm")
 logging.basicConfig(level=logging.INFO)
 
-# =========================
-# Non-blocking background helper
-# =========================
-try:
-    import threading as _threading
-    def _run_async(fn, *args, **kwargs):
-        try:
-            t = _threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True)
-            t.start()
-        except Exception as _e:
-            logger.info("run_async failed: %s", _e)
-except Exception:
-    def _run_async(fn, *args, **kwargs):
-        # fallback: do it synchronously
-        try:
-            fn(*args, **kwargs)
-        except Exception as _e:
-            logger.info("run_async fallback error: %s", _e)
-
 
 # =========================
 # FCM helpers (V1 preferred; Legacy fallback)
@@ -170,7 +151,16 @@ def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int],
             "Content-Type": "application/json"
         }, json=message, timeout=10)
         if resp.status_code not in (200, 201):
-            logger.warning("FCM v1 send failed (%s): %s", resp.status_code, resp.text[:300])
+            txt = resp.text or ''
+            logger.warning("FCM v1 send failed (%s): %s", resp.status_code, txt[:300])
+            # Auto-clean invalid tokens
+            low = txt.upper()
+            if 'UNREGISTERED' in low or 'REGISTRATION_TOKEN' in low:
+                try:
+                    _cleanup_bad_token(fcm_token)
+                    logger.info("FCM v1: cleaned up UNREGISTERED token")
+                except Exception as _e:
+                    logger.warning("cleanup token failed: %s", _e)
     except Exception as ex:
         logger.exception("FCM v1 send exception: %s", ex)
 
@@ -186,9 +176,26 @@ def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[i
                 "order_id": str(order_id or ""),
             }
         }
-        resp = requests.post("https://fcm.googleapis.com/fcm/send", headers=headers, json=payload, timeout=10)
+        resp = requests.post("https://fcm.googleapis.com/fcm/send",
+            headers=headers, json=payload, timeout=10)
+        # Legacy may return 200 with error body; check both
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
         if resp.status_code not in (200, 201):
-            logger.warning("FCM legacy send failed (%s): %s", resp.status_code, resp.text[:300])
+            logger.warning("FCM legacy send failed (%s): %s", resp.status_code, (resp.text or "")[:300])
+        # clean up NotRegistered/InvalidRegistration
+        try:
+            if data and isinstance(data, dict) and data.get("results"):
+                for r in data.get("results", []):
+                    err = (r.get("error") or "").lower()
+                    if err in ("notregistered", "not_registered", "invalidregistration", "invalid_registration"):
+                        _cleanup_bad_token(fcm_token)
+                        logger.info("FCM legacy: cleaned up invalid token")
+                        break
+        except Exception as _e:
+            logger.warning("legacy cleanup check failed: %s", _e)
     except Exception as ex:
         logger.exception("FCM legacy send exception: %s", ex)
 
@@ -402,6 +409,24 @@ def _all_fcm_tokens(cur):
         if t not in seen:
             seen.add(t); out.append(t)
     return out
+def _cleanup_bad_token(bad_token: str):
+    """Remove invalid/unregistered FCM token from DB to prevent repeated failures."""
+    if not bad_token:
+        return
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            try:
+                cur.execute("DELETE FROM public.user_devices WHERE fcm_token=%s", (bad_token,))
+            except Exception:
+                pass
+            try:
+                cur.execute("UPDATE public.users SET fcm_token=NULL WHERE fcm_token=%s", (bad_token,))
+            except Exception:
+                pass
+    finally:
+        put_conn(conn)
+
 
 def _require_admin(passwd: str):
     if passwd != ADMIN_PASSWORD:
@@ -853,8 +878,8 @@ def create_provider_order(body: ProviderOrderIn):
 
         # now outside transaction (COMMITTED): safe to notify
         if user_id:
-            _run_async(_notify_user, None, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {title}.")
-        _run_async(_notify_owner_new_order, None, oid)
+            _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {title}.")
+        _notify_owner_new_order(conn, oid)
         return {"ok": True, "order_id": oid}
     finally:
         put_conn(conn)
@@ -898,8 +923,8 @@ for path in PROVIDER_CREATE_PATHS:
 
             # After COMMIT: push notifications
             if user_id:
-                _run_async(_notify_user, None, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {p['service_name']}.")
-            _run_async(_notify_owner_new_order, None, oid)
+                _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {p['service_name']}.")
+            _notify_owner_new_order(conn, oid)
             return {"ok": True, "order_id": oid}
         finally:
             put_conn(conn)
@@ -917,8 +942,8 @@ def create_manual_order(body: ManualOrderIn):
                 RETURNING id
             """, (user_id, body.title))
             oid = cur.fetchone()[0]
-        _run_async(_notify_user, None, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {body.title}.")
-        _run_async(_notify_owner_new_order, None, oid)
+        _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {body.title}.")
+        _notify_owner_new_order(conn, oid)
         return {"ok": True, "order_id": oid}
     finally:
         put_conn(conn)
@@ -962,8 +987,8 @@ def submit_asiacell(body: AsiacellSubmitIn):
 
         # After COMMIT: push notifications
         if user_id:
-            _run_async(_notify_user, None, user_id, oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
-        _run_async(_notify_owner_new_order, None, oid)
+            _notify_user(conn, user_id, oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
+        _notify_owner_new_order(conn, oid)
         return {"ok": True, "order_id": oid, "status": "received"}
     finally:
         put_conn(conn)
@@ -987,8 +1012,8 @@ for path in ASIACELL_PATHS[1:]:
                 cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
                 r = cur.fetchone()
                 if r:
-                    _run_async(_notify_user, None, r[0], oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
-            _run_async(_notify_owner_new_order, None, oid)
+                    _notify_user(conn, r[0], oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
+            _notify_owner_new_order(conn, oid)
             return {"ok": True, "order_id": oid, "status": "received"}
         finally:
             put_conn(conn)
@@ -1105,34 +1130,6 @@ def mark_notification_read(uid: str, nid: int):
             return {"ok": True, "id": row["id"]}
     finally:
         put_conn(conn)
-
-
-@app.get("/api/user/{uid}/notifications/count")
-def user_notifications_count(uid: str, status: str = "unread"):
-    """Fast count for top-bar badge."""
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
-            r = cur.fetchone()
-            if not r:
-                return {"count": 0}
-            user_id = r[0]
-            if status not in ("unread","read","all"):
-                status = "unread"
-            if status == "all":
-                cur.execute("SELECT COUNT(*) FROM public.user_notifications WHERE user_id=%s", (user_id,))
-            else:
-                cur.execute("SELECT COUNT(*) FROM public.user_notifications WHERE user_id=%s AND status=%s", (user_id, status))
-            n = int(cur.fetchone()[0] or 0)
-            return {"count": n, "status": status}
-    finally:
-        put_conn(conn)
-
-# alias for older apps
-@app.get("/api/notifications/count")
-def notifications_count_alias(uid: str, status: str = "unread"):
-    return user_notifications_count(uid, status)
 
 # =========================
 # Manual PAID orders (charge now, refund on reject)
@@ -1253,8 +1250,8 @@ async def create_manual_paid(request: Request):
 
         # optional: immediate user notification (order received)
         body = title + (f" | ID: {account_id}" if account_id else "")
-        _run_async(_notify_user, None, user_id, oid, "تم استلام طلبك", body)
-        _run_async(_notify_owner_new_order, None, oid)
+        _notify_user(conn, user_id, oid, "تم استلام طلبك", body)
+        _notify_owner_new_order(conn, oid)
 
         return {"ok": True, "order_id": oid, "charged": float(price)}
     finally:
@@ -1447,7 +1444,7 @@ async def admin_deliver(oid: int, request: Request, x_admin_password: Optional[s
         else:
             body_txt = title or "تم التنفيذ"
 
-        _run_async(_notify_user, None, user_id, order_id, title_txt, body_txt)
+        _notify_user(conn, user_id, order_id, title_txt, body_txt)
         return {"ok": True, "status": "Done"}
     finally:
         put_conn(conn)
@@ -1512,7 +1509,7 @@ async def admin_reject(oid: int, request: Request, x_admin_password: Optional[st
             else:
                 cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
 
-        _run_async(_notify_user, None, user_id, order_id, "تم رفض طلبك", reason or "عذرًا، تم رفض هذا الطلب")
+        _notify_user(conn, user_id, order_id, "تم رفض طلبك", reason or "عذرًا، تم رفض هذا الطلب")
         return {"ok": True, "status": "Rejected"}
     finally:
         put_conn(conn)
@@ -2653,3 +2650,28 @@ def public_announcements_latest():
         return {"title": row[0], "body": row[1], "created_at": int(row[2] or 0)}
     finally:
         put_conn(conn)
+
+@app.get("/api/user/by-uid/{uid}/notifications/count")
+def user_notifications_count(uid: str, status: str = "unread"):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                return {"count": 0, "status": status}
+            user_id = r[0]
+            if status not in ("unread","read","all"):
+                status = "unread"
+            if status == "all":
+                cur.execute("SELECT COUNT(1) FROM public.user_notifications WHERE user_id=%s", (user_id,))
+            else:
+                cur.execute("SELECT COUNT(1) FROM public.user_notifications WHERE user_id=%s AND status=%s", (user_id, status))
+            cnt = int(cur.fetchone()[0])
+            return {"count": cnt, "status": status}
+    finally:
+        put_conn(conn)
+
+@app.get("/api/notifications/count")
+def notifications_count_alias(uid: str, status: str = "unread"):
+    return user_notifications_count(uid, status)
