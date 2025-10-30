@@ -300,24 +300,6 @@ def ensure_schema():
                     # trigger: notify on wallet_txns insert (skip asiacell_topup or meta.no_notify)
                     # announcements (for app-wide news)
                     cur.execute("""
-                        CREATE TABLE IF NOT EXISTS public.announcements(
-                            id BIGSERIAL PRIMARY KEY,
-                            title TEXT NULL,
-                            body  TEXT NOT NULL,
-                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                        );
-                    """)
-
-                    # trigger: notify on wallet_txns insert (skip asiacell_topup or meta.no_notify)
-                    cur.execute("""
-CREATE TABLE IF NOT EXISTS public.announcements(
-                            id BIGSERIAL PRIMARY KEY,
-                            title TEXT NULL,
-                            body  TEXT NOT NULL,
-                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                        );
-                    """)
-
                         CREATE OR REPLACE FUNCTION public.wallet_txns_notify()
                         RETURNS trigger AS $$
                         DECLARE
@@ -330,18 +312,12 @@ CREATE TABLE IF NOT EXISTS public.announcements(
                             IF NEW.meta IS NOT NULL AND (NEW.meta ? 'no_notify') AND (NEW.meta->>'no_notify')::boolean IS TRUE THEN
                                 RETURN NEW;
                             END IF;
-
-                            IF NEW.amount > 0 THEN
-                                b := 'تم إضافة ' || NEW.amount::text;
-                            ELSIF NEW.amount < 0 THEN
-                                b := 'تم خصم ' || ABS(NEW.amount)::text;
-                            ELSE
-                                RETURN NEW;
-                            END IF;
-
-                            INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
-                            VALUES (NEW.user_id, NULL, t, b, 'unread', NOW());
-
+                            b := 'تم تحديث رصيدك. الرصيد الحالي: ' || (SELECT balance FROM public.users WHERE id=NEW.user_id) || ' دينار.';
+                            PERFORM pg_notify('wallet_change', json_build_object(
+                                'user_id', NEW.user_id,
+                                'title', t,
+                                'body',  b
+                            )::text);
                             RETURN NEW;
                         END;
                         $$ LANGUAGE plpgsql;
