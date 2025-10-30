@@ -734,6 +734,8 @@ def _create_provider_order_core(cur, uid: str, service_id: Optional[int], servic
     user_id, bal, banned = r[0], float(r[1]), bool(r[2])
     if banned:
         raise HTTPException(403, "user banned")
+    orig_qty = int(quantity)
+
 
     # apply service-id override by service_name (ui_key)
     eff_sid = service_id
@@ -767,8 +769,11 @@ def _create_provider_order_core(cur, uid: str, service_id: Optional[int], servic
             if mode == 'flat':
                 eff_price = float(ppk)
             else:
-                if quantity < mn or quantity > mx:
-                    raise HTTPException(400, f"quantity out of allowed range [{mn}-{mx}]")
+                # clamp quantity within allowed range instead of failing
+                if quantity < mn:
+                    quantity = mn
+                elif quantity > mx:
+                    quantity = mx
                 eff_price = float(Decimal(quantity) * Decimal(ppk) / Decimal(1000))
 
         if not rowp:
@@ -787,8 +792,11 @@ def _create_provider_order_core(cur, uid: str, service_id: Optional[int], servic
                     if mode == 'flat':
                         eff_price = float(ppk)
                     else:
-                        if quantity < mn or quantity > mx:
-                            raise HTTPException(400, f"quantity out of allowed range [{mn}-{mx}]")
+                        # clamp quantity within allowed range instead of failing
+                        if quantity < mn:
+                            quantity = mn
+                        elif quantity > mx:
+                            quantity = mx
                         eff_price = float(Decimal(quantity) * Decimal(ppk) / Decimal(1000))
     except Exception:
         # keep original price if anything fails
@@ -810,7 +818,7 @@ def _create_provider_order_core(cur, uid: str, service_id: Optional[int], servic
         VALUES(%s,%s,%s,%s,%s,%s,'Pending',%s,%s)
         RETURNING id
     """, (user_id, service_name, eff_sid, link, quantity, Decimal(eff_price or 0),
-          Json({"source": "provider_form", "service_id_provided": service_id, "service_id_effective": eff_sid, "price_effective": eff_price}), 'provider'))
+          Json((lambda _d: (_d.update({"qty_clamped_from": orig_qty, "qty_clamped_to": quantity}) or _d) if (orig_qty != quantity) else _d)({"source": "provider_form", "service_id_provided": service_id, "service_id_effective": eff_sid, "price_effective": eff_price})), 'provider'))
     oid = cur.fetchone()[0]
     return oid
 
@@ -2353,10 +2361,12 @@ def admin_set_order_quantity(
                 if rowp:
                     ppk = float(rowp[0]); mn = int(rowp[1]); mx = int(rowp[2]); mode = (rowp[3] or 'per_k')
                     if mode == 'per_k':
-                        if body.quantity < mn or body.quantity > mx:
-                            raise HTTPException(400, f"quantity out of allowed range [{mn}-{mx}]")
-                        eff_price = float(Decimal(body.quantity) * Decimal(ppk) / Decimal(1000))
-                        cur.execute("UPDATE public.orders SET price=%s WHERE id=%s", (Decimal(eff_price), oid))
+                        if body.quantity < mn:
+    body.quantity = mn
+elif body.quantity > mx:
+    body.quantity = mx
+eff_price = float(Decimal(body.quantity) * Decimal(ppk) / Decimal(1000))
+cur.execute("UPDATE public.orders SET price=%s WHERE id=%s", (Decimal(eff_price), oid))
 
         return {"ok": True}
     finally:
