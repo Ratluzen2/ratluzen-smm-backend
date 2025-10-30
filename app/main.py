@@ -545,8 +545,21 @@ def _parse_usd(d: Dict[str, Any]) -> int:
     return 0
 
 
+
 def _push_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
-    """Push FCM to all user's devices (user_devices + fallback), without inserting DB row."""
+    """Store notification in DB then push FCM to all user's devices (user_devices + fallback)."""
+    # 1) Insert row in user_notifications (unread)
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at) "
+                "VALUES (%s,%s,%s,%s,'unread', NOW())",
+                (user_id, order_id, title, body)
+            )
+    except Exception as e:
+        logger.exception("push_user insert failed: %s", e)
+
+    # 2) Collect tokens and send FCM
     tokens = []
     try:
         with conn, conn.cursor() as cur:
@@ -564,6 +577,7 @@ def _push_user(conn, user_id: int, order_id: Optional[int], title: str, body: st
         logger.exception("push_user send failed: %s", e)
 
 # =========================
+
 # Models
 # =========================
 class UpsertUserIn(BaseModel):
