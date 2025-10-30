@@ -2551,7 +2551,37 @@ async def admin_announcement_create(request: Request, x_admin_password: _Optiona
                 (title, body)
             )
             ann_id = cur.fetchone()[0]
-        return {"ok": True, "id": ann_id}
+            # 2) Bulk insert into user_notifications so it appears in bell icon for ALL users
+            cur.execute(
+                """
+                INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
+                SELECT id AS user_id, NULL, %s AS title, %s AS body, 'unread', NOW()
+                FROM public.users
+                WHERE active IS DISTINCT FROM FALSE
+                """,
+                (title or 'إعلان', body)
+            )
+            # 3) FCM fanout to all user device tokens
+            cur.execute(
+                """
+                SELECT DISTINCT d.fcm_token
+                FROM public.user_devices d
+                JOIN public.users u ON u.uid = d.uid
+                WHERE d.fcm_token IS NOT NULL AND d.fcm_token <> ''
+                  AND u.active IS DISTINCT FROM FALSE
+                """
+            )
+            tokens = [r[0] for r in cur.fetchall()]
+        # Send FCM outside the DB cursor
+        sent = 0
+        for t in tokens:
+            try:
+                _fcm_send_push(t, title or 'إعلان', body, None)
+                sent += 1
+            except Exception as fe:
+                logger.exception("announcement fanout FCM failed: %s", fe)
+        logger.info("Announcement fan-out completed. Tokens sent: %s", sent)
+        return {"ok": True, "id": ann_id, "broadcasted": True, "tokens": sent}
     finally:
         put_conn(conn)
 
