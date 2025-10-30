@@ -1138,16 +1138,23 @@ async def create_manual_paid(request: Request):
     allowed_ludo = {5,10,20,35,85,165,475,800}
 
     if product in ("itunes","atheer","asiacell","korek"):
-        if usd not in allowed_telco:
-            raise HTTPException(422, "invalid usd for telco/itunes")
+        # accept any usd >= 1; normalize to nearest multiple of 5 for telco/itunes
+        if usd < 1:
+            raise HTTPException(422, "usd must be >= 1")
+        if usd % 5 != 0:
+            # round up to nearest multiple of 5
+            usd = int(((usd + 4) // 5) * 5)
     elif product == "pubg_uc":
-        if usd not in allowed_pubg:
-            raise HTTPException(422, "invalid usd for pubg")
+        # accept any usd >= 1 (dynamic pricing)
+        if usd < 1:
+            raise HTTPException(422, "usd must be >= 1")
     elif product in ("ludo_diamond","ludo_gold"):
-        if usd not in allowed_ludo:
-            raise HTTPException(422, "invalid usd for ludo")
+        # accept any usd >= 1 (dynamic pricing)
+        if usd < 1:
+            raise HTTPException(422, "usd must be >= 1")
     else:
         raise HTTPException(422, "invalid product")
+
 
     # Pricing & title
     steps = usd / 5.0
