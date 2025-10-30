@@ -1051,6 +1051,7 @@ def list_user_notifications(uid: str, status: str = "unread", limit: int = 50):
             if status != "all":
                 where += " AND status=%s"
                 params.append(status)
+            logger.info("list_notifications request uid=%s status=%s limit=%s", uid, status, limit)
             cur.execute(f"""
                 SELECT id, user_id, order_id, title, body, status,
                        EXTRACT(EPOCH FROM created_at)*1000 AS created_at,
@@ -1060,7 +1061,9 @@ def list_user_notifications(uid: str, status: str = "unread", limit: int = 50):
                 ORDER BY id DESC
                 LIMIT %s
             """, (*params, limit))
-            return cur.fetchall() or []
+            rows = cur.fetchall() or []
+            logger.info("list_notifications uid=%s -> %s rows", uid, len(rows))
+            return rows
     finally:
         put_conn(conn)
 
@@ -2613,3 +2616,20 @@ def admin_provider_balance(x_admin_password: _Optional[str] = Header(None, alias
     except Exception:
         bal = 0.0
     return {"balance": bal}
+
+@app.post("/api/test/push_user")
+def test_push_user(uid: str, title: str = "إشعار تجريبي", body: str = "اختبار الإشعارات", x_admin_password: str = Header(None, alias="x-admin-password"), password: str | None = None):
+    _require_admin(x_admin_password or (password or ""))
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                raise HTTPException(404, "user not found")
+            user_id = int(r[0])
+        # store + push
+        _push_user(conn, user_id, None, title, body)
+        return {"ok": True}
+    finally:
+        put_conn(conn)
