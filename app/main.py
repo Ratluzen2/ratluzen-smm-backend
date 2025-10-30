@@ -2546,41 +2546,42 @@ async def admin_announcement_create(request: Request, x_admin_password: _Optiona
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
+            # 1) store the announcement
             cur.execute(
                 "INSERT INTO public.announcements(title, body) VALUES(%s,%s) RETURNING id",
                 (title, body)
             )
             ann_id = cur.fetchone()[0]
-            # 2) Bulk insert into user_notifications so it appears in bell icon for ALL users
+
+            # 2) bulk insert notifications for ALL users (no 'active' column dependency)
             cur.execute(
                 """
                 INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
                 SELECT id AS user_id, NULL, %s AS title, %s AS body, 'unread', NOW()
                 FROM public.users
-                WHERE active IS DISTINCT FROM FALSE
                 """,
                 (title or 'إعلان', body)
             )
-            # 3) FCM fanout to all user device tokens
+
+            # 3) collect DISTINCT FCM tokens (no dependency on users.active)
             cur.execute(
                 """
                 SELECT DISTINCT d.fcm_token
                 FROM public.user_devices d
-                JOIN public.users u ON u.uid = d.uid
                 WHERE d.fcm_token IS NOT NULL AND d.fcm_token <> ''
-                  AND u.active IS DISTINCT FROM FALSE
                 """
             )
             tokens = [r[0] for r in cur.fetchall()]
-        # Send FCM outside the DB cursor
+
+        # 4) fan-out FCM
         sent = 0
         for t in tokens:
             try:
                 _fcm_send_push(t, title or 'إعلان', body, None)
                 sent += 1
             except Exception as fe:
-                logger.exception("announcement fanout FCM failed: %s", fe)
-        logger.info("Announcement fan-out completed. Tokens sent: %s", sent)
+                logger.exception("announcement FCM send failed: %s", fe)
+        logger.info("Announcement broadcast: id=%s, tokens_sent=%s", ann_id, sent)
         return {"ok": True, "id": ann_id, "broadcasted": True, "tokens": sent}
     finally:
         put_conn(conn)
