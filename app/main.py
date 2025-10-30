@@ -2362,11 +2362,11 @@ def admin_set_order_quantity(
                     ppk = float(rowp[0]); mn = int(rowp[1]); mx = int(rowp[2]); mode = (rowp[3] or 'per_k')
                     if mode == 'per_k':
                         if body.quantity < mn:
-    body.quantity = mn
-elif body.quantity > mx:
-    body.quantity = mx
-eff_price = float(Decimal(body.quantity) * Decimal(ppk) / Decimal(1000))
-cur.execute("UPDATE public.orders SET price=%s WHERE id=%s", (Decimal(eff_price), oid))
+                            body.quantity = mn
+                        elif body.quantity > mx:
+                            body.quantity = mx
+                        eff_price = float(Decimal(body.quantity) * Decimal(ppk) / Decimal(1000))
+                        cur.execute("UPDATE public.orders SET price=%s WHERE id=%s", (Decimal(eff_price), oid))
 
         return {"ok": True}
     finally:
