@@ -1489,6 +1489,98 @@ async def admin_reject(oid: int, request: Request, x_admin_password: Optional[st
 async def admin_card_reject_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     return await admin_reject(oid, request, x_admin_password, password)
 
+
+# ===== Admin Announcements (list / update / delete) =====
+from typing import Optional as _Optional
+
+@app.get("/api/admin/announcements")
+def admin_list_announcements_full(x_admin_password: _Optional[str] = Header(None, alias="x-admin-password"), password: _Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            # Ensure table exists
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS public.announcements(
+                    id SERIAL PRIMARY KEY,
+                    title TEXT NULL,
+                    body  TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+            cur.execute("""
+                SELECT id, title, body, (EXTRACT(EPOCH FROM created_at)*1000)::BIGINT AS created_at
+                FROM public.announcements
+                ORDER BY id DESC
+            """)
+            rows = cur.fetchall() or []
+            return [
+                {"id": int(r[0]), "title": r[1], "body": r[2], "created_at": int(r[3] or 0)}
+                for r in rows
+            ]
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/announcement/{ann_id}/update")
+async def admin_update_announcement_full(ann_id: int, request: Request, x_admin_password: _Optional[str] = Header(None, alias="x-admin-password"), password: _Optional[str] = None):
+    data = await _read_json_object(request)
+    _require_admin(_pick_admin_password(x_admin_password, password, data) or "")
+    title = (data.get("title") or "").strip() or None
+    body  = (data.get("body") or "").strip()
+    if not body:
+        raise HTTPException(422, "body is required")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("UPDATE public.announcements SET title=%s, body=%s WHERE id=%s RETURNING id", (title, body, ann_id))
+            r = cur.fetchone()
+            if not r:
+                raise HTTPException(404, "not found")
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/announcement/{ann_id}/delete")
+def admin_delete_announcement_full(ann_id: int, x_admin_password: _Optional[str] = Header(None, alias="x-admin-password"), password: _Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM public.announcements WHERE id=%s RETURNING id", (ann_id,))
+            r = cur.fetchone()
+            if not r:
+                raise HTTPException(404, "not found")
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/pricing/remove_override")
+async def admin_pricing_remove_override(request: Request, x_admin_password: _Optional[str] = Header(None, alias="x-admin-password"), password: _Optional[str] = None):
+    """
+    Remove price override for a ui_key.
+    Body: { "ui_key": "pkg.itunes.10" }
+    """
+    data = await _read_json_object(request)
+    _require_admin(_pick_admin_password(x_admin_password, password, data) or "")
+    ui_key = (data.get("ui_key") or "").strip()
+    if not ui_key:
+        raise HTTPException(422, "ui_key is required")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS public.pricing_overrides(
+                    ui_key TEXT PRIMARY KEY,
+                    price_per_k DOUBLE PRECISION NOT NULL,
+                    min_qty INTEGER NOT NULL DEFAULT 1,
+                    max_qty INTEGER NOT NULL DEFAULT 1000000,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+            cur.execute("DELETE FROM public.pricing_overrides WHERE ui_key=%s", (ui_key,))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
 # =========================
 # Admin pending buckets
 # =========================
