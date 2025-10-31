@@ -297,16 +297,6 @@ def ensure_schema():
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_user_created ON public.user_notifications(user_id, created_at DESC);")
                     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);")
 
-
-                    -- announcements (app-wide)
-                    CREATE TABLE IF NOT EXISTS public.announcements(
-                        id BIGSERIAL PRIMARY KEY,
-                        title TEXT NULL,
-                        body  TEXT NOT NULL,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_announcements_created ON public.announcements(created_at DESC);
-
                     # trigger: notify on wallet_txns insert (skip asiacell_topup or meta.no_notify)
                     # announcements (for app-wide news)
                     cur.execute("""
@@ -350,6 +340,28 @@ def ensure_schema():
     finally:
         put_conn(conn)
 
+
+
+def ensure_announcements():
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.announcements(
+                        id         BIGSERIAL PRIMARY KEY,
+                        title      TEXT NULL,
+                        body       TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NULL
+                    );
+                """)
+                try:
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_announcements_created ON public.announcements(created_at DESC)")
+                except Exception:
+                    pass
+    finally:
+        put_conn(conn)
 ensure_schema()
 
 # =========================
@@ -2623,88 +2635,6 @@ def public_announcements(limit: int = 50):
         put_conn(conn)
 
 @app.get("/api/admin/provider/balance")
-# =========================
-# Admin Announcements (list/update/delete)
-# =========================
-from pydantic import BaseModel as _BaseModel
-
-class _AnnUpdateIn(_BaseModel):
-    title: str | None = None
-    body: str | None = None
-
-def _ensure_announcements(cur):
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS public.announcements(
-            id BIGSERIAL PRIMARY KEY,
-            title TEXT NULL,
-            body  TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """)
-
-@app.get("/api/admin/announcements")
-def admin_announcements_list(limit: int = 200, x_admin_password: str | None = Header(None, alias="x-admin-password"), password: str | None = None):
-    _require_admin(_pick_admin_password(x_admin_password, password) or "")
-    if limit <= 0 or limit > 1000:
-        limit = 200
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            _ensure_announcements(cur)
-            cur.execute("""
-                SELECT id, title, body, (EXTRACT(EPOCH FROM created_at)*1000)::BIGINT
-                FROM public.announcements
-                ORDER BY id DESC
-                LIMIT %s
-            """, (int(limit),))
-            rows = cur.fetchall() or []
-            return [{"id": int(r[0]), "title": r[1], "body": r[2], "created_at": int(r[3] or 0)} for r in rows]
-    finally:
-        put_conn(conn)
-
-@app.post("/api/admin/announcements/{aid}/update")
-@app.post("/api/admin/announcement/{aid}/update")
-async def admin_announcement_update(aid: int, request: Request, x_admin_password: str | None = Header(None, alias="x-admin-password"), password: str | None = None):
-    data = await _read_json_object(request)
-    _require_admin(_pick_admin_password(x_admin_password, password, data) or "")
-    title = (data.get("title") if data.get("title") is not None else None)
-    body  = (data.get("body")  if data.get("body")  is not None else None)
-    if title is None and body is None:
-        raise HTTPException(422, "nothing to update")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            _ensure_announcements(cur)
-            if title is not None and body is not None:
-                cur.execute("UPDATE public.announcements SET title=%s, body=%s WHERE id=%s RETURNING id", (title, body, aid))
-            elif title is not None:
-                cur.execute("UPDATE public.announcements SET title=%s WHERE id=%s RETURNING id", (title, aid))
-            else:
-                cur.execute("UPDATE public.announcements SET body=%s WHERE id=%s RETURNING id", (body, aid))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(404, "announcement not found")
-        return {"ok": True, "id": aid}
-    finally:
-        put_conn(conn)
-
-@app.post("/api/admin/announcements/{aid}/delete")
-@app.post("/api/admin/announcement/{aid}/delete")
-def admin_announcement_delete(aid: int, x_admin_password: str | None = Header(None, alias="x-admin-password"), password: str | None = None):
-    _require_admin(_pick_admin_password(x_admin_password, password) or "")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            _ensure_announcements(cur)
-            cur.execute("DELETE FROM public.announcements WHERE id=%s RETURNING id", (aid,))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(404, "announcement not found")
-        return {"ok": True, "id": aid, "deleted": True}
-    finally:
-        put_conn(conn)
-
-
 def admin_provider_balance(x_admin_password: _Optional[str] = Header(None, alias="x-admin-password"), password: _Optional[str] = None):
     # Returns provider balance as JSON: { "balance": <number> }
     # Uses PROVIDER_API_URL / PROVIDER_API_KEY if configured (kd1s compatible).
@@ -2754,5 +2684,83 @@ def test_push_user(uid: str, title: str = "إشعار تجريبي", body: str =
         # store + push
         _push_user(conn, user_id, None, title, body)
         return {"ok": True}
+    finally:
+        put_conn(conn)
+
+
+# =========================
+# Admin: Announcements CRUD
+# =========================
+from fastapi import Header
+
+@app.get("/api/admin/announcements")
+def admin_announcements_list(limit: int = 200, x_admin_password: str | None = Header(None, alias="x-admin-password"), password: str | None = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    if limit <= 0 or limit > 500: limit = 200
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, title, body,
+                       (EXTRACT(EPOCH FROM created_at)*1000)::BIGINT AS created_at,
+                       (EXTRACT(EPOCH FROM updated_at)*1000)::BIGINT AS updated_at
+                FROM public.announcements
+                ORDER BY id DESC
+                LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall() or []
+            return [
+                {
+                    "id": int(r[0]),
+                    "title": r[1],
+                    "body": r[2],
+                    "created_at": int(r[3]) if r[3] is not None else 0,
+                    "updated_at": int(r[4]) if r[4] is not None else None,
+                } for r in rows
+            ]
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/announcements/{aid}/update")
+@app.post("/api/admin/announcement/{aid}/update")
+async def admin_announcement_update(aid: int, request: Request, x_admin_password: str | None = Header(None, alias="x-admin-password"), password: str | None = None):
+    data = await _read_json_object(request)
+    _require_admin(_pick_admin_password(x_admin_password, password, data) or "")
+    title = data.get("title", None)
+    body  = data.get("body",  None)
+    if title is None and body is None:
+        raise HTTPException(422, "title or body required")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            sets = []
+            params = []
+            if title is not None:
+                sets.append("title=%s"); params.append(title)
+            if body is not None:
+                sets.append("body=%s");  params.append(body)
+            sets.append("updated_at=NOW()")
+            q = f"UPDATE public.announcements SET {', '.join(sets)} WHERE id=%s RETURNING id"
+            params.append(aid)
+            cur.execute(q, tuple(params))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "announcement not found")
+        return {"ok": True, "id": aid, "updated": True}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/announcements/{aid}/delete")
+@app.post("/api/admin/announcement/{aid}/delete")
+def admin_announcement_delete(aid: int, x_admin_password: str | None = Header(None, alias="x-admin-password"), password: str | None = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM public.announcements WHERE id=%s RETURNING 1", (aid,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "announcement not found")
+        return {"ok": True, "id": aid, "deleted": True}
     finally:
         put_conn(conn)
