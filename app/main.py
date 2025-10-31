@@ -2119,6 +2119,7 @@ class PricingIn(BaseModel):
 def _ensure_pricing_table(cur):
 
 
+
 def _seed_pricing_categories(cur):
     # Ensure pricing overrides table exists
     cur.execute("""
