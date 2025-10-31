@@ -2851,6 +2851,162 @@ def _svc_rows_for_keywords(cur, kw_list):
         })
     return out
 
+
+# === Provider services discovery (kd1s-compatible) ===
+_provider_services_cache = {"ts": 0, "data": []}
+
+def _fetch_provider_services(force: bool = False):
+    """
+    Fetches services from the SMM provider (kd1s-compatible).
+    Returns a list of dicts with keys: service (id:int), name:str, category:str, rate:float, min:int, max:int
+    Caches for a short TTL to reduce provider calls.
+    """
+    global _provider_services_cache
+    now = int(time.time())
+    if (not force) and _provider_services_cache["data"] and now - _provider_services_cache["ts"] < 90:
+        return _provider_services_cache["data"]
+    try:
+        resp = requests.post(
+            PROVIDER_API_URL,
+            data={"key": PROVIDER_API_KEY, "action": "services"},
+            timeout=25
+        )
+        items = []
+        try:
+            arr = resp.json()
+        except Exception:
+            arr = []
+        if isinstance(arr, list):
+            for it in arr:
+                try:
+                    items.append({
+                        "service": int(it.get("service") or it.get("id") or 0),
+                        "name": str(it.get("name") or it.get("title") or ""),
+                        "category": str(it.get("category") or it.get("type") or ""),
+                        "rate": float(it.get("rate") or it.get("price") or 0),
+                        "min": int(float(it.get("min") or it.get("min_quantity") or 0)),
+                        "max": int(float(it.get("max") or it.get("max_quantity") or 0)),
+                    })
+                except Exception:
+                    # skip malformed rows
+                    pass
+        _provider_services_cache = {"ts": now, "data": items}
+        return items
+    except Exception:
+        return _provider_services_cache["data"] or []
+
+def _merge_service_rows(cur, kind: str):
+    """
+    Build unified rows for either 'itunes' or 'phone' services:
+      - include any rows already present in overrides/pricing
+      - include ALL matching provider services (kd1s)
+      - deduplicate by a ui_key derived from the provider name (case-insensitive)
+      - keep existing pricing overrides if present; else apply safe defaults:
+            itunes: flat, price=5.0, min=1, max=1
+            phone:  per_k, price_per_k=1.0, min=1, max=1_000_000
+    Returns: [ { service_name, provider_service_id, price_per_k, min_qty, max_qty, mode }, ... ]
+    """
+    kind = (kind or "").lower()
+    if kind not in ("itunes", "phone"):
+        return []
+
+    # keywords for filtering provider services
+    if kind == "itunes":
+        kw = ("itunes","i-tunes","ايتونز","آيتونز","itunes card","itunes gift","apple itunes")
+        defaults = {"mode": "flat", "price_per_k": 5.0, "min_qty": 1, "max_qty": 1}
+    else:
+        kw = ("asiacell","اسيا","اسياسيل","رصيد","topup","recharge","korek","كورك","atheer","اثير","phone","line","شحن")
+        defaults = {"mode": "per_k", "price_per_k": 1.0, "min_qty": 1, "max_qty": 1_000_000}
+
+    def _matches(name: str, category: str) -> bool:
+        s = (name or "").lower()
+        c = (category or "").lower()
+        return any(k in s for k in kw) or any(k in c for k in kw)
+
+    # 1) existing rows from overrides/pricing
+    existing = {}
+    try:
+        # find any service names we already know (from overrides+pricing)
+        names = set()
+        cur.execute("CREATE TABLE IF NOT EXISTS public.service_id_overrides(ui_key TEXT PRIMARY KEY, service_id BIGINT NOT NULL)")
+        cur.execute("SELECT ui_key, service_id FROM public.service_id_overrides")
+        for (nm, sid) in cur.fetchall() or []:
+            nm_l = (nm or "").strip()
+            if not nm_l:
+                continue
+            if kind == "itunes" and any(k in nm_l.lower() for k in ("itunes","ايتونز","آيتونز","i-tunes")):
+                names.add(nm_l)
+            if kind == "phone" and any(k in nm_l.lower() for k in ("asiacell","رصيد","الهاتف","phone","line","topup","شحن","korek","كورك","atheer","اثير")):
+                names.add(nm_l)
+
+        cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides")
+        for (nm, ppk, mn, mx, md) in cur.fetchall() or []:
+            nm_l = (nm or "").strip()
+            if not nm_l:
+                continue
+            if kind == "itunes" and any(k in nm_l.lower() for k in ("itunes","ايتونز","آيتونز","i-tunes")):
+                names.add(nm_l)
+            if kind == "phone" and any(k in nm_l.lower() for k in ("asiacell","رصيد","الهاتف","phone","line","topup","شحن","korek","كورك","atheer","اثير")):
+                names.add(nm_l)
+
+        for nm in names:
+            cur.execute("SELECT service_id FROM public.service_id_overrides WHERE ui_key=%s", (nm,))
+            r_sid = cur.fetchone()
+            sid = int(r_sid[0]) if r_sid and r_sid[0] is not None else None
+
+            cur.execute("SELECT price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (nm,))
+            rp = cur.fetchone()
+            if rp:
+                ppk, mn, mx, md = float(rp[0]), int(rp[1]), int(rp[2]), str(rp[3])
+            else:
+                ppk, mn, mx, md = defaults["price_per_k"], defaults["min_qty"], defaults["max_qty"], defaults["mode"]
+
+            key = nm.strip()
+            existing[key.lower()] = {
+                "service_name": key,
+                "provider_service_id": sid,
+                "price_per_k": ppk,
+                "min_qty": mn,
+                "max_qty": mx,
+                "mode": md
+            }
+    except Exception:
+        pass
+
+    # 2) merge provider services
+    prov = _fetch_provider_services()
+    for it in prov:
+        try:
+            name = (it.get("name") or "").strip()
+            cat  = (it.get("category") or "").strip()
+            if not _matches(name, cat):
+                continue
+            sid = int(it.get("service") or 0) or None
+            key = name.strip()
+            k = key.lower()
+            row = existing.get(k)
+            if row:
+                # only fill provider_service_id if missing
+                if not row.get("provider_service_id") and sid:
+                    row["provider_service_id"] = sid
+            else:
+                existing[k] = {
+                    "service_name": key,
+                    "provider_service_id": sid,
+                    "price_per_k": defaults["price_per_k"],
+                    "min_qty": defaults["min_qty"],
+                    "max_qty": defaults["max_qty"],
+                    "mode": defaults["mode"]
+                }
+        except Exception:
+            pass
+
+    # stable sort by name
+    out = list(existing.values())
+    out.sort(key=lambda x: x["service_name"].lower())
+    return out
+
+
 @app.get("/api/admin/itunes/services")
 def admin_list_itunes_services(x_admin_password: str | None = Header(None, alias="x-admin-password"), password: str | None = None):
     _require_admin(_pick_admin_password(x_admin_password, password) or "")
@@ -2860,7 +3016,7 @@ def admin_list_itunes_services(x_admin_password: str | None = Header(None, alias
             _ensure_pricing_table(cur)
             _ensure_pricing_mode_column(cur)
             _seed_pricing_categories(cur)
-            rows = _svc_rows_for_keywords(cur, ["itunes","ايتونز","آيتونز","i-tunes"])
+            rows = _merge_service_rows(cur, "itunes")
             return rows
     finally:
         put_conn(conn)
@@ -2874,7 +3030,7 @@ def admin_list_phone_services(x_admin_password: str | None = Header(None, alias=
             _ensure_pricing_table(cur)
             _ensure_pricing_mode_column(cur)
             _seed_pricing_categories(cur)
-            rows = _svc_rows_for_keywords(cur, ["asiacell","رصيد","الهاتف","phone","line","topup","شحن"])
+            rows = _merge_service_rows(cur, "phone")
             return rows
     finally:
         put_conn(conn)
