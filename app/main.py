@@ -2116,9 +2116,19 @@ class PricingIn(BaseModel):
     max_qty: Optional[int] = None
     mode: Optional[str] = None  # 'per_k' (default) or 'flat'
 
+
 def _ensure_pricing_table(cur):
-
-
+    """Ensure the service_pricing_overrides table exists (idempotent)."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.service_pricing_overrides(
+            ui_key TEXT PRIMARY KEY,
+            price_per_k NUMERIC(18,6) NOT NULL,
+            min_qty INTEGER NOT NULL,
+            max_qty INTEGER NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'per_k',
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
 
 def _seed_pricing_categories(cur):
     # Ensure pricing overrides table exists
