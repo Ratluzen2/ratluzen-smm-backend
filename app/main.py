@@ -354,6 +354,115 @@ app.add_middleware(
 
 # ===== Helpers =====
 
+# =========================
+# Flat-pack pricing helpers (iTunes / Telco) + Admin catalog
+# =========================
+TELCO_PRODUCTS = ("asiacell","korek","atheer")
+FIXED_PACKS = (5,10,15,20,25,30,40,50,100)
+
+def _ensure_pricing_table_and_mode(cur):
+    try:
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS public.service_pricing_overrides("
+            "ui_key TEXT PRIMARY KEY,"
+            "price_per_k NUMERIC(18,6) NOT NULL,"
+            "min_qty INTEGER NOT NULL,"
+            "max_qty INTEGER NOT NULL,"
+            "mode TEXT NOT NULL DEFAULT 'per_k',"
+            "updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE public.service_pricing_overrides ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'per_k'")
+    except Exception:
+        pass
+
+def _flat_pack_price(cur, product: str, usd: int) -> float:
+    # Resolve a FLAT price for a (product, usd) pack using overrides if available, else defaults.
+    p = product.strip().lower()
+    key_exact = f"pkg.{p}.{usd}"
+    cur.execute("SELECT price_per_k, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (key_exact,))
+    r = cur.fetchone()
+    if r and (str(r[1] or 'per_k') == 'flat'):
+        return float(r[0])
+
+    # fallback to base 5$ pack * steps
+    steps = max(1, usd // 5)
+    key_base = f"pkg.{p}.5"
+    cur.execute("SELECT price_per_k, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (key_base,))
+    r = cur.fetchone()
+    if r and (str(r[1] or 'per_k') == 'flat'):
+        return float(r[0]) * steps
+
+    # defaults
+    if p == "itunes":
+        per5 = 9.0
+    else:
+        per5 = 7.0  # telcos default
+    return per5 * steps
+
+@app.get("/api/admin/pricing/packs")
+def admin_pricing_packs(product: str, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    """
+    Returns a canonical list of editable denomination packs and current prices for:
+      product=itunes|asiacell|korek|atheer
+    Always returns items so the app can render the screen even if DB has no overrides yet.
+    """
+    _require_admin(x_admin_password or password or "")
+    prod = (product or "").strip().lower()
+    if prod not in ("itunes",) + TELCO_PRODUCTS:
+        raise HTTPException(422, "invalid product")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table_and_mode(cur)
+            items = []
+            for usd in FIXED_PACKS:
+                price = _flat_pack_price(cur, prod, usd)
+                ui_key = f"pkg.{prod}.{usd}"
+                items.append({"usd": usd, "ui_key": ui_key, "price": float(price)})
+        return {"product": prod, "items": items}
+    finally:
+        put_conn(conn)
+
+class PackSetIn(BaseModel):
+    product: str
+    usd: int
+    price: float
+
+@app.post("/api/admin/pricing/packs/set")
+def admin_pricing_packs_set(body: PackSetIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    """
+    Upsert a flat price for a specific denomination pack.
+    Body: { product: 'itunes'|'asiacell'|'korek'|'atheer', usd: 5|10|..., price: 9.0 }
+    """
+    _require_admin(x_admin_password or password or "")
+    prod = (body.product or "").strip().lower()
+    if prod not in ("itunes",) + TELCO_PRODUCTS:
+        raise HTTPException(422, "invalid product")
+    if body.usd not in FIXED_PACKS:
+        raise HTTPException(422, "invalid usd")
+    if body.price is None or float(body.price) <= 0:
+        raise HTTPException(422, "invalid price")
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table_and_mode(cur)
+            ui_key = f"pkg.{prod}.{int(body.usd)}"
+            cur.execute(
+                "INSERT INTO public.service_pricing_overrides(ui_key, price_per_k, min_qty, max_qty, mode, updated_at) "
+                "VALUES(%s,%s,%s,%s,'flat', now()) "
+                "ON CONFLICT (ui_key) DO UPDATE SET price_per_k=EXCLUDED.price_per_k, min_qty=EXCLUDED.min_qty, "
+                "max_qty=EXCLUDED.max_qty, mode='flat', updated_at=now()",
+                (ui_key, float(body.price), int(body.usd), int(body.usd))
+            )
+        return {"ok": True, "ui_key": ui_key, "price": float(body.price)}
+    finally:
+        put_conn(conn)
+
+
 def _tokens_for_uid(cur, uid: str):
     """Return list of FCM tokens for a uid from user_devices or fallback to users.fcm_token"""
     try:
@@ -1156,33 +1265,33 @@ async def create_manual_paid(request: Request):
         raise HTTPException(422, "invalid product")
 
 
-    # Pricing & title
-    steps = usd / 5.0
-    if product == "itunes":
-        price = steps * 9.0
-        title = f"شراء رصيد ايتونز {usd}$"
-    elif product == "atheer":
-        price = steps * 7.0
-        title = f"شراء رصيد اثير {usd}$"
-    elif product == "asiacell":
-        price = steps * 7.0
-        title = f"شراء رصيد اسياسيل {usd}$"
-    elif product == "korek":
-        price = steps * 7.0
-        title = f"شراء رصيد كورك {usd}$"
-    elif product == "pubg_uc":
-        price = float(usd)
-        title = f"شحن شدات ببجي بسعر {usd}$"
-    elif product == "ludo_diamond":
-        price = float(usd)
-        title = f"شراء الماسات لودو بسعر {usd}$"
-    elif product == "ludo_gold":
-        price = float(usd)
-        title = f"شراء ذهب لودو بسعر {usd}$"
-    else:
-        raise HTTPException(422, "invalid product")
-
-    if account_id:
+    
+# Pricing & title (override-aware)
+steps = usd / 5.0
+conn_pr = get_conn()
+try:
+    with conn_pr, conn_pr.cursor() as cur_pr:
+        if product == "itunes":
+            price = _flat_pack_price(cur_pr, "itunes", usd)
+            title = f"شراء رصيد ايتونز {usd}$"
+        elif product in ("atheer","asiacell","korek"):
+            price = _flat_pack_price(cur_pr, product, usd)
+            title_map = {"atheer":"اثير", "asiacell":"اسياسيل", "korek":"كورك"}
+            title = f"شراء رصيد {title_map.get(product, product)} {usd}$"
+        elif product == "pubg_uc":
+            price = float(usd)
+            title = f"شحن شدات ببجي بسعر {usd}$"
+        elif product == "ludo_diamond":
+            price = float(usd)
+            title = f"شراء الماسات لودو بسعر {usd}$"
+        elif product == "ludo_gold":
+            price = float(usd)
+            title = f"شراء ذهب لودو بسعر {usd}$"
+        else:
+            raise HTTPException(422, "invalid product")
+finally:
+    put_conn(conn_pr)
+if account_id:
         title = f"{title} | ID: {account_id}"
     conn = get_conn()
     try:
