@@ -2329,6 +2329,7 @@ def _ensure_pricing_mode_column(cur):
     except Exception:
         pass
 
+
 @app.get("/api/admin/pricing/list")
 def admin_list_pricing(
     x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
@@ -2339,13 +2340,31 @@ def admin_list_pricing(
     try:
         with conn, conn.cursor() as cur:
             _ensure_pricing_table(cur)
-            cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode, 'per_k') FROM public.service_pricing_overrides ORDER BY ui_key")
+            try:
+                _ensure_pricing_mode_column(cur)
+            except Exception:
+                pass
+            cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides ORDER BY ui_key")
             rows = cur.fetchall()
             out = [{"ui_key": r[0], "price_per_k": float(r[1]), "min_qty": int(r[2]), "max_qty": int(r[3]), "mode": (r[4] or "per_k")} for r in rows]
+
+            # --- Fallback population for iTunes & Telco packs so the app never shows empty lists ---
+            existing = {r[0] for r in rows}
+            for prod in ("itunes","asiacell","korek","atheer"):
+                for usd in (5,10,15,20,25,30,40,50,100):
+                    ui_key = f"pkg.{prod}.{usd}"
+                    if ui_key not in existing:
+                        price = _flat_pack_price(cur, prod, usd)
+                        out.append({
+                            "ui_key": ui_key,
+                            "price_per_k": float(price),
+                            "min_qty": usd,
+                            "max_qty": usd,
+                            "mode": "flat"
+                        })
             return {"list": out}
     finally:
         put_conn(conn)
-
 @app.post("/api/admin/pricing/set")
 def admin_set_pricing(
     body: PricingIn,
@@ -2439,7 +2458,10 @@ def public_pricing_bulk(keys: str):
                     "mode": r[4] or "per_k",
                     "updated_at": int(r[5] or 0)
                 }
-            return {"map": out, "keys": key_list}
+            from starlette.responses import JSONResponse
+            resp = JSONResponse({"map": out, "keys": key_list})
+            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            return resp
     finally:
         put_conn(conn)
 
