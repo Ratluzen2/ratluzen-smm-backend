@@ -2931,3 +2931,29 @@ def admin_clear_pricing_for_service(inp: _SvcPriceIn, x_admin_password: str | No
         return {"ok": True, "ui_key": ui_key, "cleared": True}
     finally:
         put_conn(conn)
+
+
+@app.get("/api/admin/pricing/list")
+def admin_list_pricing(x_admin_password: str | None = Header(None, alias="x-admin-password"), password: str | None = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table(cur)
+            _seed_pricing_categories(cur)
+            cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides ORDER BY ui_key ASC")
+            rows = [
+                {"ui_key": ui, "price_per_k": float(ppk), "min_qty": int(mn), "max_qty": int(mx), "mode": str(md)}
+                for (ui, ppk, mn, mx, md) in (cur.fetchall() or [])
+            ]
+            have = {r["ui_key"] for r in rows}
+            defaults = [
+                {"ui_key": "cat.itunes", "name": "iTunes", "mode": "flat", "price_per_k": 5.0, "min_qty": 1, "max_qty": 1},
+                {"ui_key": "cat.phone", "name": "Phone Balance", "mode": "per_k", "price_per_k": 1.0, "min_qty": 1, "max_qty": 1000000},
+            ]
+            for d in defaults:
+                if d["ui_key"] not in have:
+                    rows.append(d)
+            return rows
+    finally:
+        put_conn(conn)
