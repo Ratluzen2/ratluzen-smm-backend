@@ -342,30 +342,6 @@ def ensure_schema():
 
 ensure_schema()
 
-
-def ensure_announcements():
-    conn = get_conn()
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS public.announcements(
-                        id         BIGSERIAL PRIMARY KEY,
-                        title      TEXT NULL,
-                        body       TEXT NOT NULL,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        updated_at TIMESTAMPTZ NULL
-                    );
-                """)
-                try:
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_announcements_created ON public.announcements(created_at DESC)")
-                except Exception:
-                    pass
-    finally:
-        put_conn(conn)
-
-ensure_announcements()
-
 # =========================
 # FastAPI
 # =========================
@@ -2690,13 +2666,35 @@ def test_push_user(uid: str, title: str = "إشعار تجريبي", body: str =
         put_conn(conn)
 
 
+def ensure_announcements():
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.announcements(
+                        id         BIGSERIAL PRIMARY KEY,
+                        title      TEXT NULL,
+                        body       TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NULL
+                    );
+                """)
+                try:
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_announcements_created ON public.announcements(created_at DESC)")
+                except Exception:
+                    pass
+    finally:
+        put_conn(conn)
+
+
 # =========================
-# Admin: Announcements CRUD (for app's edit/delete buttons)
+# Admin: Announcements CRUD (edit/delete from owner panel)
 # =========================
-from typing import Optional as __Opt
+from fastapi import Header
 
 @app.get("/api/admin/announcements")
-def admin_announcements_list(x_admin_password: __Opt[str] = Header(None, alias="x-admin-password"), password: __Opt[str] = None, limit: int = 200):
+def admin_announcements_list(x_admin_password: Opt[str] = Header(None, alias="x-admin-password"), password: Opt[str] = None, limit: int = 200):
     _require_admin(_pick_admin_password(x_admin_password, password, None) or "")
     if limit <= 0 or limit > 500:
         limit = 200
@@ -2705,7 +2703,8 @@ def admin_announcements_list(x_admin_password: __Opt[str] = Header(None, alias="
         with conn, conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, title, body, (EXTRACT(EPOCH FROM created_at)*1000)::BIGINT AS created_at,
+                SELECT id, title, body,
+                       (EXTRACT(EPOCH FROM created_at)*1000)::BIGINT AS created_at,
                        (EXTRACT(EPOCH FROM updated_at)*1000)::BIGINT AS updated_at
                 FROM public.announcements
                 ORDER BY id DESC
@@ -2728,11 +2727,12 @@ def admin_announcements_list(x_admin_password: __Opt[str] = Header(None, alias="
         put_conn(conn)
 
 class AnnouncementUpdateIn(BaseModel):
-    title: __Opt[str] = None
-    body: __Opt[str] = None
+    title: Opt[str] = None
+    body: Opt[str] = None
 
+# --- Plural style (already used by some tools) ---
 @app.post("/api/admin/announcements/{aid}/update")
-async def admin_announcement_update(aid: int, request: Request, x_admin_password: __Opt[str] = Header(None, alias="x-admin-password"), password: __Opt[str] = None):
+async def admin_announcement_update(aid: int, request: Request, x_admin_password: Opt[str] = Header(None, alias="x-admin-password"), password: Opt[str] = None):
     data = await _read_json_object(request)
     _require_admin(_pick_admin_password(x_admin_password, password, data) or "")
     title = data.get("title")
@@ -2762,7 +2762,7 @@ async def admin_announcement_update(aid: int, request: Request, x_admin_password
         put_conn(conn)
 
 @app.post("/api/admin/announcements/{aid}/delete")
-def admin_announcement_delete(aid: int, x_admin_password: __Opt[str] = Header(None, alias="x-admin-password"), password: __Opt[str] = None):
+def admin_announcement_delete(aid: int, x_admin_password: Opt[str] = Header(None, alias="x-admin-password"), password: Opt[str] = None):
     _require_admin(_pick_admin_password(x_admin_password, password, None) or "")
     conn = get_conn()
     try:
@@ -2775,13 +2775,22 @@ def admin_announcement_delete(aid: int, x_admin_password: __Opt[str] = Header(No
     finally:
         put_conn(conn)
 
-# ---- Common aliases for compatibility with Android client ----
+# --- Singular style to match Android AdminEndpoints ---
+@app.post("/api/admin/announcement/{aid}/update")
+async def admin_announcement_update_singular(aid: int, request: Request, x_admin_password: Opt[str] = Header(None, alias="x-admin-password"), password: Opt[str] = None):
+    return await admin_announcement_update(aid, request, x_admin_password, password)
+
+@app.post("/api/admin/announcement/{aid}/delete")
+def admin_announcement_delete_singular(aid: int, x_admin_password: Opt[str] = Header(None, alias="x-admin-password"), password: Opt[str] = None):
+    return admin_announcement_delete(aid, x_admin_password, password)
+
+# --- Aliases retained for flexibility ---
 @app.get("/api/admin/announcements/list")
-def _alias_admin_ann_list(x_admin_password: __Opt[str] = Header(None, alias="x-admin-password"), password: __Opt[str] = None, limit: int = 200):
+def _alias_admin_ann_list(x_admin_password: Opt[str] = Header(None, alias="x-admin-password"), password: Opt[str] = None, limit: int = 200):
     return admin_announcements_list(x_admin_password, password, limit)
 
 @app.post("/api/admin/announcement/update")
-async def _alias_admin_update(request: Request, x_admin_password: __Opt[str] = Header(None, alias="x-admin-password"), password: __Opt[str] = None):
+async def _alias_admin_update(request: Request, x_admin_password: Opt[str] = Header(None, alias="x-admin-password"), password: Opt[str] = None):
     data = await _read_json_object(request)
     aid = int(data.get("id", 0))
     if not aid:
@@ -2789,7 +2798,7 @@ async def _alias_admin_update(request: Request, x_admin_password: __Opt[str] = H
     return await admin_announcement_update(aid, request, x_admin_password, password)
 
 @app.post("/api/admin/announcement/delete_json")
-async def _alias_admin_delete_json(request: Request, x_admin_password: __Opt[str] = Header(None, alias="x-admin-password"), password: __Opt[str] = None):
+async def _alias_admin_delete_json(request: Request, x_admin_password: Opt[str] = Header(None, alias="x-admin-password"), password: Opt[str] = None):
     data = await _read_json_object(request)
     _require_admin(_pick_admin_password(x_admin_password, password, data) or "")
     aid = int(data.get("id", 0))
