@@ -1084,6 +1084,8 @@ def list_user_notifications(uid: str, status: str = "unread", limit: int = 50):
             """, (*params, limit))
             rows = cur.fetchall() or []
             logger.info("list_notifications uid=%s -> %s rows", uid, len(rows))
+            rows = _expand_canonical_services(cur, rows, "itunes")
+            rows = _expand_canonical_services(cur, rows, "phone")
             return rows
     finally:
         put_conn(conn)
@@ -2807,81 +2809,44 @@ from pydantic import BaseModel as _BaseModel
 
 class _SvcPriceIn(_BaseModel):
     service_name: str
+    # Advanced (backward-compat)
     price_per_k: float | None = None
     min_qty: int | None = None
     max_qty: int | None = None
     mode: str | None = None  # "per_k" or "flat"
+    # Simple UI aliases
+    price: float | None = None
+    quantity: int | None = None
 
 def _svc_rows_for_keywords(cur, kw_list):
     names = set()
-    # gather existing keys from both overrides tables
+    # from service_id_overrides
     cur.execute("CREATE TABLE IF NOT EXISTS public.service_id_overrides(ui_key TEXT PRIMARY KEY, service_id BIGINT NOT NULL)")
     cur.execute("SELECT ui_key FROM public.service_id_overrides")
-    for row in (cur.fetchall() or []):
-        nm = row[0] if isinstance(row, (list, tuple)) else (row.get("ui_key") if isinstance(row, dict) else None)
-        if not nm:
-            continue
+    for (nm,) in cur.fetchall() or []:
         s = (nm or "").lower()
         if any(k in s for k in kw_list):
             names.add(nm)
-
+    # from pricing overrides
     cur.execute("SELECT ui_key FROM public.service_pricing_overrides")
-    for row in (cur.fetchall() or []):
-        nm = row[0] if isinstance(row, (list, tuple)) else (row.get("ui_key") if isinstance(row, dict) else None)
-        if not nm:
-            continue
+    for (nm,) in cur.fetchall() or []:
         s = (nm or "").lower()
         if any(k in s for k in kw_list):
             names.add(nm)
-
-    # canonical placeholders so sections are never empty in admin UI
-    kws = [str(k).lower() for k in kw_list]
-    def add_itunes_defaults():
-        denoms = [5,10,15,20,25,30,40,50,100]
-        for d in denoms:
-            names.add(f"itunes.{d}")
-
-    def add_phone_defaults():
-        carriers = ["atheer","asiacell","korek"]
-        denoms = [5,10,15,20,25,30,40,50,100]
-        for c in carriers:
-            for d in denoms:
-                names.add(f"phone.{c}.{d}")
-
-    if any(k in ("itunes","ايتونز","آيتونز","i-tunes") for k in kws):
-        add_itunes_defaults()
-    if any(k in ("asiacell","رصيد","الهاتف","phone","line","topup","شحن") for k in kws):
-        add_phone_defaults()
 
     out = []
-    # helper to read one override row
-    def read_pricing(nm: str):
-        cur.execute("SELECT price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (nm,))
-        r = cur.fetchone()
-        if r is None:
-            return None, None, None, None
-        # support tuple or dict rows
-        if isinstance(r, (list, tuple)):
-            price_per_k, min_qty, max_qty, mode = r[0], r[1], r[2], r[3]
-        else:
-            price_per_k = r.get("price_per_k"); min_qty = r.get("min_qty"); max_qty = r.get("max_qty"); mode = r.get("coalesce") or r.get("mode")
-        return (float(price_per_k), int(min_qty), int(max_qty), str(mode))
-
-    # helper to read service_id override
-    def read_service_id(nm: str):
-        cur.execute("SELECT service_id FROM public.service_id_overrides WHERE ui_key=%s", (nm,))
-        r = cur.fetchone()
-        if r is None:
-            return None
-        return int(r[0]) if isinstance(r, (list, tuple)) else int(r.get("service_id"))
-
     for nm in sorted(names, key=lambda x: x.lower()):
-        sid = read_service_id(nm)
-        rp = read_pricing(nm)
-        if rp is None:
-            price_per_k = min_qty = max_qty = mode = None
+        cur.execute("SELECT service_id FROM public.service_id_overrides WHERE ui_key=%s", (nm,))
+        row_sid = cur.fetchone()
+        sid = int(row_sid[0]) if row_sid and row_sid[0] is not None else None
+
+        cur.execute("SELECT price_per_k, min_qty, max_qty, mode FROM public.service_pricing_overrides WHERE ui_key=%s", (nm,))
+        rowp = cur.fetchone()
+        if rowp:
+            price_per_k, min_qty, max_qty, mode = float(rowp[0]), int(rowp[1]), int(rowp[2]), str(rowp[3])
         else:
-            price_per_k, min_qty, max_qty, mode = rp
+            price_per_k = None; min_qty = None; max_qty = None; mode = None
+
         out.append({
             "service_name": nm,
             "provider_service_id": sid,
@@ -2890,6 +2855,139 @@ def _svc_rows_for_keywords(cur, kw_list):
             "max_qty": max_qty,
             "mode": mode
         })
+    return out
+
+
+# === Canonical expansions for iTunes & Phone services (non-breaking addition) ===
+def _expand_canonical_services(cur, base_rows, category: str):
+    """
+    Returns base_rows + canonical per-service items for the given category.
+    category: "itunes" or "phone"
+    Output rows each look like:
+      {"service_name": str, "provider_service_id": int|None, "price_per_k": float|None,
+       "min_qty": int|None, "max_qty": int|None, "mode": str|None}
+    """
+    # Build a quick index of existing names to avoid duplicates
+    existing = { (r.get("service_name") or "").strip().lower() for r in (base_rows or []) }
+    out = list(base_rows or [])
+
+    def row_for(name):
+        # Look up provider_service_id and pricing if already set
+        cur.execute("SELECT service_id FROM public.service_id_overrides WHERE ui_key=%s", (name,))
+        r_sid = cur.fetchone()
+        sid = int(r_sid[0]) if r_sid and r_sid[0] is not None else None
+
+        cur.execute("SELECT price_per_k, min_qty, max_qty, COALESCE(mode,'flat') FROM public.service_pricing_overrides WHERE ui_key=%s", (name,))
+        r_p = cur.fetchone()
+        if r_p:
+            price_per_k, mn, mx, mode = float(r_p[0]), int(r_p[1]), int(r_p[2]), str(r_p[3] or "flat")
+        else:
+            # sensible defaults for per-item pricing
+            price_per_k, mn, mx, mode = None, 1, 1, "flat"
+        return {
+            "service_name": name,
+            "provider_service_id": sid,
+            "price_per_k": price_per_k,
+            "min_qty": mn,
+            "max_qty": mx,
+            "mode": mode
+        }
+
+    if category == "itunes":
+        denoms = [5,10,15,20,25,30,40,50,100]
+        for usd in denoms:
+            name = f"itunes_{usd}"
+            if name.lower() not in existing:
+                out.append(row_for(name))
+        # Also ensure category-level key exists for global adjustments
+        if "cat.itunes" not in existing:
+            out.append(row_for("cat.itunes"))
+    elif category == "phone":
+        denoms = [5,10,15,20,25,30,40,50,100]
+        carriers = ["asiacell", "korek", "atheer"]
+        for c in carriers:
+            for usd in denoms:
+                name = f"{c}_{usd}"
+                if name.lower() not in existing:
+                    out.append(row_for(name))
+        # Category-level fallback
+        if "cat.phone" not in existing:
+            out.append(row_for("cat.phone"))
+    return out
+
+
+def _expand_canonical_services(cur, base_rows, category: str):
+    """
+    Expand canonical services for iTunes and phone credit with safe numeric defaults.
+    """
+    existing = { (r.get("service_name") or "").strip().lower() for r in (base_rows or []) }
+    out = list(base_rows or [])
+
+    def normalize_defaults(row):
+        row["price_per_k"] = float(row.get("price_per_k") if row.get("price_per_k") is not None else 0.0)
+        row["min_qty"] = int(row.get("min_qty") if row.get("min_qty") not in (None, 0) else 1)
+        row["max_qty"] = int(row.get("max_qty") if row.get("max_qty") not in (None, 0) else 1)
+        row["mode"] = (row.get("mode") or "flat")
+        return row
+
+    def row_for(name):
+        sid = None
+        cur.execute("SELECT service_id FROM public.service_id_overrides WHERE ui_key=%s", (name,))
+        r_sid = cur.fetchone()
+        if r_sid is not None:
+            try:
+                sid = int(getattr(r_sid, "service_id", None) or r_sid[0])
+            except Exception:
+                try:
+                    sid = int(r_sid[0])
+                except Exception:
+                    sid = None
+
+        price_per_k, mn, mx, mode = None, None, None, None
+        cur.execute("SELECT price_per_k, min_qty, max_qty, COALESCE(mode,'flat') AS mode FROM public.service_pricing_overrides WHERE ui_key=%s", (name,))
+        r_p = cur.fetchone()
+        if r_p is not None:
+            def getv(x):
+                try:
+                    return r_p[x]
+                except Exception:
+                    try:
+                        idx = ["price_per_k","min_qty","max_qty","mode"].index(x)
+                        return r_p[idx]
+                    except Exception:
+                        return None
+            price_per_k = getv("price_per_k")
+            mn = getv("min_qty")
+            mx = getv("max_qty")
+            mode = getv("mode")
+
+        return normalize_defaults({
+            "service_name": name,
+            "provider_service_id": sid,
+            "price_per_k": price_per_k,
+            "min_qty": mn,
+            "max_qty": mx,
+            "mode": mode
+        })
+
+    if category == "itunes":
+        denoms = [5,10,15,20,25,30,40,50,100]
+        for usd in denoms:
+            name = f"itunes.{usd}"
+            if name.lower() not in existing:
+                out.append(row_for(name))
+        if "cat.itunes" not in existing:
+            out.append(row_for("cat.itunes"))
+    elif category == "phone":
+        denoms = [5,10,15,20,25,30,40,50,100]
+        carriers = ["asiacell", "korek", "atheer"]
+        for c in carriers:
+            for usd in denoms:
+                name = f"{c}.{usd}"
+                if name.lower() not in existing:
+                    out.append(row_for(name))
+        if "cat.phone" not in existing:
+            out.append(row_for("cat.phone"))
     return out
 
 @app.get("/api/admin/itunes/services")
@@ -2901,8 +2999,37 @@ def admin_list_itunes_services(x_admin_password: str | None = Header(None, alias
             _ensure_pricing_table(cur)
             _ensure_pricing_mode_column(cur)
             _seed_pricing_categories(cur)
-            rows = _svc_rows_for_keywords(cur, ["itunes","ايتونز","آيتونز","i-tunes"])
-            return rows
+            rows = _svc_rows_for_keywords(cur, ['itunes', 'ايتونز', 'آيتونز', 'i-tunes'])
+            rows = _expand_canonical_services(cur, rows, 'itunes')
+            # Transform to simple items
+            out = []
+            for r in rows or []:
+                name = (r.get("service_name") or "").strip()
+                # Resolve any override to compute simple fields
+                cur.execute("SELECT price_per_k, min_qty, max_qty, COALESCE(mode,'flat') FROM public.service_pricing_overrides WHERE ui_key=%s", (name,))
+                rp = cur.fetchone()
+                if rp:
+                    try:
+                        price = float(rp[0])
+                        mn = int(rp[1]); mx = int(rp[2]); mode = str(rp[3] or "flat")
+                    except Exception:
+                        # support dict-like
+                        price = float(rp.get("price_per_k", 0.0))
+                        mn = int(rp.get("min_qty", 1)); mx = int(rp.get("max_qty", 1)); mode = str(rp.get("mode","flat"))
+                else:
+                    price = float(r.get("price_per_k") or 0.0)
+                    mn = int(r.get("min_qty") or 1); mx = int(r.get("max_qty") or 1); mode = str(r.get("mode") or "flat")
+                # For simple UI we collapse to one quantity number
+                quantity = mx if mx == mn else mx
+                title = name.replace('.', ' ').replace('_',' ')
+                out.append({
+                    "service_name": name,
+                    "title": title,
+                    "price": float(price),
+                    "quantity": int(quantity),
+                    "provider_service_id": r.get("provider_service_id")
+                })
+            return out
     finally:
         put_conn(conn)
 
@@ -2915,8 +3042,37 @@ def admin_list_phone_services(x_admin_password: str | None = Header(None, alias=
             _ensure_pricing_table(cur)
             _ensure_pricing_mode_column(cur)
             _seed_pricing_categories(cur)
-            rows = _svc_rows_for_keywords(cur, ["asiacell","رصيد","الهاتف","phone","line","topup","شحن"])
-            return rows
+            rows = _svc_rows_for_keywords(cur, ['asiacell', 'رصيد', 'الهاتف', 'phone', 'line', 'topup', 'شحن'])
+            rows = _expand_canonical_services(cur, rows, 'phone')
+            # Transform to simple items
+            out = []
+            for r in rows or []:
+                name = (r.get("service_name") or "").strip()
+                # Resolve any override to compute simple fields
+                cur.execute("SELECT price_per_k, min_qty, max_qty, COALESCE(mode,'flat') FROM public.service_pricing_overrides WHERE ui_key=%s", (name,))
+                rp = cur.fetchone()
+                if rp:
+                    try:
+                        price = float(rp[0])
+                        mn = int(rp[1]); mx = int(rp[2]); mode = str(rp[3] or "flat")
+                    except Exception:
+                        # support dict-like
+                        price = float(rp.get("price_per_k", 0.0))
+                        mn = int(rp.get("min_qty", 1)); mx = int(rp.get("max_qty", 1)); mode = str(rp.get("mode","flat"))
+                else:
+                    price = float(r.get("price_per_k") or 0.0)
+                    mn = int(r.get("min_qty") or 1); mx = int(r.get("max_qty") or 1); mode = str(r.get("mode") or "flat")
+                # For simple UI we collapse to one quantity number
+                quantity = mx if mx == mn else mx
+                title = name.replace('.', ' ').replace('_',' ')
+                out.append({
+                    "service_name": name,
+                    "title": title,
+                    "price": float(price),
+                    "quantity": int(quantity),
+                    "provider_service_id": r.get("provider_service_id")
+                })
+            return out
     finally:
         put_conn(conn)
 
@@ -2935,6 +3091,16 @@ def admin_set_pricing_for_service(inp: _SvcPriceIn, x_admin_password: str | None
             cur.execute("SELECT 1 FROM public.service_pricing_overrides WHERE ui_key=%s", (ui_key,))
             exists = cur.fetchone() is not None
             fields = {}
+            # Simple aliases first
+            if inp.price is not None:
+                fields["price_per_k"] = float(inp.price)
+                # Force flat mode for simple pricing
+                fields["mode"] = fields.get("mode", "flat")
+            if inp.quantity is not None:
+                q = int(inp.quantity)
+                fields["min_qty"] = q
+                fields["max_qty"] = q
+            # Advanced (backward-compat)
             if inp.price_per_k is not None: fields["price_per_k"] = float(inp.price_per_k)
             if inp.min_qty is not None:    fields["min_qty"] = int(inp.min_qty)
             if inp.max_qty is not None:    fields["max_qty"] = int(inp.max_qty)
