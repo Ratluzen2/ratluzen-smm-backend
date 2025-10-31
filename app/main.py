@@ -2118,6 +2118,7 @@ class PricingIn(BaseModel):
 
 def _ensure_pricing_table(cur):
 
+
 def _seed_pricing_categories(cur):
     # Ensure pricing overrides table exists
     cur.execute("""
@@ -2130,7 +2131,7 @@ def _seed_pricing_categories(cur):
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
     """)
-    # Default categories so they appear in admin pricing panel
+    # Default categories so they appear in admin "Change prices/quantities"
     defaults = [
         ("cat.pubg",   1000.0, 1, 1000000, "per_k"),
         ("cat.ludo",   1000.0, 1, 1000000, "per_k"),
@@ -2139,19 +2140,10 @@ def _seed_pricing_categories(cur):
     ]
     for key, ppk, mn, mx, mode in defaults:
         cur.execute(
-            "INSERT INTO public.service_pricing_overrides(ui_key, price_per_k, min_qty, max_qty, mode) VALUES(%s,%s,%s,%s,%s) ON CONFLICT (ui_key) DO NOTHING",
+            "INSERT INTO public.service_pricing_overrides(ui_key, price_per_k, min_qty, max_qty, mode) "
+            "VALUES(%s,%s,%s,%s,%s) ON CONFLICT (ui_key) DO NOTHING",
             (key, ppk, mn, mx, mode)
         )
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS public.service_pricing_overrides(
-            ui_key TEXT PRIMARY KEY,
-            price_per_k NUMERIC(18,6) NOT NULL,
-            min_qty INTEGER NOT NULL,
-            max_qty INTEGER NOT NULL,
-            mode TEXT NOT NULL DEFAULT 'per_k',
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-    """)
 
 def _ensure_pricing_mode_column(cur):
     try:
