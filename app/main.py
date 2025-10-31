@@ -2118,10 +2118,19 @@ class PricingIn(BaseModel):
 
 def _ensure_pricing_table(cur):
 
-
 def _seed_pricing_categories(cur):
-    # Ensure default category rows exist so they are visible in Admin "Change prices/quantities"
-    cur.execute("CREATE TABLE IF NOT EXISTS public.service_pricing_overrides(ui_key TEXT PRIMARY KEY, price_per_k NUMERIC(18,6) NOT NULL, min_qty INTEGER NOT NULL, max_qty INTEGER NOT NULL, mode TEXT NOT NULL DEFAULT 'per_k', updated_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+    # Ensure pricing overrides table exists
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.service_pricing_overrides(
+            ui_key TEXT PRIMARY KEY,
+            price_per_k NUMERIC(18,6) NOT NULL,
+            min_qty INTEGER NOT NULL,
+            max_qty INTEGER NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'per_k',
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
+    # Default categories so they appear in admin pricing panel
     defaults = [
         ("cat.pubg",   1000.0, 1, 1000000, "per_k"),
         ("cat.ludo",   1000.0, 1, 1000000, "per_k"),
@@ -2129,7 +2138,10 @@ def _seed_pricing_categories(cur):
         ("cat.phone",     1.0, 1, 1000000, "per_k"),
     ]
     for key, ppk, mn, mx, mode in defaults:
-        cur.execute("INSERT INTO public.service_pricing_overrides(ui_key, price_per_k, min_qty, max_qty, mode) VALUES(%s,%s,%s,%s,%s) ON CONFLICT (ui_key) DO NOTHING", (key, ppk, mn, mx, mode))
+        cur.execute(
+            "INSERT INTO public.service_pricing_overrides(ui_key, price_per_k, min_qty, max_qty, mode) VALUES(%s,%s,%s,%s,%s) ON CONFLICT (ui_key) DO NOTHING",
+            (key, ppk, mn, mx, mode)
+        )
     cur.execute("""
         CREATE TABLE IF NOT EXISTS public.service_pricing_overrides(
             ui_key TEXT PRIMARY KEY,
@@ -2798,15 +2810,15 @@ class _SvcPriceIn(_BaseModel):
     mode: str | None = None  # "per_k" or "flat"
 
 def _svc_rows_for_keywords(cur, kw_list):
-    # Collect distinct service names from both overrides and id-overrides
     names = set()
-    # From service_id_overrides (where admin ربط service_name -> service_id)
+    # from service_id_overrides
+    cur.execute("CREATE TABLE IF NOT EXISTS public.service_id_overrides(ui_key TEXT PRIMARY KEY, service_id BIGINT NOT NULL)")
     cur.execute("SELECT ui_key FROM public.service_id_overrides")
     for (nm,) in cur.fetchall() or []:
         s = (nm or "").lower()
         if any(k in s for k in kw_list):
             names.add(nm)
-    # From pricing overrides keyed by service_name
+    # from pricing overrides
     cur.execute("SELECT ui_key FROM public.service_pricing_overrides")
     for (nm,) in cur.fetchall() or []:
         s = (nm or "").lower()
@@ -2815,12 +2827,10 @@ def _svc_rows_for_keywords(cur, kw_list):
 
     out = []
     for nm in sorted(names, key=lambda x: x.lower()):
-        # read possible linked service_id (for info)
         cur.execute("SELECT service_id FROM public.service_id_overrides WHERE ui_key=%s", (nm,))
         row_sid = cur.fetchone()
         sid = int(row_sid[0]) if row_sid and row_sid[0] is not None else None
 
-        # read pricing override if any
         cur.execute("SELECT price_per_k, min_qty, max_qty, mode FROM public.service_pricing_overrides WHERE ui_key=%s", (nm,))
         rowp = cur.fetchone()
         if rowp:
@@ -2878,7 +2888,6 @@ def admin_set_pricing_for_service(inp: _SvcPriceIn, x_admin_password: str | None
             _ensure_pricing_table(cur)
             _ensure_pricing_mode_column(cur)
             _seed_pricing_categories(cur)
-            # Build upsert fields
             cur.execute("SELECT 1 FROM public.service_pricing_overrides WHERE ui_key=%s", (ui_key,))
             exists = cur.fetchone() is not None
             fields = {}
@@ -2894,7 +2903,6 @@ def admin_set_pricing_for_service(inp: _SvcPriceIn, x_admin_password: str | None
                 params = list(fields.values()) + [ui_key]
                 cur.execute(f"UPDATE public.service_pricing_overrides SET {sets}, updated_at=now() WHERE ui_key=%s", tuple(params))
             else:
-                # require minimal defaults
                 price = fields.get("price_per_k", 0.0)
                 mn = fields.get("min_qty", 1)
                 mx = fields.get("max_qty", 1000000)
