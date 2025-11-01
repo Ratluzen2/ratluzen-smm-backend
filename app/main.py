@@ -1152,8 +1152,7 @@ async def create_manual_paid(request: Request):
     allowed_ludo = {5,10,20,35,85,165,475,800}
 
     if product in ("itunes","atheer","asiacell","korek"):
-        if usd not in allowed_telco:
-            raise HTTPException(422, "invalid usd for telco/itunes")
+        pass  # allow overrides to supply custom amounts
     elif product == "pubg_uc":
         if usd not in allowed_pubg:
             raise HTTPException(422, "invalid usd for pubg")
@@ -1194,6 +1193,54 @@ async def create_manual_paid(request: Request):
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
+
+            # --- Dynamic pricing overrides for topup (iTunes/Atheer/Asiacell/Korek) ---
+            # If admin set a pricing override like ui_key = "topup.<product>.<usd>" we will use it as a flat price
+            override_row = None
+            if product in ("itunes","atheer","asiacell","korek"):
+                try:
+                    _ensure_pricing_table(cur)
+                    try:
+                        _ensure_pricing_mode_column(cur)
+                    except Exception:
+                        pass
+                    ui_key = f"topup.{product}.{usd}"
+                    cur.execute("SELECT price_per_k, COALESCE(min_qty,0), COALESCE(max_qty,0), COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (ui_key,))
+                    override_row = cur.fetchone()
+                except Exception:
+                    override_row = None
+
+            # Validate amount for telco/itunes: allow admin overrides to bypass the static allowed list
+            if product in ("itunes","atheer","asiacell","korek"):
+                allowed_telco = {5,10,15,20,25,30,40,50,100}
+                if (usd not in allowed_telco) and (not override_row):
+                    raise HTTPException(422, "invalid usd for telco/itunes")
+
+            # Compute price & title (apply override first if present)
+            if product in ("itunes","atheer","asiacell","korek"):
+                if override_row:
+                    ppk, mn, mx, mode = float(override_row[0]), int(override_row[1] or 0), int(override_row[2] or 0), (override_row[3] or "per_k")
+                    # For topups we treat override price as a FLAT price per pack
+                    price = float(ppk)
+                    effective_usd = int(mn) if mn and mn > 0 else int(usd)
+                    usd = effective_usd
+                    ar_label = {"itunes":"ايتونز","atheer":"اثير","asiacell":"اسياسيل","korek":"كورك"}.get(product, product)
+                    title = f"شراء رصيد {ar_label} {usd}$"
+                else:
+                    steps = usd / 5.0
+                    if product == "itunes":
+                        price = steps * 9.0
+                        title = f"شراء رصيد ايتونز {usd}$"
+                    elif product == "atheer":
+                        price = steps * 7.0
+                        title = f"شراء رصيد اثير {usd}$"
+                    elif product == "asiacell":
+                        price = steps * 7.0
+                        title = f"شراء رصيد اسياسيل {usd}$"
+                    elif product == "korek":
+                        price = steps * 7.0
+                        title = f"شراء رصيد كورك {usd}$"
+            # ---------------------------------------------------------------------------
             # ensure user & balance
             cur.execute("SELECT id, balance, is_banned FROM public.users WHERE uid=%s", (uid,))
             r = cur.fetchone()
