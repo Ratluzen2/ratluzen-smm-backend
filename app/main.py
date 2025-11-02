@@ -3234,33 +3234,48 @@ def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple]
             return "api"
 
         def _svc_name_ar(ps):
-            cat = _svc_cat(ps)
-            if cat == "itunes": return "آيتونز"
-            if cat == "phone":
-                if "atheer" in ps:   return "أثير"
-                if "asiacell" in ps: return "آسيا سيل"
-                if "korek" in ps:    return "كورك"
-                if "zain" in ps:     return "زين"
-                return "رصيد"
-            if cat == "pubg": return "ببجي"
-            if cat == "ludo_dia": return "ألماس لودو"
-            if cat == "ludo_gold": return "ذهب لودو"
-            if cat == "ludo": return "لودو"
-            # API fallback: try a nicer Arabic label from ui_key tokens
-            # Examples: tiktok_followers -> "متابعين تيكتوك"
-            t = " ".join(ps)
-            if "tiktok" in t: 
-                if "followers" in t or "متابعين" in t: return "متابعين تيكتوك"
-                if "likes" in t or "لايك" in t: return "لايكات تيكتوك"
-                if "views" in t or "مشاهد" in t: return "مشاهدات تيكتوك"
-            if "instagram" in t or "insta" in t or "انستا" in t:
-                if "followers" in t or "متابعين" in t: return "متابعين انستا"
-                if "likes" in t or "لايك" in t: return "لايكات انستا"
-                if "views" in t or "مشاهد" in t: return "مشاهدات انستا"
-            if "telegram" in t or "تيليجرام" in t or "تلجرام" in t: return "خدمات تيليجرام"
-            if "youtube" in t or "يوتيوب" in t: return "خدمات يوتيوب"
-            if "score" in t or "سكور" in t: return "رفع السكور"
-            return "خدمة"
+    # ps = list of ui_key tokens (lowercased)
+    t = " ".join(ps)
+    def has(*keys): 
+        return any(k in t for k in keys)
+
+    # Platform detection
+    platform = None
+    if has("tiktok", "تيك", "تيكتوك"): platform = "تيكتوك"
+    elif has("instagram", "insta", "انستا", "ig"): platform = "انستا"
+    elif has("youtube", "يوتيوب", "yt"): platform = "يوتيوب"
+    elif has("telegram", "تيليجرام", "تلجرام", "تليجرام", "tg"): platform = "تيليجرام"
+    elif has("twitter", "x_","x-", "x.", "xapp", "تويتر"): platform = "تويتر"
+    elif has("facebook", "fb", "فيس"): platform = "فيسبوك"
+    elif has("snapchat", "snap", "سناب"): platform = "سناب"
+    elif has("kwai", "كواي"): platform = "كواي"
+    elif has("likee", "لايكي"): platform = "لايكي"
+
+    # Metric detection
+    if has("follower", "followers", "subs", "subscriber", "subscrip"):
+        return f"متابعين {platform or ''}".strip()
+    if has("like", "likes"):
+        return f"لايكات {platform or ''}".strip()
+    if has("view", "views", "play", "plays"):
+        # live / livestream views
+        if has("live", "livestream", "broadcast", "البث", "مباشر"):
+            return f"مشاهدات البث المباشر {platform or ''}".strip()
+        return f"مشاهدات {platform or ''}".strip()
+    if has("comment", "comments"):
+        return f"تعليقات {platform or ''}".strip()
+    if has("save", "saves"):
+        return f"حفظ {platform or ''}".strip()
+    if has("reaction", "reactions"):
+        return f"تفاعلات {platform or ''}".strip()
+    if has("member", "members", "join"):
+        # Common for Telegram
+        if platform == "تيليجرام":
+            return "أعضاء تيليجرام"
+
+    # Fallbacks
+    if platform:
+        return f"خدمات {platform}"
+    return "خدمة"
 
         def _first_digits(ps):
             for p in reversed(ps):
