@@ -2813,8 +2813,110 @@ def admin_announcement_delete(aid: int, x_admin_password: str | None = Header(No
         put_conn(conn)
 
 
+def _service_names_ar():
+    return {
+        "itunes": "آيتونز",
+        "pubg": "ببجي",
+        "bgmi": "ببجي",
+        "ludo": "لودو",
+        "diamonds": "ألماس لودو",
+        "gold": "ذهب لودو",
+        "asiacell": "آسيا سيل",
+        "zain": "زين",
+        "korek": "كورك",
+        "atheer": "أثير",
+    }
+
+def _last_digits(parts):
+    for p in reversed(parts):
+        if p.isdigit():
+            return p
+    return None
+
+def _label_for_ui_key(ui_key: str):
+    """(category, pretty_ar) broader label for heads-up and logs."""
+    try:
+        parts = [p for p in (ui_key or '').lower().split('.') if p]
+        names = _service_names_ar()
+        if not parts:
+            return "service", "خدمة"
+
+        # iTunes
+        if "itunes" in parts:
+            amt = _last_digits(parts)
+            return "itunes", f"{names['itunes']} ${amt}" if amt else names['itunes']
+
+        # Phone balance
+        for op in ("asiacell","zain","korek","atheer"):
+            if op in parts:
+                amt = _last_digits(parts)
+                return "phone", f"رصيد {names[op]} {amt}" if amt else f"رصيد {names[op]}"
+
+        # PUBG
+        if ("pubg" in parts) or ("bgmi" in parts) or ("uc" in parts):
+            amt = _last_digits(parts)
+            return "pubg", f"{names['pubg']} UC {amt}" if amt else f"{names['pubg']} UC"
+
+        # Ludo
+        if any("ludo" in p for p in parts):
+            base = "لودو"
+            if "diamonds" in parts:
+                base = names["diamonds"]
+            elif "gold" in parts:
+                base = names["gold"]
+            amt = _last_digits(parts)
+            return "ludo", f"{base} {amt}" if amt else base
+
+        return "service", ui_key or "خدمة"
+    except Exception:
+        return "service", ui_key or "خدمة"
+
+def _short_label_for_ui_key(ui_key: str):
+    """Short label formatted per user's preference, like '5$أثير', '5$آيتونز', '60UCببجي'."""
+    try:
+        parts = [p for p in (ui_key or '').lower().split('.') if p]
+        names = _service_names_ar()
+        if not parts:
+            return "عنصر"
+
+        amt = _last_digits(parts) or ""
+        amt_dollar = f"{amt}$" if amt else ""
+
+        # iTunes
+        if "itunes" in parts:
+            return f"{amt_dollar}{names['itunes']}" if amt else names['itunes']
+
+        # Phone operators
+        for op in ("asiacell","zain","korek","atheer"):
+            if op in parts:
+                return f"{amt_dollar}{names[op]}" if amt else names[op]
+
+        # PUBG
+        if ("pubg" in parts) or ("bgmi" in parts) or ("uc" in parts):
+            return f"{(amt or '')}UC{names['pubg']}" if amt else f"UC{names['pubg']}"
+
+        # Ludo
+        if any("ludo" in p for p in parts):
+            if "diamonds" in parts:
+                base = "ألماس لودو"
+            elif "gold" in parts:
+                base = "ذهب لودو"
+            else:
+                base = "لودو"
+            return f"{amt}{base}" if amt else base
+
+        return ui_key or "عنصر"
+    except Exception:
+        return ui_key or "عنصر"
+
+def _fmt_price(v, currency: str = "$"):
+    try:
+        return f"{float(v):g}{currency}"
+    except Exception:
+        return f"{v}{currency}" if v is not None else ""
+
 def _ensure_user_notifications_table(cur):
-    cur.execute(\"\"\"
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS public.user_notifications(
             id BIGSERIAL PRIMARY KEY,
             uid TEXT NOT NULL,
@@ -2824,5 +2926,5 @@ def _ensure_user_notifications_table(cur):
             data JSONB,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
-    \"\"\")
-    cur.execute(\"CREATE INDEX IF NOT EXISTS idx_user_notifications_uid_created ON public.user_notifications(uid, created_at DESC)\")
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_uid_created ON public.user_notifications(uid, created_at DESC)")
