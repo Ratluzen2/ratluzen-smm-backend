@@ -1,5 +1,23 @@
 from fastapi import Header, HTTPException
 
+# ---- UI key normalization to tolerate Arabic variants/spaces ----
+def _normalize_ui_key(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    try:
+        import unicodedata
+        t = unicodedata.normalize("NFKC", str(s)).strip().lower()
+    except Exception:
+        t = str(s).strip().lower()
+    repl = {"أ":"ا","إ":"ا","آ":"ا","ى":"ي","ئ":"ي","ؤ":"و","ة":"ه","ـ":""}
+    out = []
+    for ch in t:
+        out.append(repl.get(ch, ch))
+    t = "".join(out)
+    for ch in [" ", "\u200f","\u200e","\u202a","\u202b","\u202c","\u202d","\u202e","\t","\n","\r","-","_",".",","]:
+        t = t.replace(ch, "")
+    return t
+
 
 # === Safety: prevent negative balances on deduct ===
 def _can_deduct(balance: float, amount: float) -> bool:
@@ -781,10 +799,28 @@ def _create_provider_order_core(cur, uid: str, service_id: Optional[int], servic
     try:
         rowp = None
         if service_name:
+            # exact match
             cur.execute("SELECT price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (service_name,))
             rowp = cur.fetchone()
 
-        # compute price based on mode
+        # normalization fallback on ui_key
+        if not rowp and service_name:
+            cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides")
+            allp = cur.fetchall() or []
+            sn = _normalize_ui_key(service_name)
+            for ui_key, ppk, mn, mx, mode in allp:
+                if _normalize_ui_key(ui_key) == sn:
+                    rowp = (ppk, mn, mx, mode)
+                    break
+
+        # fallback by service_id mapping if present
+        if not rowp and service_id:
+            try:
+                cur.execute("SELECT p.price_per_k, p.min_qty, p.max_qty, COALESCE(p.mode,'per_k') FROM public.service_id_overrides s JOIN public.service_pricing_overrides p ON p.ui_key = s.ui_key WHERE s.service_id=%s", (int(service_id),))
+                rowp = cur.fetchone()
+            except Exception:
+                pass
+
         if rowp:
             ppk = float(rowp[0]); mn = int(rowp[1]); mx = int(rowp[2]); mode = (rowp[3] or 'per_k')
             if mode == 'flat':
@@ -814,10 +850,9 @@ def _create_provider_order_core(cur, uid: str, service_id: Optional[int], servic
                             raise HTTPException(400, f"quantity out of allowed range [{mn}-{mx}]")
                         eff_price = float(Decimal(quantity) * Decimal(ppk) / Decimal(1000))
     except Exception:
-        # keep original price if anything fails
         pass
 
-    # charge if paid (use effective price)
+    # charge if paid# charge if paid (use effective price)
     if eff_price and eff_price > 0:
         if bal < eff_price:
             raise HTTPException(400, "insufficient balance")
@@ -2423,9 +2458,11 @@ def public_pricing_version():
 def public_pricing_bulk(keys: str):
     if not keys:
         return {"map": {}, "keys": []}
-    key_list = [k.strip() for k in keys.split(",") if k.strip()]
-    if not key_list:
+    key_list_raw = [k.strip() for k in keys.split(",") if k.strip()]
+    if not key_list_raw:
         return {"map": {}, "keys": []}
+    # prepare normalized variants
+    norm_map = {k: _normalize_ui_key(k) for k in key_list_raw}
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -2434,6 +2471,7 @@ def public_pricing_bulk(keys: str):
                 _ensure_pricing_mode_column(cur)
             except Exception:
                 pass
+            # Exact matches first
             cur.execute(
                 """
                 SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'),
@@ -2441,21 +2479,46 @@ def public_pricing_bulk(keys: str):
                 FROM public.service_pricing_overrides
                 WHERE ui_key = ANY(%s)
                 """,
-                (key_list,)
+                (key_list_raw,)
             )
             rows = cur.fetchall() or []
+            by_ui = {ui_key: (ui_key, price_per_k, min_qty, max_qty, mode, updated_ms) for ui_key, price_per_k, min_qty, max_qty, mode, updated_ms in rows}
+
+            # normalization fallback
+            missing = [k for k in key_list_raw if k not in by_ui]
+            if missing:
+                cur.execute(
+                    """
+                    SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'),
+                           EXTRACT(EPOCH FROM COALESCE(updated_at, NOW()))*1000 AS updated_at
+                    FROM public.service_pricing_overrides
+                    """
+                )
+                all_rows = cur.fetchall() or []
+                by_norm = {_normalize_ui_key(ui_key): (ui_key, price_per_k, min_qty, max_qty, mode, updated_ms)
+                           for ui_key, price_per_k, min_qty, max_qty, mode, updated_ms in all_rows}
+                for mk in missing:
+                    nk = norm_map.get(mk)
+                    if nk and nk in by_norm:
+                        ui_key, price_per_k, min_qty, max_qty, mode, updated_ms = by_norm[nk]
+                        by_ui[mk] = (ui_key, price_per_k, min_qty, max_qty, mode, updated_ms)
+
             out = {}
-            for ui_key, price_per_k, min_qty, max_qty, mode, updated_ms in rows:
-                out[ui_key] = {
-                    "price_per_k": float(price_per_k) if price_per_k is not None else None,
-                    "min_qty": int(min_qty) if min_qty is not None else None,
-                    "max_qty": int(max_qty) if max_qty is not None else None,
-                    "mode": mode or "per_k",
-                    "updated_at": int(updated_ms or 0)
-                }
-            return {"map": out, "keys": key_list}
+            for original in key_list_raw:
+                row = by_ui.get(original)
+                if row:
+                    (_k, price_per_k, min_qty, max_qty, mode, updated_ms) = row
+                    out[original] = {
+                        "price_per_k": float(price_per_k) if price_per_k is not None else None,
+                        "min_qty": int(min_qty) if min_qty is not None else None,
+                        "max_qty": int(max_qty) if max_qty is not None else None,
+                        "mode": mode or "per_k",
+                        "updated_at": int(updated_ms or 0)
+                    }
+            return {"map": out, "keys": key_list_raw}
     finally:
         put_conn(conn)
+
 
 # =========================
 # Per-order pricing override (PUBG/Ludo only)
