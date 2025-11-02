@@ -1,3 +1,5 @@
+from __future__ import annotations
+from typing import Optional
 from fastapi import Header, HTTPException
 
 # ---- UI key normalization to tolerate Arabic variants/spaces ----
@@ -3264,4 +3266,3 @@ def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple]
         logger.info("pricing.change.notify ui_key=%s tokens=%d sent=%d", ui_key, len(tokens), sent)
     except Exception as e:
         logger.exception("notify pricing change failed: %s", e)
-
