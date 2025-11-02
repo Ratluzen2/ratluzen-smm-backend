@@ -80,37 +80,8 @@ def get_conn() -> psycopg2.extensions.connection:
     return conn
 
 def put_conn(conn: psycopg2.extensions.connection) -> None:
-    try:
-        if conn is not None:
-            dbpool.putconn(conn, close=False)
-    except Exception:
-        try:
-            conn.close()
-        except Exception:
-            pass
+    dbpool.putconn(conn)
 
-def _prune_bad_fcm_token(bad_token: str):
-    """
-    Remove invalid/blocked FCM token from user_devices and users.fcm_token (if matches).
-    Safe to call from anywhere; opens its own DB connection.
-    """
-    if not bad_token:
-        return
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            try:
-                cur.execute("DELETE FROM public.user_devices WHERE fcm_token=%s", (bad_token,))
-            except Exception:
-                pass
-            try:
-                cur.execute("UPDATE public.users SET fcm_token=NULL WHERE fcm_token=%s", (bad_token,))
-            except Exception:
-                pass
-    except Exception as e:
-        logger.exception("prune_bad_fcm_token failed: %s", e)
-    finally:
-        put_conn(conn)
 # =========================
 # Logging
 # =========================
@@ -163,18 +134,15 @@ def _fcm_get_access_token_v1(sa_info: dict) -> Optional[str]:
     return None
 
 def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int], sa_info: dict, project_id: Optional[str] = None):
-    """
-    Send using FCM HTTP v1. On invalid/blocked tokens, prune them from DB.
-    """
     try:
         access_token = _fcm_get_access_token_v1(sa_info)
         if not access_token:
             logger.warning("FCM v1: could not obtain access token")
-            return False
+            return
         pid = project_id or sa_info.get("project_id")
         if not pid:
             logger.warning("FCM v1: missing project_id")
-            return False
+            return
         url = f"https://fcm.googleapis.com/v1/projects/{pid}/messages:send"
         message = {
             "message": {
@@ -191,81 +159,44 @@ def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int],
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json"
         }, json=message, timeout=10)
-
-        if resp.status_code in (200, 201):
-            return True
-
-        # Try to detect unregistered/invalid tokens and prune
-        try:
-            ej = resp.json().get("error", {})
-        except Exception:
-            ej = {}
-        status = str(ej.get("status") or "").upper()
-        message_txt = str(ej.get("message") or "")
-        if resp.status_code in (400, 404) or status in ("INVALID_ARGUMENT", "NOT_FOUND"):
-            if ("Requested entity was not found" in message_txt) or ("Invalid registration token" in message_txt) or ("UNREGISTERED" in message_txt.upper()):
-                _prune_bad_fcm_token(fcm_token)
-        logger.warning("FCM v1 send failed (%s): %s", resp.status_code, resp.text[:300])
-        return False
+        if resp.status_code not in (200, 201):
+            logger.warning("FCM v1 send failed (%s): %s", resp.status_code, resp.text[:300])
     except Exception as ex:
         logger.exception("FCM v1 send exception: %s", ex)
-        return False
 
 def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[int], server_key: str):
-    """
-    Send using Legacy HTTP API. If response indicates an invalid/blocked token, prune it.
-    """
     try:
         headers = {
             "Authorization": f"key={server_key}",
             "Content-Type": "application/json"
         }
-        payload = {
-            "to": fcm_token,
-            "priority": "high",
-            "notification": {"title": title, "body": body},
-            "data": {"title": title, "body": body, "order_id": str(order_id or "")}
+        payload = {"to": fcm_token, "priority": "high", "notification": {"title": title, "body": body}, "data": {
+                "title": title,
+                "body": body,
+                "order_id": str(order_id or ""),
+            }
         }
         resp = requests.post("https://fcm.googleapis.com/fcm/send", headers=headers, json=payload, timeout=10)
         if resp.status_code not in (200, 201):
             logger.warning("FCM legacy send failed (%s): %s", resp.status_code, resp.text[:300])
-            return False
-        # Parse per-result errors
-        try:
-            obj = resp.json()
-        except Exception:
-            obj = {}
-        try:
-            results = obj.get("results") or []
-            if results and isinstance(results, list):
-                err = results[0].get("error")
-                if err in ("NotRegistered", "InvalidRegistration", "MismatchSenderId"):
-                    _prune_bad_fcm_token(fcm_token)
-                    return False
-        except Exception:
-            pass
-        return True
     except Exception as ex:
         logger.exception("FCM legacy send exception: %s", ex)
-        return False
 
 def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Optional[int]):
-    """
-    Wrapper that prefers v1; prunes invalid tokens automatically.
-    """
     if not fcm_token:
-        return False
+        return
+    # Prefer v1 via Service Account JSON stored in env
     sa_json = (GOOGLE_APPLICATION_CREDENTIALS_JSON or "").strip()
     if sa_json:
         try:
             info = json.loads(sa_json)
-            return _fcm_send_v1(fcm_token, title, body, order_id, info, project_id=(FCM_PROJECT_ID or None))
+            _fcm_send_v1(fcm_token, title, body, order_id, info, project_id=(FCM_PROJECT_ID or None))
+            return
         except Exception as e:
             logger.info("Invalid GOOGLE_APPLICATION_CREDENTIALS_JSON: %s", e)
+    # Fallback to legacy if configured
     if FCM_SERVER_KEY:
-        return _fcm_send_legacy(fcm_token, title, body, order_id, FCM_SERVER_KEY)
-    logger.warning("FCM not configured: missing credentials")
-    return False
+        _fcm_send_legacy(fcm_token, title, body, order_id, FCM_SERVER_KEY)
 
 # =========================
 # Schema & Triggers
@@ -2338,30 +2269,12 @@ def _ensure_pricing_bumps(cur):
     except Exception:
         pass
 
-def _bump_pricing_version(*args):
-    """Bump pricing version. Compatible with two usages:
-    - _bump_pricing_version()            -> updates meta + inserts bump row
-    - _bump_pricing_version(cur)         -> inserts bump row using provided cursor
-    """
+def _bump_pricing_version(cur):
     try:
-        if args:
-            cur = args[0]
-            _ensure_pricing_bumps(cur)
-            cur.execute("INSERT INTO public.pricing_bumps DEFAULT VALUES")
-            return
-        # No-arg path: open connection and update meta + bumps
-        conn = get_conn()
-        try:
-            with conn, conn.cursor() as cur:
-                _ensure_pricing_meta_table(cur)
-                cur.execute("UPDATE public.service_pricing_meta SET updated_at = NOW() WHERE id = 1")
-                _ensure_pricing_bumps(cur)
-                cur.execute("INSERT INTO public.pricing_bumps DEFAULT VALUES")
-        finally:
-            put_conn(conn)
+        _ensure_pricing_bumps(cur)
+        cur.execute("INSERT INTO public.pricing_bumps DEFAULT VALUES")
     except Exception:
         pass
-
 
 @app.get("/api/admin/pricing/list")
 def admin_list_pricing(
