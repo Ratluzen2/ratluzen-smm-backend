@@ -2207,46 +2207,91 @@ def admin_set_pricing(
 ):
     _require_admin(x_admin_password or password or "")
     if not body.ui_key or body.price_per_k is None or body.min_qty is None or body.max_qty is None:
-        raise HTTPException(422, "invalid payload")
+        raise HTTPException(status_code=422, detail="invalid payload")
     if body.min_qty < 0 or body.max_qty < body.min_qty:
-        raise HTTPException(422, "invalid range")
+        raise HTTPException(status_code=422, detail="invalid range")
+
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             _ensure_pricing_table(cur)
             _ensure_pricing_mode_column(cur)
+
+            # BEFORE snapshot
             cur.execute("""
-                INSERT INTO public.service_pricing_overrides(ui_key, price_per_k, min_qty, max_qty, mode, updated_at)
-                VALUES(%s,%s,%s,%s,COALESCE(%s,'per_k'), now())
-                ON CONFLICT (ui_key) DO UPDATE SET price_per_k=EXCLUDED.price_per_k, min_qty=EXCLUDED.min_qty, max_qty=EXCLUDED.max_qty, mode=COALESCE(EXCLUDED.mode,'per_k'), updated_at=now()
-            """, (body.ui_key, Decimal(body.price_per_k), int(body.min_qty), int(body.max_qty), (body.mode or 'per_k')))
+                SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), updated_at
+                FROM public.service_pricing_overrides
+                WHERE ui_key=%s
+            """, (body.ui_key,))
+            _before = cur.fetchone()
+
+            # UPSERT
+            cur.execute("""
+                INSERT INTO public.service_pricing_overrides
+                    (ui_key, price_per_k, min_qty, max_qty, mode, updated_at)
+                VALUES
+                    (%s, %s, %s, %s, COALESCE(%s,'per_k'), now())
+                ON CONFLICT (ui_key) DO UPDATE SET
+                    price_per_k = EXCLUDED.price_per_k,
+                    min_qty     = EXCLUDED.min_qty,
+                    max_qty     = EXCLUDED.max_qty,
+                    mode        = COALESCE(EXCLUDED.mode, 'per_k'),
+                    updated_at  = now()
+            """, (
+                body.ui_key,
+                Decimal(str(body.price_per_k)),
+                int(body.min_qty),
+                int(body.max_qty),
+                (body.mode or 'per_k'),
+            ))
+
+            # AFTER snapshot
+            cur.execute("""
+                SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), updated_at
+                FROM public.service_pricing_overrides
+                WHERE ui_key=%s
+            """, (body.ui_key,))
+            _after = cur.fetchone()
+
+        # notify (in-app + FCM)
+        _notify_pricing_change_via_tokens(conn, body.ui_key, _before, _after)
         return {"ok": True}
     finally:
         put_conn(conn)
-
 @app.post("/api/admin/pricing/clear")
 def admin_clear_pricing(
-    body: PricingIn,
+    body: PricingClearIn,
     x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
     password: Optional[str] = None
 ):
     _require_admin(x_admin_password or password or "")
     if not body.ui_key:
-        raise HTTPException(422, "invalid payload")
+        raise HTTPException(status_code=422, detail="invalid payload")
+
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             _ensure_pricing_table(cur)
-            _ensure_pricing_mode_column(cur)
-            cur.execute("DELETE FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+
+            # BEFORE snapshot
+            cur.execute("""
+                SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), updated_at
+                FROM public.service_pricing_overrides
+                WHERE ui_key=%s
+            """, (body.ui_key,))
+            _before = cur.fetchone()
+
+            # DELETE
+            cur.execute("""
+                DELETE FROM public.service_pricing_overrides
+                WHERE ui_key=%s
+            """, (body.ui_key,))
+
+        # notify (before exists, after is None)
+        _notify_pricing_change_via_tokens(conn, body.ui_key, _before, None)
         return {"ok": True}
     finally:
         put_conn(conn)
-
-
-# ------------------------------
-# Public pricing (read-only for clients)
-# ------------------------------
 @app.get("/api/public/pricing/version")
 def public_pricing_version():
     conn = get_conn()
