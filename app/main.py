@@ -3234,48 +3234,77 @@ def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple]
             return "api"
 
         def _svc_name_ar(ps):
-    # ps = list of ui_key tokens (lowercased)
-    t = " ".join(ps)
-    def has(*keys): 
-        return any(k in t for k in keys)
+            # Arabic/English heuristics to mirror UI service labels for API services
+            cat = _svc_cat(ps)
+            # Manual categories keep their fixed names
+            if cat == "itunes": return "آيتونز"
+            if cat == "phone":
+                if "atheer" in ps:   return "أثير"
+                if "asiacell" in ps: return "آسيا سيل"
+                if "korek" in ps:    return "كورك"
+                if "zain" in ps:     return "زين"
+                return "رصيد"
+            if cat == "pubg": return "ببجي"
+            if cat == "ludo_dia": return "ألماس لودو"
+            if cat == "ludo_gold": return "ذهب لودو"
+            if cat == "ludo": return "لودو"
 
-    # Platform detection
-    platform = None
-    if has("tiktok", "تيك", "تيكتوك"): platform = "تيكتوك"
-    elif has("instagram", "insta", "انستا", "ig"): platform = "انستا"
-    elif has("youtube", "يوتيوب", "yt"): platform = "يوتيوب"
-    elif has("telegram", "تيليجرام", "تلجرام", "تليجرام", "tg"): platform = "تيليجرام"
-    elif has("twitter", "x_","x-", "x.", "xapp", "تويتر"): platform = "تويتر"
-    elif has("facebook", "fb", "فيس"): platform = "فيسبوك"
-    elif has("snapchat", "snap", "سناب"): platform = "سناب"
-    elif has("kwai", "كواي"): platform = "كواي"
-    elif has("likee", "لايكي"): platform = "لايكي"
+            # API: build a nicer Arabic name from tokens
+            s = " ".join(ps).lower()
+            # platform detection
+            is_tt = any(k in s for k in ["tiktok","tik","تيكتوك","تيك توك","تيك"])
+            is_ig = any(k in s for k in ["instagram","insta","انستا","انستغرام","انستجرام"])
+            is_tg = any(k in s for k in ["telegram","teleg","tg","تيليجرام","تلجرام","تلي"])
+            is_yt = any(k in s for k in ["youtube","يوتيوب","يوتوب"])
 
-    # Metric detection
-    if has("follower", "followers", "subs", "subscriber", "subscrip"):
-        return f"متابعين {platform or ''}".strip()
-    if has("like", "likes"):
-        return f"لايكات {platform or ''}".strip()
-    if has("view", "views", "play", "plays"):
-        # live / livestream views
-        if has("live", "livestream", "broadcast", "البث", "مباشر"):
-            return f"مشاهدات البث المباشر {platform or ''}".strip()
-        return f"مشاهدات {platform or ''}".strip()
-    if has("comment", "comments"):
-        return f"تعليقات {platform or ''}".strip()
-    if has("save", "saves"):
-        return f"حفظ {platform or ''}".strip()
-    if has("reaction", "reactions"):
-        return f"تفاعلات {platform or ''}".strip()
-    if has("member", "members", "join"):
-        # Common for Telegram
-        if platform == "تيليجرام":
-            return "أعضاء تيليجرام"
+            plat = None
+            if is_tt: plat = "تيكتوك"
+            elif is_ig: plat = "انستغرام"
+            elif is_tg: plat = "تليجرام"
+            elif is_yt: plat = "يوتيوب"
 
-    # Fallbacks
-    if platform:
-        return f"خدمات {platform}"
-    return "خدمة"
+            # service types
+            is_follow = any(k in s for k in ["followers","follower","subs","متابع","متابعين"])
+            is_like   = any(k in s for k in ["likes","like","لايك","لايكات"])
+            is_view   = any(k in s for k in ["views","view","مشاهد","مشاهدات"])
+            is_live   = any(k in s for k in ["live","broadcast","stream","بث"])
+            is_score  = any(k in s for k in ["score","سكور"])
+            is_member = any(k in s for k in ["members","member","اعضاء","أعضاء"])
+            is_chan   = any(k in s for k in ["channel","قناة","قناه"])
+            is_group  = any(k in s for k in ["group","كروب","كروبات"])
+
+            # special cases
+            if is_score and is_live:
+                return "رفع سكور البث"
+            if is_score:
+                return "رفع السكور"
+
+            if is_tg and is_member:
+                if is_chan and not is_group:
+                    return "اعضاء قنوات تليجرام"
+                if is_group and not is_chan:
+                    return "اعضاء كروبات تليجرام"
+                return "اعضاء تليجرام"
+
+            if is_live and is_view:
+                if plat == "تيكتوك": return "مشاهدات بث تيكتوك"
+                if plat == "انستغرام": return "مشاهدات بث انستا"
+                return "مشاهدات البث المباشر"
+
+            if is_follow and plat: return f"متابعين {plat}"
+            if is_like and plat:   return f"لايكات {plat}"
+            if is_view and plat:   return f"مشاهدات {plat}"
+
+            if plat:
+                return f"خدمات {plat}"
+
+            # fallback: if Arabic tokens exist in key, show them; else generic
+            raw = " ".join(ps).replace("_", " ").replace(".", " ")
+            import re as _re
+            raw = _re.sub(r"\s+", " ", raw).strip()
+            if _re.search(r"[\u0600-\u06FF]", raw):
+                return raw
+            return "خدمة"
 
         def _first_digits(ps):
             for p in reversed(ps):
@@ -3372,53 +3401,3 @@ def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple]
         logger.info("pricing.change.notify ui_key=%s tokens=%d sent=%d", ui_key, len(tokens), sent)
     except Exception as e:
         logger.exception("notify pricing change failed: %s", e)
-
-def _svc_name_ar(parts: list[str]) -> str:
-    """Return a nice Arabic name for API services based on ui_key tokens."""
-    ps = [str(p).lower() for p in parts]
-    t = " ".join(ps)
-
-    def has(*keys: str) -> bool:
-        return any(k in t for k in keys)
-
-    platform = None
-    if has("tiktok", "تيك", "تيكتوك"):
-        platform = "تيكتوك"
-    elif has("instagram", "insta", "انستا", "ig"):
-        platform = "انستا"
-    elif has("youtube", "يوتيوب", "yt"):
-        platform = "يوتيوب"
-    elif has("telegram", "تيليجرام", "تلجرام", "تليجرام", "tg"):
-        platform = "تيليجرام"
-    elif has("twitter", "x_", "x-", "x.", "xapp", "تويتر"):
-        platform = "تويتر"
-    elif has("facebook", "fb", "فيس"):
-        platform = "فيسبوك"
-    elif has("snapchat", "snap", "سناب"):
-        platform = "سناب"
-    elif has("kwai", "كواي"):
-        platform = "كواي"
-    elif has("likee", "لايكي"):
-        platform = "لايكي"
-
-    if has("follower", "followers", "subs", "subscriber"):
-        return f"متابعين {platform or ''}".strip()
-    if has("like", "likes"):
-        return f"لايكات {platform or ''}".strip()
-    if has("view", "views", "play", "plays"):
-        if has("live", "livestream", "broadcast", "البث", "مباشر"):
-            return f"مشاهدات البث المباشر {platform or ''}".strip()
-        return f"مشاهدات {platform or ''}".strip()
-    if has("comment", "comments"):
-        return f"تعليقات {platform or ''}".strip()
-    if has("save", "saves"):
-        return f"حفظ {platform or ''}".strip()
-    if has("reaction", "reactions"):
-        return f"تفاعلات {platform or ''}".strip()
-    if has("member", "members", "join"):
-        if platform == "تيليجرام":
-            return "أعضاء تيليجرام"
-
-    if platform:
-        return f"خدمات {platform}"
-    return "خدمة"
