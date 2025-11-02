@@ -177,6 +177,148 @@ def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Op
     if FCM_SERVER_KEY:
         _fcm_send_legacy(fcm_token, title, body, order_id, FCM_SERVER_KEY)
 
+
+def _fcm_send_topic_v1(topic: str, title: str, body: str, data: dict, sa_info: dict, project_id: Optional[str] = None):
+    try:
+        access_token = _fcm_get_access_token_v1(sa_info)
+        if not access_token:
+            logger.warning("FCM v1 topic: could not obtain access token")
+            return
+        pid = project_id or sa_info.get("project_id")
+        if not pid:
+            logger.warning("FCM v1 topic: missing project_id")
+            return
+        url = f"https://fcm.googleapis.com/v1/projects/{pid}/messages:send"
+        message = {
+            "message": {
+                "topic": topic,
+                "notification": {"title": title, "body": body},
+                "data": {k: str(v) for k,v in (data or {}).items()}
+            }
+        }
+        resp = requests.post(url, headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }, json=message, timeout=10)
+        if resp.status_code not in (200, 201):
+            logger.warning("FCM v1 topic send failed (%s): %s", resp.status_code, resp.text[:300])
+    except Exception as ex:
+        logger.exception("FCM v1 topic send exception: %s", ex)
+
+def _fcm_send_topic_legacy(topic: str, title: str, body: str, data: dict, server_key: str):
+    try:
+        headers = {
+            "Authorization": f"key={server_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "to": f"/topics/{topic}",
+            "priority": "high",
+            "notification": {"title": title, "body": body},
+            "data": {k: str(v) for k,v in (data or {}).items()}
+        }
+        resp = requests.post("https://fcm.googleapis.com/fcm/send", headers=headers, json=payload, timeout=10)
+        if resp.status_code not in (200, 201):
+            logger.warning("FCM legacy topic send failed (%s): %s", resp.status_code, resp.text[:300])
+    except Exception as ex:
+        logger.exception("FCM legacy topic send exception: %s", ex)
+
+def _fcm_send_topic(topic: str, title: str, body: str, data: Optional[dict] = None):
+    data = data or {}
+    # Prefer v1 via Service Account JSON stored in env
+    sa_json = (GOOGLE_APPLICATION_CREDENTIALS_JSON or "").strip()
+    if sa_json:
+        try:
+            info = json.loads(sa_json)
+            _fcm_send_topic_v1(topic, title, body, data, info, project_id=(FCM_PROJECT_ID or None))
+            return
+        except Exception as e:
+            logger.info("Invalid GOOGLE_APPLICATION_CREDENTIALS_JSON for topic: %s", e)
+    # Fallback to legacy if configured
+    if FCM_SERVER_KEY:
+        _fcm_send_topic_legacy(topic, title, body, data, FCM_SERVER_KEY)
+
+def _fcm_broadcast_all(title: str, body: str, data: Optional[dict] = None) -> int:
+    """Send to all distinct user device tokens (no client changes required). Returns count sent."""
+    data = data or {}
+    c = get_conn()
+    sent = 0
+    try:
+        with c, c.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT d.fcm_token
+                FROM public.user_devices d
+                WHERE d.fcm_token IS NOT NULL AND d.fcm_token <> ''
+            """)
+            toks = [r[0] for r in (cur.fetchall() or []) if r and r[0]]
+        for t in toks:
+            try:
+                _fcm_send_push(t, title, body, data)
+                sent += 1
+            except Exception:
+                pass
+        return sent
+    finally:
+        put_conn(c)
+
+def _pricing_topic_for_key(ui_key: str) -> str:
+    k = (ui_key or "").lower()
+    if k.startswith("topup.itunes"):
+        return "pricing_itunes"
+    if k.startswith("topup.") and any(x in k for x in ("asiacell","korek","atheer")):
+        return "pricing_phone"
+    if ("pubg" in k) or ("bgmi" in k) or ("uc" in k) or k == "cat.pubg":
+        return "pricing_pubg"
+    if ("ludo" in k) or k == "cat.ludo":
+        return "pricing_ludo"
+    return "pricing_all"
+
+def _notify_pricing_change(ui_key: str, before: Optional[tuple], after: Optional[tuple]) -> None:
+    """Compose Arabic message and notify users. before/after are rows:
+       (ui_key, price_per_k, min_qty, max_qty, mode, updated_at_ms)
+    """
+    try:
+        topic = _pricing_topic_for_key(ui_key)
+        def row_to_dict(r):
+            if not r: return None
+            return {
+                "price_per_k": float(r[1]),
+                "min_qty": int(r[2]),
+                "max_qty": int(r[3]),
+                "mode": (r[4] or "per_k")
+            }
+        b = row_to_dict(before)
+        a = row_to_dict(after)
+        title = "تحديث الأسعار"
+        if a and not b:
+            body = f"تم إضافة قاعدة تسعير جديدة: {ui_key} — السعر/ألف: {a['price_per_k']}, المدى: {a['min_qty']}–{a['max_qty']}، النمط: {a['mode']}"
+        elif (not a) and b:
+            body = f"تم حذف قاعدة التسعير: {ui_key}"
+        else:
+            # changed
+            parts = []
+            if b and a:
+                if abs(a['price_per_k'] - b['price_per_k']) > 1e-9:
+                    parts.append(f"السعر/ألف: {b['price_per_k']} → {a['price_per_k']}")
+                if a['min_qty'] != b['min_qty'] or a['max_qty'] != b['max_qty']:
+                    parts.append(f"الكمية: {b['min_qty']}–{b['max_qty']} → {a['min_qty']}–{a['max_qty']}")
+                if a['mode'] != b['mode']:
+                    parts.append(f"النمط: {b['mode']} → {a['mode']}")
+            body = f"{ui_key} — " + (" — ".join(parts) if parts else "تم التحديث")
+        # Data payload (optional for clients)
+        data = {
+            "type": "pricing_change",
+            "ui_key": ui_key,
+            "topic": topic
+        }
+        try:
+            _fcm_send_topic(topic, title, body, data)
+        except Exception:
+            pass
+        # Always ensure delivery even if topics not used: broadcast to all tokens
+        _fcm_broadcast_all(title, body, data)
+    except Exception as e:
+        logger.exception("notify pricing change failed: %s", e)
 # =========================
 # Schema & Triggers
 # =========================
@@ -2811,3 +2953,77 @@ def admin_announcement_delete(aid: int, x_admin_password: str | None = Header(No
         return {"ok": True, "id": aid, "deleted": True}
     finally:
         put_conn(conn)
+
+
+def _label_for_ui_key(ui_key: str):
+    """Return (category, label) from ui_key patterns like:
+       topup.itunes.10, topup.asiacell.5000, topup.korek.10000, topup.zain.10000,
+       topup.pubg.uc.60, topup.ludo.diamonds.100, cat.pubg, cat.ludo
+    """
+    try:
+        k = (ui_key or "").lower()
+        parts = k.split(".")
+        def first_digits(ps):
+            for p in ps[::-1]:
+                if p.isdigit():
+                    return p
+            return None
+
+        # Defaults
+        category = "service"
+        label = ui_key
+
+        if not parts:
+            return category, label
+
+        if parts[0] in ("topup", "cat"):
+            # iTunes
+            if "itunes" in parts:
+                category = "itunes"
+                amt = first_digits(parts)
+                label = f"iTunes ${amt}" if amt else "iTunes"
+                return category, label
+
+            # Phone balance
+            if any(x in parts for x in ("asiacell", "zain", "korek", "atheer")):
+                category = "phone"
+                op_map = {"asiacell": "آسيا سيل", "zain": "زين", "korek": "كورك", "atheer": "أثير"}
+                op = next((x for x in ("asiacell","zain","korek","atheer") if x in parts), None)
+                amt = first_digits(parts)
+                op_name = op_map.get(op, op or "الهاتف")
+                label = f"رصيد {op_name}" + (f" {amt}" if amt else "")
+                return category, label
+
+            # PUBG / BGMI
+            if any(x in parts for x in ("pubg", "bgmi", "uc")):
+                category = "pubg"
+                amt = first_digits(parts)
+                label = f"PUBG UC {amt}" if amt else "PUBG UC"
+                return category, label
+
+            # Ludo
+            if any("ludo" in x for x in parts):
+                category = "ludo"
+                # could be diamonds/gold
+                if "diamonds" in parts:
+                    base = "Ludo Diamonds"
+                elif "gold" in parts:
+                    base = "Ludo Gold"
+                else:
+                    base = "Ludo"
+                amt = first_digits(parts)
+                label = f"{base} {amt}" if amt else base
+                return category, label
+
+        return category, label
+    except Exception:
+        return "service", ui_key or "خدمة"
+
+
+def _fmt_price(v, currency: str = "$"):
+    try:
+        f = float(v)
+        # لا نبالغ بالتنسيق، عرض بسيط
+        return f"{f:g}{currency}"
+    except Exception:
+        return f"{v}{currency}" if v is not None else ""
