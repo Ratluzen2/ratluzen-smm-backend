@@ -2284,6 +2284,34 @@ def admin_clear_pricing(
 # ------------------------------
 # Public pricing (read-only for clients)
 # ------------------------------
+
+@app.post("/api/admin/pricing/clear")
+def admin_clear_pricing(
+    body: PricingClearIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.ui_key:
+        raise HTTPException(422, "invalid payload")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table(cur)
+            try:
+                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, mode FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+                _before = cur.fetchone()
+            except Exception:
+                _before = None
+            cur.execute("DELETE FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+        # commit via context manager
+        try:
+            _notify_pricing_change_via_tokens(conn, body.ui_key, _before, None)
+        except Exception as e:
+            logger.exception("notify after clear failed: %s", e)
+        return {"ok": True}
+    finally:
+        put_conn(conn)
 @app.get("/api/public/pricing/version")
 def public_pricing_version():
     conn = get_conn()
