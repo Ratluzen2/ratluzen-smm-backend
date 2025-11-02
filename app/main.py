@@ -2928,12 +2928,10 @@ def _fmt_price(v, currency: str = "$"):
 
 def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple], after: Optional[tuple]) -> None:
     """
-    ترسل إشعار FCM عربي واضح عند تغيير السعر أو "الكمية" للخدمات اليدوية (ايتونز/أثير/آسيا/كورك)
-    وكذلك مفاتيح التصنيفات (PUBG/Ludo). لا نستخدم صياغة "بالألف" إطلاقاً.
-    أمثلة مطلوبة:
-      - تم تخفيض سعر 5$اثير من 7$ إلى 5$
-      - تم رفع سعر 10$ايتونز من 9$ إلى 10$
-      - تم تغيير كمية اثير من 5$اثير إلى 6$اثير
+    إشعار FCM عربي بصيغة موحّدة لكل الخدمات (آيتونز/أثير/آسيا سيل/كورك/زين/ببجي/لودو):
+    - رفع/تخفيض السعر:  تم رفع/تخفيض سعر {الباقة} من {السعر القديم} الى {السعر الجديد}
+    - تغيير الكمية:      تم تغيير كمية {الباقة القديمة} من {الباقة القديمة} الى {الباقة الجديدة}
+    لا نستخدم "بالألف" إطلاقاً.
     """
     try:
         def as_row_dict(r):
@@ -2955,77 +2953,110 @@ def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple]
             except Exception:
                 return f"{v}$"
 
-        def _first_digits(parts):
-            for p in reversed(parts):
+        parts = (ui_key or "").lower().split(".")
+
+        def _svc_cat(ps):
+            if "itunes" in ps: return "itunes"
+            if any(op in ps for op in ("atheer","asiacell","korek","zain")): return "phone"
+            if any(p in ps for p in ("pubg","bgmi","uc")): return "pubg"
+            if "ludo" in ps:
+                if "diamonds" in ps: return "ludo_dia"
+                if "gold" in ps: return "ludo_gold"
+                return "ludo"
+            return "service"
+
+        def _svc_name_ar(ps):
+            cat = _svc_cat(ps)
+            if cat == "itunes": return "آيتونز"
+            if cat == "phone":
+                if "atheer" in ps:   return "أثير"
+                if "asiacell" in ps: return "آسيا سيل"
+                if "korek" in ps:    return "كورك"
+                if "zain" in ps:     return "زين"
+                return "رصيد"
+            if cat == "pubg": return "ببجي"
+            if cat == "ludo_dia": return "ألماس لودو"
+            if cat == "ludo_gold": return "ذهب لودو"
+            if cat == "ludo": return "لودو"
+            return "خدمة"
+
+        def _first_digits(ps):
+            for p in reversed(ps):
                 if p.isdigit():
                     return int(p)
             return None
 
-        def _svc_ar(parts):
-            if "itunes" in parts:   return "ايتونز"
-            if "atheer" in parts:   return "اثير"
-            if "asiacell" in parts: return "اسياسيل"
-            if "korek" in parts:    return "كورك"
-            if "pubg" in parts or "bgmi" in parts or "uc" in parts: return "ببجي"
-            if "ludo" in parts:
-                if "diamonds" in parts: return "لودو الماس"
-                if "gold" in parts:     return "لودو ذهب"
-                return "لودو"
-            return "خدمة"
+        cat = _svc_cat(parts)
+        svc = _svc_name_ar(parts)
 
-        parts = (ui_key or "").lower().split(".")
-        is_topup = parts and parts[0] == "topup"
-        svc_name = _svc_ar(parts)
-        ui_amt = _first_digits(parts)
+        def pack_for(amount):
+            # يُرجع اسم الباقة بالشكل المطلوب لكل تصنيف
+            if amount is None:
+                return svc
+            if cat in ("itunes","phone"):
+                return f"{amount}$" + svc         # 5$أثير / 10$آيتونز
+            if cat == "pubg":
+                return f"{amount}UC" + svc        # 60UCببجي
+            if cat in ("ludo","ludo_dia","ludo_gold"):
+                return f"{svc} {amount}"          # ألماس لودو 100
+            return f"{amount} " + svc
 
         b = as_row_dict(before)
         a = as_row_dict(after)
 
-        old_amt = (b.get("min_qty") if b else None) or ui_amt
-        new_amt = (a.get("min_qty") if a else None) or ui_amt
+        ui_amt = _first_digits(parts)
+        old_amt = (b.get("min_qty") if b else None)
+        new_amt = (a.get("min_qty") if a else None)
+        if old_amt is None: old_amt = ui_amt
+        if new_amt is None: new_amt = ui_amt
 
         old_price = b.get("price_per_k") if b else None
         new_price = a.get("price_per_k") if a else None
 
-        lines = []
         title = "تحديث التسعير"
+        final_body = None
 
+        # حالة الحذف (عودة للافتراضي)
         if (b and not a):
-            if is_topup and old_amt:
-                pack = f"{old_amt}$" + svc_name
-                final_body = f"تم حذف تعديل سعر {pack} — عادت القيم إلى الافتراضية"
+            if old_amt is not None:
+                final_body = f"تم حذف تعديل سعر {pack_for(old_amt)} — عادت القيم الى الافتراضية"
             else:
-                final_body = f"تم حذف تعديل الأسعار لخدمة {svc_name} — عادت القيم إلى الافتراضية"
+                final_body = f"تم حذف تعديل الأسعار لخدمة {svc} — عادت القيم الى الافتراضية"
 
+        # حالة الإضافة
         elif (a and not b):
-            if is_topup and new_amt is not None and new_price is not None:
-                pack = f"{new_amt}$" + svc_name
-                final_body = f"تم إضافة سعر {pack} = {_fmt_usd(new_price)}"
+            if new_amt is not None and new_price is not None:
+                final_body = f"تم إضافة سعر {pack_for(new_amt)} = {_fmt_usd(new_price)}"
             elif new_price is not None:
-                final_body = f"تم إضافة سعر {svc_name} = {_fmt_usd(new_price)}"
+                final_body = f"تم إضافة سعر {svc} = {_fmt_usd(new_price)}"
             else:
-                final_body = f"تمت إضافة إعدادات جديدة لـ {svc_name}"
+                final_body = f"تمت إضافة إعدادات جديدة لـ {svc}"
 
+        # حالة التعديل
         else:
-            changed_any = False
+            messages = []
+
+            # 1) السعر: رفع/تخفيض
             if old_price is not None and new_price is not None and abs(float(new_price) - float(old_price)) > 1e-9:
-                changed_any = True
                 direction = "رفع" if float(new_price) > float(old_price) else "تخفيض"
-                if is_topup and (new_amt or old_amt):
-                    ref_amt = new_amt if new_amt is not None else (old_amt or ui_amt)
-                    pack = f"{ref_amt}$" + svc_name
-                    lines.append(f"تم {direction} سعر {pack} من {_fmt_usd(old_price)} إلى {_fmt_usd(new_price)}")
+                ref_amt = new_amt if new_amt is not None else old_amt
+                if ref_amt is not None:
+                    messages.append(f"تم {direction} سعر {pack_for(ref_amt)} من {_fmt_usd(old_price)} الى {_fmt_usd(new_price)}")
                 else:
-                    lines.append(f"تم {direction} سعر {svc_name} من {_fmt_usd(old_price)} إلى {_fmt_usd(new_price)}")
+                    messages.append(f"تم {direction} سعر {svc} من {_fmt_usd(old_price)} الى {_fmt_usd(new_price)}")
 
-            if is_topup and (old_amt is not None) and (new_amt is not None) and (int(old_amt) != int(new_amt)):
-                changed_any = True
-                prev_pack = f"{old_amt}$" + svc_name
-                next_pack = f"{new_amt}$" + svc_name
-                lines.append(f"تم تغيير كمية {svc_name} من {prev_pack} إلى {next_pack}")
+            # 2) الكمية: لأي تصنيف (بما فيها PUBG/Ludo)
+            if (old_amt is not None) and (new_amt is not None) and (int(old_amt) != int(new_amt)):
+                prev_pack = pack_for(old_amt)
+                next_pack = pack_for(new_amt)
+                messages.append(f"تم تغيير كمية {prev_pack} من {prev_pack} الى {next_pack}")
 
-            final_body = " — ".join(lines) if (lines and changed_any) else f"{svc_name} — تم التحديث"
+            if messages:
+                final_body = " — ".join(messages)
+            else:
+                final_body = f"{svc} — تم التحديث"
 
+        # إرسال FCM
         with conn.cursor() as cur:
             cur.execute("SELECT DISTINCT d.fcm_token FROM public.user_devices d WHERE d.fcm_token IS NOT NULL AND d.fcm_token <> ''")
             tokens = [r[0] for r in (cur.fetchall() or [])]
@@ -3041,3 +3072,4 @@ def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple]
         logger.info("pricing.change.notify ui_key=%s tokens=%d sent=%d", ui_key, len(tokens), sent)
     except Exception as e:
         logger.exception("notify pricing change failed: %s", e)
+
