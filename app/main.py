@@ -3200,10 +3200,14 @@ def _fmt_price(v, currency: str = "$"):
 
 def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple], after: Optional[tuple]) -> None:
     """
-    إشعار FCM عربي بصيغة موحّدة لكل الخدمات (آيتونز/أثير/آسيا سيل/كورك/زين/ببجي/لودو):
-    - رفع/تخفيض السعر:  تم رفع/تخفيض سعر {الباقة} من {السعر القديم} الى {السعر الجديد}
-    - تغيير الكمية:      تم تغيير كمية {الباقة القديمة} من {الباقة القديمة} الى {الباقة الجديدة}
-    لا نستخدم "بالألف" إطلاقاً.
+    إشعار FCM عربي بصيغة موحّدة لكل الخدمات (آيتونز/أثير/آسيا سيل/كورك/زين/ببجي/لودو/خدمات الـ API):
+      • رفع/تخفيض السعر:  تم رفع/تخفيض سعر {الباقة|الخدمة} من {السعر القديم} الى {السعر الجديد}
+      • تغيير الكمية (للباقات اليدوية مثل آيتونز/الرصيد و PUBG/Ludo):
+         تم تغيير كمية {الباقة القديمة} من {الباقة القديمة} الى {الباقة الجديدة}
+      • تغيير الحدود (للخدمات المرتبطة بالـ API فقط):
+         تم تغيير الحد الأدنى لخدمة {الاسم} من {قديمة} الى {جديدة}
+         تم تغيير الحد الأقصى لخدمة {الاسم} من {قديمة} الى {جديدة}
+    ملاحظة: لا نستخدم عبارة "بالألف" إطلاقاً.
     """
     try:
         def as_row_dict(r):
@@ -3216,15 +3220,6 @@ def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple]
                 "mode": (r[4] or "per_k") if len(r) > 4 else "per_k",
             }
 
-        def _fmt_usd(v):
-            try:
-                f = float(v)
-                if abs(f - round(f)) < 1e-9:
-                    return f"{int(round(f))}$"
-                return f"{f:g}$"
-            except Exception:
-                return f"{v}$"
-
         parts = (ui_key or "").lower().split(".")
 
         def _svc_cat(ps):
@@ -3235,7 +3230,8 @@ def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple]
                 if "diamonds" in ps: return "ludo_dia"
                 if "gold" in ps: return "ludo_gold"
                 return "ludo"
-            return "service"
+            # treat all other keys as API services
+            return "api"
 
         def _svc_name_ar(ps):
             cat = _svc_cat(ps)
@@ -3250,6 +3246,20 @@ def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple]
             if cat == "ludo_dia": return "ألماس لودو"
             if cat == "ludo_gold": return "ذهب لودو"
             if cat == "ludo": return "لودو"
+            # API fallback: try a nicer Arabic label from ui_key tokens
+            # Examples: tiktok_followers -> "متابعين تيكتوك"
+            t = " ".join(ps)
+            if "tiktok" in t: 
+                if "followers" in t or "متابعين" in t: return "متابعين تيكتوك"
+                if "likes" in t or "لايك" in t: return "لايكات تيكتوك"
+                if "views" in t or "مشاهد" in t: return "مشاهدات تيكتوك"
+            if "instagram" in t or "insta" in t or "انستا" in t:
+                if "followers" in t or "متابعين" in t: return "متابعين انستا"
+                if "likes" in t or "لايك" in t: return "لايكات انستا"
+                if "views" in t or "مشاهد" in t: return "مشاهدات انستا"
+            if "telegram" in t or "تيليجرام" in t or "تلجرام" in t: return "خدمات تيليجرام"
+            if "youtube" in t or "يوتيوب" in t: return "خدمات يوتيوب"
+            if "score" in t or "سكور" in t: return "رفع السكور"
             return "خدمة"
 
         def _first_digits(ps):
@@ -3258,84 +3268,78 @@ def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple]
                     return int(p)
             return None
 
-        cat = _svc_cat(parts)
-        svc = _svc_name_ar(parts)
+        def _fmt_usd(v):
+            try:
+                f = float(v)
+                if abs(f - round(f)) < 1e-9:
+                    return f"{int(round(f))}$"
+                return f"{f:g}$"
+            except Exception:
+                return f"{v}$"
 
-        def pack_for(amount):
-            # يُرجع اسم الباقة بالشكل المطلوب لكل تصنيف
+        def pack_for(cat, svc, amount):
             if amount is None:
                 return svc
             if cat in ("itunes","phone"):
-                return f"{amount}$" + svc         # 5$أثير / 10$آيتونز
+                return f"{amount}${svc}"             # 5$أثير / 10$آيتونز
             if cat == "pubg":
-                return f"{amount}UC" + svc        # 60UCببجي
+                return f"{amount}UC{svc}"           # 60UCببجي
             if cat in ("ludo","ludo_dia","ludo_gold"):
-                return f"{svc} {amount}"          # ألماس لودو 100
-            return f"{amount} " + svc
+                return f"{svc} {amount}"            # ألماس لودو 100
+            # api: quantity term not used in messages; limits will be explicit below
+            return svc
 
+        # prepare snapshots
         b = as_row_dict(before)
         a = as_row_dict(after)
-
+        cat = _svc_cat(parts)
+        svc = _svc_name_ar(parts)
         ui_amt = _first_digits(parts)
-        old_amt = (b.get("min_qty") if b else None)
-        new_amt = (a.get("min_qty") if a else None)
-        if old_amt is None: old_amt = ui_amt
-        if new_amt is None: new_amt = ui_amt
+
+        b_min = b.get("min_qty") if b else None
+        b_max = b.get("max_qty") if b else None
+        a_min = a.get("min_qty") if a else None
+        a_max = a.get("max_qty") if a else None
+
+        # For topup keys we store amount in ui_key, also we may use min_qty as amount override
+        if b_min is None: b_min = ui_amt
+        if a_min is None: a_min = ui_amt
 
         old_price = b.get("price_per_k") if b else None
         new_price = a.get("price_per_k") if a else None
 
         title = "تحديث التسعير"
-        final_body = None
+        messages = []
 
-        # حالة الحذف (عودة للافتراضي)
-        if (b and not a):
-            if old_amt is not None:
-                final_body = f"تم حذف تعديل سعر {pack_for(old_amt)} — عادت القيم الى الافتراضية"
+        # 1) السعر: رفع/تخفيض (all categories)
+        if (old_price is not None) and (new_price is not None) and abs(float(new_price) - float(old_price)) > 1e-9:
+            direction = "رفع" if float(new_price) > float(old_price) else "تخفيض"
+            # pick a representative pack for manual categories; API uses service name only
+            if cat in ("itunes","phone","pubg","ludo","ludo_dia","ludo_gold"):
+                ref_amount = a_min if a_min is not None else b_min
+                pack = pack_for(cat, svc, ref_amount)
+                messages.append(f"تم {direction} سعر {pack} من {_fmt_usd(old_price)} الى {_fmt_usd(new_price)}")
             else:
-                final_body = f"تم حذف تعديل الأسعار لخدمة {svc} — عادت القيم الى الافتراضية"
+                messages.append(f"تم {direction} سعر {svc} من {_fmt_usd(old_price)} الى {_fmt_usd(new_price)} لكل الف")
 
-        # حالة الإضافة
-        elif (a and not b):
-            # إذا لا يوجد سطر سابق لكن الخدمة من نوع تعبئة (آيتونز/أثير/آسيا/كورك/زين)،
-            # نفترض السعر الافتراضي يساوي قيمة الباقة بالدولار (مثلاً 10$ -> 10$) ونصيغ رفع/تخفيض.
-            if new_amt is not None and new_price is not None and cat in ("itunes","phone"):
-                base_old = float(new_amt)
-                direction = "رفع" if float(new_price) > base_old else ("تخفيض" if float(new_price) < base_old else None)
-                if direction:
-                    final_body = f"تم {direction} سعر {pack_for(new_amt)} من {_fmt_usd(base_old)} الى {_fmt_usd(new_price)}"
-                else:
-                    final_body = f"تم إضافة سعر {pack_for(new_amt)} = {_fmt_usd(new_price)}"
-            elif new_amt is not None and new_price is not None:
-                final_body = f"تم إضافة سعر {pack_for(new_amt)} = {_fmt_usd(new_price)}"
-            elif new_price is not None:
-                final_body = f"تم إضافة سعر {svc} = {_fmt_usd(new_price)}"
-            else:
-                final_body = f"تمت إضافة إعدادات جديدة لـ {svc}"
-
-        # حالة التعديل
-        else:
-            messages = []
-
-            # 1) السعر: رفع/تخفيض
-            if old_price is not None and new_price is not None and abs(float(new_price) - float(old_price)) > 1e-9:
-                direction = "رفع" if float(new_price) > float(old_price) else "تخفيض"
-                ref_amt = new_amt if new_amt is not None else old_amt
-                if ref_amt is not None:
-                    messages.append(f"تم {direction} سعر {pack_for(ref_amt)} من {_fmt_usd(old_price)} الى {_fmt_usd(new_price)}")
-                else:
-                    messages.append(f"تم {direction} سعر {svc} من {_fmt_usd(old_price)} الى {_fmt_usd(new_price)}")
-
-            # 2) الكمية: لأي تصنيف (بما فيها PUBG/Ludo)
-            if (old_amt is not None) and (new_amt is not None) and (int(old_amt) != int(new_amt)):
-                prev_pack = pack_for(old_amt)
-                next_pack = pack_for(new_amt)
+        # 2) تغيّر "الكمية" للباقات اليدوية فقط (itunes/phone/pubg/ludo)
+        if cat in ("itunes","phone","pubg","ludo","ludo_dia","ludo_gold"):
+            if (b_min is not None) and (a_min is not None) and (int(b_min) != int(a_min)):
+                prev_pack = pack_for(cat, svc, int(b_min))
+                next_pack = pack_for(cat, svc, int(a_min))
                 messages.append(f"تم تغيير كمية {prev_pack} من {prev_pack} الى {next_pack}")
 
-            if messages:
-                final_body = " — ".join(messages)
-            else:
-                final_body = f"{svc} — تم التحديث"
+        # 3) تغيّر الحدود (API فقط): الحد الأدنى/الأقصى
+        if cat == "api":
+            if (b_min is not None) and (a_min is not None) and (int(b_min) != int(a_min)):
+                messages.append(f"تم تغيير الحد الأدنى لخدمة {svc} من {int(b_min)} الى {int(a_min)}")
+            if (b_max is not None) and (a_max is not None) and (int(b_max) != int(a_max)):
+                messages.append(f"تم تغيير الحد الأقصى لخدمة {svc} من {int(b_max)} الى {int(a_max)}")
+
+        if not messages:
+            messages.append(f"{svc} — تم التحديث")
+
+        body = " — ".join(messages)
 
         # إرسال FCM
         with conn.cursor() as cur:
@@ -3345,7 +3349,7 @@ def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple]
         sent = 0
         for t in tokens:
             try:
-                _fcm_send_push(t, title, final_body, None)
+                _fcm_send_push(t, title, body, None)
                 sent += 1
             except Exception as fe:
                 logger.exception("pricing_change FCM send failed: %s", fe)
