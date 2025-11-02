@@ -2215,44 +2215,16 @@ def admin_set_pricing(
         with conn, conn.cursor() as cur:
             _ensure_pricing_table(cur)
             _ensure_pricing_mode_column(cur)
-
-            # BEFORE row snapshot for notification
-            try:
-                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, mode FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
-                _before = cur.fetchone()
-            except Exception:
-                _before = None
-
-            # Upsert the new values
-            cur.execute(
-                """
-                INSERT INTO public.service_pricing_overrides (ui_key, price_per_k, min_qty, max_qty, mode, updated_at)
-                VALUES (%s, %s, %s, %s, COALESCE(%s,'per_k'), now())
-                ON CONFLICT (ui_key)
-                DO UPDATE SET
-                    price_per_k = EXCLUDED.price_per_k,
-                    min_qty     = EXCLUDED.min_qty,
-                    max_qty     = EXCLUDED.max_qty,
-                    mode        = COALESCE(EXCLUDED.mode,'per_k'),
-                    updated_at  = now()
-                """,
-                (body.ui_key, Decimal(body.price_per_k), int(body.min_qty), int(body.max_qty), (body.mode or 'per_k'))
-            )
-
-            # AFTER row for notification
-            try:
-                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, mode FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
-                _after = cur.fetchone()
-            except Exception:
-                _after = None
-
-        # Notify after commit
-        _notify_pricing_change_via_tokens(conn, body.ui_key, _before, _after)
-        return {{"ok": True}}
+            cur.execute("""
+                INSERT INTO public.service_pricing_overrides(ui_key, price_per_k, min_qty, max_qty, mode, updated_at)
+                VALUES(%s,%s,%s,%s,COALESCE(%s,'per_k'), now())
+                ON CONFLICT (ui_key) DO UPDATE SET price_per_k=EXCLUDED.price_per_k, min_qty=EXCLUDED.min_qty, max_qty=EXCLUDED.max_qty, mode=COALESCE(EXCLUDED.mode,'per_k'), updated_at=now()
+            """, (body.ui_key, Decimal(body.price_per_k), int(body.min_qty), int(body.max_qty), (body.mode or 'per_k')))
+        return {"ok": True}
     finally:
         put_conn(conn)
 
-app.post("/api/admin/pricing/clear")
+@app.post("/api/admin/pricing/clear")
 def admin_clear_pricing(
     body: PricingIn,
     x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
@@ -2266,16 +2238,7 @@ def admin_clear_pricing(
         with conn, conn.cursor() as cur:
             _ensure_pricing_table(cur)
             _ensure_pricing_mode_column(cur)
-            # BEFORE row snapshot for notification
-            try:
-                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), EXTRACT(EPOCH FROM updated_at)*1000 FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
-                _before = cur.fetchone()
-            except Exception:
-                _before = None
             cur.execute("DELETE FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
-
-        # Notify after commit
-        _notify_pricing_change_via_tokens(conn, body.ui_key, _before, None)
         return {"ok": True}
     finally:
         put_conn(conn)
@@ -2301,7 +2264,6 @@ def public_pricing_version():
         put_conn(conn)
 
 @app.get("/api/public/pricing/bulk")
-
 def public_pricing_bulk(keys: str):
     if not keys:
         return {"map": {}, "keys": []}
@@ -2316,21 +2278,19 @@ def public_pricing_bulk(keys: str):
                 _ensure_pricing_mode_column(cur)
             except Exception:
                 pass
-            cur.execute("""
-                SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'),
-                       EXTRACT(EPOCH FROM COALESCE(updated_at, NOW()))*1000 AS updated_at
-                FROM public.service_pricing_overrides
-                WHERE ui_key = ANY(%s)
-            """, (key_list,))
+            cur.execute(
+                "SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), EXTRACT(EPOCH FROM updated_at)*1000 FROM public.service_pricing_overrides WHERE ui_key = ANY(%s)",
+                (key_list,)
+            )
             rows = cur.fetchall()
             out = {}
-            for ui_key, price_per_k, min_qty, max_qty, mode, updated_ms in rows:
-                out[ui_key] = {
-                    "price_per_k": float(price_per_k) if price_per_k is not None else None,
-                    "min_qty": int(min_qty) if min_qty is not None else None,
-                    "max_qty": int(max_qty) if max_qty is not None else None,
-                    "mode": mode or "per_k",
-                    "updated_at": int(updated_ms or 0)
+            for r in rows:
+                out[r[0]] = {
+                    "price_per_k": float(r[1]),
+                    "min_qty": int(r[2]),
+                    "max_qty": int(r[3]),
+                    "mode": r[4] or "per_k",
+                    "updated_at": int(r[5] or 0)
                 }
             return {"map": out, "keys": key_list}
     finally:
@@ -2853,134 +2813,16 @@ def admin_announcement_delete(aid: int, x_admin_password: str | None = Header(No
         put_conn(conn)
 
 
-def _label_for_ui_key(ui_key: str):
-    """Return (category, label) from ui_key patterns like:
-       topup.itunes.10, topup.asiacell.5000, topup.korek.10000, topup.zain.10000,
-       topup.pubg.uc.60, topup.ludo.diamonds.100, cat.pubg, cat.ludo
-    """
-    try:
-        k = (ui_key or "").lower()
-        parts = k.split(".")
-        def first_digits(ps):
-            for p in ps[::-1]:
-                if p.isdigit():
-                    return p
-            return None
-
-        # Defaults
-        category = "service"
-        label = ui_key
-
-        if not parts:
-            return category, label
-
-        if parts[0] in ("topup", "cat"):
-            # iTunes
-            if "itunes" in parts:
-                category = "itunes"
-                amt = first_digits(parts)
-                label = f"iTunes ${amt}" if amt else "iTunes"
-                return category, label
-
-            # Phone balance
-            if any(x in parts for x in ("asiacell", "zain", "korek", "atheer")):
-                category = "phone"
-                op_map = {"asiacell": "آسيا سيل", "zain": "زين", "korek": "كورك", "atheer": "أثير"}
-                op = next((x for x in ("asiacell","zain","korek","atheer") if x in parts), None)
-                amt = first_digits(parts)
-                op_name = op_map.get(op, op or "الهاتف")
-                label = f"رصيد {op_name}" + (f" {amt}" if amt else "")
-                return category, label
-
-            # PUBG / BGMI
-            if any(x in parts for x in ("pubg", "bgmi", "uc")):
-                category = "pubg"
-                amt = first_digits(parts)
-                label = f"PUBG UC {amt}" if amt else "PUBG UC"
-                return category, label
-
-            # Ludo
-            if any("ludo" in x for x in parts):
-                category = "ludo"
-                # could be diamonds/gold
-                if "diamonds" in parts:
-                    base = "Ludo Diamonds"
-                elif "gold" in parts:
-                    base = "Ludo Gold"
-                else:
-                    base = "Ludo"
-                amt = first_digits(parts)
-                label = f"{base} {amt}" if amt else base
-                return category, label
-
-        return category, label
-    except Exception:
-        return "service", ui_key or "خدمة"
-
-
-def _fmt_price(v, currency: str = "$"):
-    try:
-        f = float(v)
-        return f"{f:g}{currency}"
-    except Exception:
-        return f"{v}{currency}" if v is not None else ""
-
-
-def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple], after: Optional[tuple]) -> None:
-    """Use existing user_devices tokens to send a rich Arabic notification about pricing change."""
-    try:
-        category, pretty = _label_for_ui_key(ui_key)
-
-        def row_to_dict(r):
-            if not r: return None
-            return {
-                "price_per_k": float(r[1]) if r[1] is not None else None,
-                "min_qty": int(r[2]) if r[2] is not None else None,
-                "max_qty": int(r[3]) if r[3] is not None else None,
-                "mode": (r[4] or "per_k")
-            }
-
-        b = row_to_dict(before)
-        a = row_to_dict(after)
-
-        title = f"تحديث على {pretty}"
-        if a and not b:
-            body = f"تم إضافة تسعير جديد — السعر/ألف: {_fmt_price(a['price_per_k'])} — الكمية: {a['min_qty']}–{a['max_qty']} — النمط: {a['mode']}"
-        elif (not a) and b:
-            body = f"تم حذف تعديل الأسعار — عادت {pretty} إلى القيم الافتراضية"
-        else:
-            changes = []
-            if b and a:
-                if (a['price_per_k'] is not None and b['price_per_k'] is not None) and (abs(a['price_per_k'] - b['price_per_k']) > 1e-9):
-                    changes.append(f"السعر/ألف: {_fmt_price(b['price_per_k'])} → {_fmt_price(a['price_per_k'])}")
-                if (a['min_qty'] is not None and a['max_qty'] is not None and b['min_qty'] is not None and b['max_qty'] is not None) and (a['min_qty'] != b['min_qty'] or a['max_qty'] != b['max_qty']):
-                    changes.append(f"الكمية: {b['min_qty']}–{b['max_qty']} → {a['min_qty']}–{a['max_qty']}")
-                if a['mode'] != b['mode']:
-                    changes.append(f"النمط: {b['mode']} → {a['mode']}")
-            body = " — ".join(changes) if changes else "تم التحديث"
-
-        # Read tokens similar to admin_announcement_create
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT DISTINCT d.fcm_token
-                FROM public.user_devices d
-                WHERE d.fcm_token IS NOT NULL AND d.fcm_token <> ''
-            """)
-            tokens = [r[0] for r in cur.fetchall() or []]
-
-        sent = 0
-        for t in tokens:
-            try:
-                _fcm_send_push(t, title, f"{pretty} — {body}", {
-                    "type": "pricing_change",
-                    "category": category,
-                    "ui_key": ui_key,
-                    "serviceLabel": pretty
-                })
-                sent += 1
-            except Exception as fe:
-                logger.exception("pricing_change FCM send failed: %s", fe)
-
-        logger.info("pricing.change.notify ui_key=%s tokens=%d sent=%d", ui_key, len(tokens), sent)
-    except Exception as e:
-        logger.exception("notify pricing change failed: %s", e)
+def _ensure_user_notifications_table(cur):
+    cur.execute(\"\"\"
+        CREATE TABLE IF NOT EXISTS public.user_notifications(
+            id BIGSERIAL PRIMARY KEY,
+            uid TEXT NOT NULL,
+            type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            data JSONB,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    \"\"\")
+    cur.execute(\"CREATE INDEX IF NOT EXISTS idx_user_notifications_uid_created ON public.user_notifications(uid, created_at DESC)\")
