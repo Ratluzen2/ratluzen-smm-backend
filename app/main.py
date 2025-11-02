@@ -2261,12 +2261,12 @@ def admin_set_pricing(
                     updated_at  = now()
                 """,
                 (body.ui_key, Decimal(body.price_per_k), int(body.min_qty), int(body.max_qty), (body.mode or 'per_k'))
-            )\1
+            )
         # bump pricing version so clients refresh cache on next open
         with conn, conn.cursor() as cur:
             _bump_pricing_version(cur)
 
-        \2
+        
         return {{"ok": True}}
     finally:
         put_conn(conn)
@@ -2291,7 +2291,7 @@ def admin_clear_pricing(
                 _before = cur.fetchone()
             except Exception:
                 _before = None
-            \1
+            
             # bump version so app cache refreshes on first open
             _bump_pricing_version(cur)
 
@@ -2335,7 +2335,7 @@ def admin_clear_pricing(
             except Exception:
                 _before = None
             # تنفيذ الحذف
-            \1
+            
             # bump version so app cache refreshes on first open
             _bump_pricing_version(cur)
         # بعد الإتمام: إشعار المستخدمين
@@ -2347,31 +2347,32 @@ def admin_clear_pricing(
     finally:
         put_conn(conn)
 
+
 @app.get("/api/public/pricing/version")
 def public_pricing_version():
-
-conn = get_conn()
-try:
-    with conn, conn.cursor() as cur:
-        _ensure_pricing_table(cur)
-        try:
-            _ensure_pricing_mode_column(cur)
-        except Exception:
-            pass
-        # v_overrides: latest update in service_pricing_overrides
-        cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM MAX(updated_at))*1000, 0) FROM public.service_pricing_overrides")
-        v_overrides = int(cur.fetchone()[0] or 0)
-        # v_bumps: latest bump timestamp
-        try:
-            _ensure_pricing_bumps(cur)
-            cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM MAX(bumped_at))*1000, 0) FROM public.pricing_bumps")
-            v_bumps = int(cur.fetchone()[0] or 0)
-        except Exception:
-            v_bumps = 0
-        v = max(v_overrides, v_bumps)
-        return {"version": int(v)}
-finally:
-    put_conn(conn)
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table(cur)
+            try:
+                _ensure_pricing_mode_column(cur)
+            except Exception:
+                pass
+            try:
+                _ensure_pricing_bumps(cur)
+            except Exception:
+                pass
+            cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM MAX(updated_at))*1000, 0) FROM public.service_pricing_overrides")
+            v_overrides = int((cur.fetchone() or [0])[0] or 0)
+            try:
+                cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM MAX(bumped_at))*1000, 0) FROM public.pricing_bumps")
+                v_bumps = int((cur.fetchone() or [0])[0] or 0)
+            except Exception:
+                v_bumps = 0
+            v = max(v_overrides, v_bumps)
+            return {"version": int(v)}
+    finally:
+        put_conn(conn)
 @app.get("/api/public/pricing/bulk")
 
 def public_pricing_bulk(keys: str):
