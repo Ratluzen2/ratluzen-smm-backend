@@ -2259,7 +2259,74 @@ def admin_list_pricing(
 
 @app.post("/api/admin/pricing/set")
 def admin_set_pricing(
+    body: PricingIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.ui_key or body.price_per_k is None or body.min_qty is None or body.max_qty is None:
+        raise HTTPException(422, "invalid payload")
+    if int(body.min_qty) < 0 or int(body.max_qty) < int(body.min_qty):
+        raise HTTPException(422, "invalid range")
 
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table(cur)
+            try:
+                _ensure_pricing_mode_column(cur)
+            except Exception:
+                pass
+
+            # BEFORE snapshot
+            try:
+                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+                _before = cur.fetchone()
+            except Exception:
+                _before = None
+
+            # Upsert
+            cur.execute(
+                """
+                INSERT INTO public.service_pricing_overrides (ui_key, price_per_k, min_qty, max_qty, mode, updated_at)
+                VALUES (%s, %s, %s, %s, COALESCE(%s,'per_k'), now())
+                ON CONFLICT (ui_key)
+                DO UPDATE SET
+                    price_per_k = EXCLUDED.price_per_k,
+                    min_qty     = EXCLUDED.min_qty,
+                    max_qty     = EXCLUDED.max_qty,
+                    mode        = COALESCE(EXCLUDED.mode,'per_k'),
+                    updated_at  = now()
+                """,
+                (body.ui_key, Decimal(body.price_per_k), int(body.min_qty), int(body.max_qty), (body.mode or 'per_k'))
+            )
+
+            # AFTER snapshot
+            try:
+                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+                _after = cur.fetchone()
+            except Exception:
+                _after = None
+
+        # bump version for client cache refresh (support both unified and cursor-style implementations)
+        try:
+            _bump_pricing_version()
+        except Exception:
+            try:
+                with get_conn() as c:
+                    with c.cursor() as cur:
+                        _bump_pricing_version(cur)  # type: ignore
+            except Exception:
+                pass
+
+        try:
+            _notify_pricing_change_via_tokens(conn, body.ui_key, _before, _after)
+        except Exception as e:
+            logger.exception("notify after set failed: %s", e)
+
+        return {"ok": True}
+    finally:
+        put_conn(conn)
 
 
 @app.post("/api/admin/pricing/clear")
@@ -2276,260 +2343,83 @@ def admin_clear_pricing(
     try:
         with conn, conn.cursor() as cur:
             _ensure_pricing_table(cur)
-            _ensure_pricing_mode_column(cur)
-
             try:
-                cur.execute(
-                    "SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s",
-                    (body.ui_key,)
-                )
+                _ensure_pricing_mode_column(cur)
+            except Exception:
+                pass
+
+            # BEFORE snapshot (for notification)
+            try:
+                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
                 _before = cur.fetchone()
             except Exception:
                 _before = None
 
+            # Delete override
             cur.execute("DELETE FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
 
         # bump version for client cache refresh
-        _bump_pricing_version()
-
         try:
-            _notify_pricing_change_via_tokens(conn, body.ui_key, _before, None)
-        except Exception as e:
-            logger.exception("notify after clear failed: %s", e)
-
-        return {"ok": True}
-    finally:
-        put_conn(conn)
-
-    body: PricingIn,
-    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
-    password: Optional[str] = None
-):
-    _require_admin(x_admin_password or password or "")
-    if not body.ui_key or body.price_per_k is None or body.min_qty is None or body.max_qty is None:
-        raise HTTPException(422, "invalid payload")
-    if body.min_qty < 0 or body.max_qty < body.min_qty:
-        raise HTTPException(422, "invalid range")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            _ensure_pricing_table(cur)
-            _ensure_pricing_mode_column(cur)
-
+            _bump_pricing_version()
+        except Exception:
             try:
-                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode, 'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
-                _before = cur.fetchone()
+                with get_conn() as c:
+                    with c.cursor() as cur:
+                        _bump_pricing_version(cur)  # type: ignore
             except Exception:
-                _before = None
-
-            cur.execute(
-                """
-                INSERT INTO public.service_pricing_overrides (ui_key, price_per_k, min_qty, max_qty, mode, updated_at)
-                VALUES (%s, %s, %s, %s, COALESCE(%s,'per_k'), now())
-                ON CONFLICT (ui_key)
-                DO UPDATE SET
-                    price_per_k = EXCLUDED.price_per_k,
-                    min_qty     = EXCLUDED.min_qty,
-                    max_qty     = EXCLUDED.max_qty,
-                    mode        = COALESCE(EXCLUDED.mode,'per_k'),
-                    updated_at  = now()
-                """,
-                (body.ui_key, Decimal(body.price_per_k), int(body.min_qty), int(body.max_qty), (body.mode or 'per_k'))
-            )
-
-            try:
-                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode, 'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
-                _after = cur.fetchone()
-            except Exception:
-                _after = None
-
-        # bump version for client cache refresh
-        _bump_pricing_version()
-
-        _notify_pricing_change_via_tokens(conn, body.ui_key, _before, _after)
-        return {"ok": True}
-    finally:
-        put_conn(conn)
-
-    body: PricingIn,
-    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
-    password: Optional[str] = None
-):
-    _require_admin(x_admin_password or password or "")
-    if not body.ui_key or body.price_per_k is None or body.min_qty is None or body.max_qty is None:
-        raise HTTPException(422, "invalid payload")
-    if body.min_qty < 0 or body.max_qty < body.min_qty:
-        raise HTTPException(422, "invalid range")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            _ensure_pricing_table(cur)
-            _ensure_pricing_mode_column(cur)
-
-            # BEFORE row snapshot for notification
-            try:
-                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, mode FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
-                _before = cur.fetchone()
-            except Exception:
-                _before = None
-
-            # Upsert the new values
-            cur.execute(
-                """
-                INSERT INTO public.service_pricing_overrides (ui_key, price_per_k, min_qty, max_qty, mode, updated_at)
-                VALUES (%s, %s, %s, %s, COALESCE(%s,'per_k'), now())
-                ON CONFLICT (ui_key)
-                DO UPDATE SET
-                    price_per_k = EXCLUDED.price_per_k,
-                    min_qty     = EXCLUDED.min_qty,
-                    max_qty     = EXCLUDED.max_qty,
-                    mode        = COALESCE(EXCLUDED.mode,'per_k'),
-                    updated_at  = now()
-                """,
-                (body.ui_key, Decimal(body.price_per_k), int(body.min_qty), int(body.max_qty), (body.mode or 'per_k'))
-            )
-        # bump pricing version so clients refresh cache on next open
-        with conn, conn.cursor() as cur:
-            _bump_pricing_version(cur)
-
-        
-        return {"ok": True}
-    finally:
-        put_conn(conn)
-
-
-    body: PricingIn,
-    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
-    password: Optional[str] = None
-):
-    _require_admin(x_admin_password or password or "")
-    if not body.ui_key:
-        raise HTTPException(422, "invalid payload")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            _ensure_pricing_table(cur)
-            _ensure_pricing_mode_column(cur)
-            # BEFORE row snapshot for notification
-            try:
-                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), EXTRACT(EPOCH FROM updated_at)*1000 FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
-                _before = cur.fetchone()
-            except Exception:
-                _before = None
-            
-            # bump version so app cache refreshes on first open
-            _bump_pricing_version(cur)
+                pass
 
         # Notify after commit
-        _notify_pricing_change_via_tokens(conn, body.ui_key, _before, None)
-        return {"ok": True}
-    finally:
-        put_conn(conn)
-
-
-# ------------------------------
-# Public pricing (read-only for clients)
-# ------------------------------
-
-
-
-    body: PricingClearIn,
-    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
-    password: Optional[str] = None
-):
-    """
-    يحذف تعديل التسعير (السعر/الكمية) لواجهة معينة ui_key ويعيدها للافتراضي.
-    يعيد {"ok": True} عند النجاح، ويرسل إشعار FCM عربي للمستخدمين.
-    """
-    _require_admin(x_admin_password or password or "")
-    if not body.ui_key:
-        raise HTTPException(422, "invalid payload")
-
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            _ensure_pricing_table(cur)
-            # الحالة قبل الحذف لأجل الإشعار
-            try:
-                cur.execute(
-                    "SELECT ui_key, price_per_k, min_qty, max_qty, mode FROM public.service_pricing_overrides WHERE ui_key=%s",
-                    (body.ui_key,)
-                )
-                _before = cur.fetchone()
-            except Exception:
-                _before = None
-            # تنفيذ الحذف
-            
-            # bump version so app cache refreshes on first open
-            _bump_pricing_version(cur)
-        # بعد الإتمام: إشعار المستخدمين
         try:
             _notify_pricing_change_via_tokens(conn, body.ui_key, _before, None)
         except Exception as e:
             logger.exception("notify after clear failed: %s", e)
+
         return {"ok": True}
     finally:
         put_conn(conn)
 
 
 @app.get("/api/public/pricing/version")
-
 def public_pricing_version():
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            _ensure_pricing_table(cur)
+            # Ensure tables
+            try:
+                _ensure_pricing_table(cur)
+            except Exception:
+                pass
             try:
                 _ensure_pricing_mode_column(cur)
             except Exception:
                 pass
-            try:
-                _ensure_pricing_meta_table(cur)
-            except Exception:
-                pass
-
+            # Try both meta & bumps styles
+            v_overrides = 0
+            v_meta = 0
+            v_bumps = 0
             try:
                 cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM MAX(updated_at))*1000, 0) FROM public.service_pricing_overrides")
-                v_overrides = int(cur.fetchone()[0] or 0)
+                v_overrides = int((cur.fetchone() or [0])[0] or 0)
             except Exception:
                 v_overrides = 0
-
             try:
                 cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM updated_at)*1000, 0) FROM public.service_pricing_meta WHERE id=1")
-                v_meta = int(cur.fetchone()[0] or 0)
+                v_meta = int((cur.fetchone() or [0])[0] or 0)
             except Exception:
                 v_meta = 0
-
-            v = max(v_overrides, v_meta)
-            return {"version": int(v)}
-    finally:
-        put_conn(conn)
-
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            _ensure_pricing_table(cur)
-            try:
-                _ensure_pricing_mode_column(cur)
-            except Exception:
-                pass
-            try:
-                _ensure_pricing_bumps(cur)
-            except Exception:
-                pass
-            cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM MAX(updated_at))*1000, 0) FROM public.service_pricing_overrides")
-            v_overrides = int((cur.fetchone() or [0])[0] or 0)
             try:
                 cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM MAX(bumped_at))*1000, 0) FROM public.pricing_bumps")
                 v_bumps = int((cur.fetchone() or [0])[0] or 0)
             except Exception:
                 v_bumps = 0
-            v = max(v_overrides, v_bumps)
+            v = max(v_overrides, v_meta, v_bumps)
             return {"version": int(v)}
     finally:
         put_conn(conn)
-@app.get("/api/public/pricing/bulk")
 
+
+@app.get("/api/public/pricing/bulk")
 def public_pricing_bulk(keys: str):
     if not keys:
         return {"map": {}, "keys": []}
@@ -2544,13 +2434,16 @@ def public_pricing_bulk(keys: str):
                 _ensure_pricing_mode_column(cur)
             except Exception:
                 pass
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'),
                        EXTRACT(EPOCH FROM COALESCE(updated_at, NOW()))*1000 AS updated_at
                 FROM public.service_pricing_overrides
                 WHERE ui_key = ANY(%s)
-            """, (key_list,))
-            rows = cur.fetchall()
+                """,
+                (key_list,)
+            )
+            rows = cur.fetchall() or []
             out = {}
             for ui_key, price_per_k, min_qty, max_qty, mode, updated_ms in rows:
                 out[ui_key] = {
@@ -2563,7 +2456,6 @@ def public_pricing_bulk(keys: str):
             return {"map": out, "keys": key_list}
     finally:
         put_conn(conn)
-
 
 # =========================
 # Per-order pricing override (PUBG/Ludo only)
