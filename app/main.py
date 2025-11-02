@@ -2158,6 +2158,10 @@ def admin_clear_service_id(
 # Pricing overrides (server-level)
 # =========================
 class PricingIn(BaseModel):
+
+class PricingClearIn(BaseModel):
+    ui_key: str
+
     ui_key: str
     price_per_k: Optional[float] = None
     min_qty: Optional[int] = None
