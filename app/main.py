@@ -1,3 +1,4 @@
+from fastapi import Header, HTTPException
 
 
 # === Safety: prevent negative balances on deduct ===
@@ -2164,6 +2165,10 @@ class PricingIn(BaseModel):
     max_qty: Optional[int] = None
     mode: Optional[str] = None  # 'per_k' (default) or 'flat'
 
+
+
+class PricingClearIn(BaseModel):
+    ui_key: str
 def _ensure_pricing_table(cur):
     cur.execute("""
         CREATE TABLE IF NOT EXISTS public.service_pricing_overrides(
@@ -2285,26 +2290,37 @@ def admin_clear_pricing(
 # Public pricing (read-only for clients)
 # ------------------------------
 
+
 @app.post("/api/admin/pricing/clear")
 def admin_clear_pricing(
     body: PricingClearIn,
     x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
     password: Optional[str] = None
 ):
+    """
+    يحذف تعديل التسعير (السعر/الكمية) لواجهة معينة ui_key ويعيدها للافتراضي.
+    يعيد {"ok": True} عند النجاح، ويرسل إشعار FCM عربي للمستخدمين.
+    """
     _require_admin(x_admin_password or password or "")
     if not body.ui_key:
         raise HTTPException(422, "invalid payload")
+
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             _ensure_pricing_table(cur)
+            # الحالة قبل الحذف لأجل الإشعار
             try:
-                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, mode FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+                cur.execute(
+                    "SELECT ui_key, price_per_k, min_qty, max_qty, mode FROM public.service_pricing_overrides WHERE ui_key=%s",
+                    (body.ui_key,)
+                )
                 _before = cur.fetchone()
             except Exception:
                 _before = None
+            # تنفيذ الحذف
             cur.execute("DELETE FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
-        # commit via context manager
+        # بعد الإتمام: إشعار المستخدمين
         try:
             _notify_pricing_change_via_tokens(conn, body.ui_key, _before, None)
         except Exception as e:
@@ -2312,6 +2328,7 @@ def admin_clear_pricing(
         return {"ok": True}
     finally:
         put_conn(conn)
+
 @app.get("/api/public/pricing/version")
 def public_pricing_version():
     conn = get_conn()
