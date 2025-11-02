@@ -177,148 +177,6 @@ def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Op
     if FCM_SERVER_KEY:
         _fcm_send_legacy(fcm_token, title, body, order_id, FCM_SERVER_KEY)
 
-
-def _fcm_send_topic_v1(topic: str, title: str, body: str, data: dict, sa_info: dict, project_id: Optional[str] = None):
-    try:
-        access_token = _fcm_get_access_token_v1(sa_info)
-        if not access_token:
-            logger.warning("FCM v1 topic: could not obtain access token")
-            return
-        pid = project_id or sa_info.get("project_id")
-        if not pid:
-            logger.warning("FCM v1 topic: missing project_id")
-            return
-        url = f"https://fcm.googleapis.com/v1/projects/{pid}/messages:send"
-        message = {
-            "message": {
-                "topic": topic,
-                "notification": {"title": title, "body": body},
-                "data": {k: str(v) for k,v in (data or {}).items()}
-            }
-        }
-        resp = requests.post(url, headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        }, json=message, timeout=10)
-        if resp.status_code not in (200, 201):
-            logger.warning("FCM v1 topic send failed (%s): %s", resp.status_code, resp.text[:300])
-    except Exception as ex:
-        logger.exception("FCM v1 topic send exception: %s", ex)
-
-def _fcm_send_topic_legacy(topic: str, title: str, body: str, data: dict, server_key: str):
-    try:
-        headers = {
-            "Authorization": f"key={server_key}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "to": f"/topics/{topic}",
-            "priority": "high",
-            "notification": {"title": title, "body": body},
-            "data": {k: str(v) for k,v in (data or {}).items()}
-        }
-        resp = requests.post("https://fcm.googleapis.com/fcm/send", headers=headers, json=payload, timeout=10)
-        if resp.status_code not in (200, 201):
-            logger.warning("FCM legacy topic send failed (%s): %s", resp.status_code, resp.text[:300])
-    except Exception as ex:
-        logger.exception("FCM legacy topic send exception: %s", ex)
-
-def _fcm_send_topic(topic: str, title: str, body: str, data: Optional[dict] = None):
-    data = data or {}
-    # Prefer v1 via Service Account JSON stored in env
-    sa_json = (GOOGLE_APPLICATION_CREDENTIALS_JSON or "").strip()
-    if sa_json:
-        try:
-            info = json.loads(sa_json)
-            _fcm_send_topic_v1(topic, title, body, data, info, project_id=(FCM_PROJECT_ID or None))
-            return
-        except Exception as e:
-            logger.info("Invalid GOOGLE_APPLICATION_CREDENTIALS_JSON for topic: %s", e)
-    # Fallback to legacy if configured
-    if FCM_SERVER_KEY:
-        _fcm_send_topic_legacy(topic, title, body, data, FCM_SERVER_KEY)
-
-def _fcm_broadcast_all(title: str, body: str, data: Optional[dict] = None) -> int:
-    """Send to all distinct user device tokens (no client changes required). Returns count sent."""
-    data = data or {}
-    c = get_conn()
-    sent = 0
-    try:
-        with c, c.cursor() as cur:
-            cur.execute("""
-                SELECT DISTINCT d.fcm_token
-                FROM public.user_devices d
-                WHERE d.fcm_token IS NOT NULL AND d.fcm_token <> ''
-            """)
-            toks = [r[0] for r in (cur.fetchall() or []) if r and r[0]]
-        for t in toks:
-            try:
-                _fcm_send_push(t, title, body, data)
-                sent += 1
-            except Exception:
-                pass
-        return sent
-    finally:
-        put_conn(c)
-
-def _pricing_topic_for_key(ui_key: str) -> str:
-    k = (ui_key or "").lower()
-    if k.startswith("topup.itunes"):
-        return "pricing_itunes"
-    if k.startswith("topup.") and any(x in k for x in ("asiacell","korek","atheer")):
-        return "pricing_phone"
-    if ("pubg" in k) or ("bgmi" in k) or ("uc" in k) or k == "cat.pubg":
-        return "pricing_pubg"
-    if ("ludo" in k) or k == "cat.ludo":
-        return "pricing_ludo"
-    return "pricing_all"
-
-def _notify_pricing_change(ui_key: str, before: Optional[tuple], after: Optional[tuple]) -> None:
-    """Compose Arabic message and notify users. before/after are rows:
-       (ui_key, price_per_k, min_qty, max_qty, mode, updated_at_ms)
-    """
-    try:
-        topic = _pricing_topic_for_key(ui_key)
-        def row_to_dict(r):
-            if not r: return None
-            return {
-                "price_per_k": float(r[1]),
-                "min_qty": int(r[2]),
-                "max_qty": int(r[3]),
-                "mode": (r[4] or "per_k")
-            }
-        b = row_to_dict(before)
-        a = row_to_dict(after)
-        title = "تحديث الأسعار"
-        if a and not b:
-            body = f"تم إضافة قاعدة تسعير جديدة: {ui_key} — السعر/ألف: {a['price_per_k']}, المدى: {a['min_qty']}–{a['max_qty']}، النمط: {a['mode']}"
-        elif (not a) and b:
-            body = f"تم حذف قاعدة التسعير: {ui_key}"
-        else:
-            # changed
-            parts = []
-            if b and a:
-                if abs(a['price_per_k'] - b['price_per_k']) > 1e-9:
-                    parts.append(f"السعر/ألف: {b['price_per_k']} → {a['price_per_k']}")
-                if a['min_qty'] != b['min_qty'] or a['max_qty'] != b['max_qty']:
-                    parts.append(f"الكمية: {b['min_qty']}–{b['max_qty']} → {a['min_qty']}–{a['max_qty']}")
-                if a['mode'] != b['mode']:
-                    parts.append(f"النمط: {b['mode']} → {a['mode']}")
-            body = f"{ui_key} — " + (" — ".join(parts) if parts else "تم التحديث")
-        # Data payload (optional for clients)
-        data = {
-            "type": "pricing_change",
-            "ui_key": ui_key,
-            "topic": topic
-        }
-        try:
-            _fcm_send_topic(topic, title, body, data)
-        except Exception:
-            pass
-        # Always ensure delivery even if topics not used: broadcast to all tokens
-        _fcm_broadcast_all(title, body, data)
-    except Exception as e:
-        logger.exception("notify pricing change failed: %s", e)
 # =========================
 # Schema & Triggers
 # =========================
@@ -2357,10 +2215,25 @@ def admin_set_pricing(
         with conn, conn.cursor() as cur:
             _ensure_pricing_table(cur)
             _ensure_pricing_mode_column(cur)
+            # BEFORE row snapshot for notification
+            try:
+                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), EXTRACT(EPOCH FROM updated_at)*1000 FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+                _before = cur.fetchone()
+            except Exception:
+                _before = None
             cur.execute("""
                 INSERT INTO public.service_pricing_overrides(ui_key, price_per_k, min_qty, max_qty, mode, updated_at)
                 VALUES(%s,%s,%s,%s,COALESCE(%s,'per_k'), now())
                 ON CONFLICT (ui_key) DO UPDATE SET price_per_k=EXCLUDED.price_per_k, min_qty=EXCLUDED.min_qty, max_qty=EXCLUDED.max_qty, mode=COALESCE(EXCLUDED.mode,'per_k'), updated_at=now()
+
+            # AFTER row for notification
+            try:
+                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), EXTRACT(EPOCH FROM updated_at)*1000 FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+                _after = cur.fetchone()
+            except Exception:
+                _after = None
+        # Notify after commit
+        _notify_pricing_change_via_tokens(conn, body.ui_key, _before, _after)
             """, (body.ui_key, Decimal(body.price_per_k), int(body.min_qty), int(body.max_qty), (body.mode or 'per_k')))
         return {"ok": True}
     finally:
@@ -2380,7 +2253,16 @@ def admin_clear_pricing(
         with conn, conn.cursor() as cur:
             _ensure_pricing_table(cur)
             _ensure_pricing_mode_column(cur)
+            # BEFORE row snapshot for notification
+            try:
+                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), EXTRACT(EPOCH FROM updated_at)*1000 FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+                _before = cur.fetchone()
+            except Exception:
+                _before = None
             cur.execute("DELETE FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+
+        # Notify after commit
+        _notify_pricing_change_via_tokens(conn, body.ui_key, _before, None)
         return {"ok": True}
     finally:
         put_conn(conn)
@@ -2397,6 +2279,12 @@ def public_pricing_version():
             _ensure_pricing_table(cur)
             try:
                 _ensure_pricing_mode_column(cur)
+            # BEFORE row snapshot for notification
+            try:
+                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), EXTRACT(EPOCH FROM updated_at)*1000 FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+                _before = cur.fetchone()
+            except Exception:
+                _before = None
             except Exception:
                 pass
             cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM MAX(updated_at))*1000, 0) FROM public.service_pricing_overrides")
@@ -2418,6 +2306,12 @@ def public_pricing_bulk(keys: str):
             _ensure_pricing_table(cur)
             try:
                 _ensure_pricing_mode_column(cur)
+            # BEFORE row snapshot for notification
+            try:
+                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), EXTRACT(EPOCH FROM updated_at)*1000 FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+                _before = cur.fetchone()
+            except Exception:
+                _before = None
             except Exception:
                 pass
             cur.execute(
@@ -3023,7 +2917,66 @@ def _label_for_ui_key(ui_key: str):
 def _fmt_price(v, currency: str = "$"):
     try:
         f = float(v)
-        # لا نبالغ بالتنسيق، عرض بسيط
         return f"{f:g}{currency}"
     except Exception:
         return f"{v}{currency}" if v is not None else ""
+
+
+def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple], after: Optional[tuple]) -> None:
+    """Use existing user_devices tokens to send a rich Arabic notification about pricing change."""
+    try:
+        category, pretty = _label_for_ui_key(ui_key)
+
+        def row_to_dict(r):
+            if not r: return None
+            return {
+                "price_per_k": float(r[1]) if r[1] is not None else None,
+                "min_qty": int(r[2]) if r[2] is not None else None,
+                "max_qty": int(r[3]) if r[3] is not None else None,
+                "mode": (r[4] or "per_k")
+            }
+
+        b = row_to_dict(before)
+        a = row_to_dict(after)
+
+        title = f"تحديث على {pretty}"
+        if a and not b:
+            body = f"تم إضافة تسعير جديد — السعر/ألف: {_fmt_price(a['price_per_k'])} — الكمية: {a['min_qty']}–{a['max_qty']} — النمط: {a['mode']}"
+        elif (not a) and b:
+            body = f"تم حذف تعديل الأسعار — عادت {pretty} إلى القيم الافتراضية"
+        else:
+            changes = []
+            if b and a:
+                if (a['price_per_k'] is not None and b['price_per_k'] is not None) and (abs(a['price_per_k'] - b['price_per_k']) > 1e-9):
+                    changes.append(f"السعر/ألف: {_fmt_price(b['price_per_k'])} → {_fmt_price(a['price_per_k'])}")
+                if (a['min_qty'] is not None and a['max_qty'] is not None and b['min_qty'] is not None and b['max_qty'] is not None) and (a['min_qty'] != b['min_qty'] or a['max_qty'] != b['max_qty']):
+                    changes.append(f"الكمية: {b['min_qty']}–{b['max_qty']} → {a['min_qty']}–{a['max_qty']}")
+                if a['mode'] != b['mode']:
+                    changes.append(f"النمط: {b['mode']} → {a['mode']}")
+            body = " — ".join(changes) if changes else "تم التحديث"
+
+        # Read tokens similar to admin_announcement_create
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT d.fcm_token
+                FROM public.user_devices d
+                WHERE d.fcm_token IS NOT NULL AND d.fcm_token <> ''
+            """)
+            tokens = [r[0] for r in cur.fetchall() or []]
+
+        sent = 0
+        for t in tokens:
+            try:
+                _fcm_send_push(t, title, f"{pretty} — {body}", {
+                    "type": "pricing_change",
+                    "category": category,
+                    "ui_key": ui_key,
+                    "serviceLabel": pretty
+                })
+                sent += 1
+            except Exception as fe:
+                logger.exception("pricing_change FCM send failed: %s", fe)
+
+        logger.info("pricing.change.notify ui_key=%s tokens=%d sent=%d", ui_key, len(tokens), sent)
+    except Exception as e:
+        logger.exception("notify pricing change failed: %s", e)
