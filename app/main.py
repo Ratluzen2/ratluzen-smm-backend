@@ -80,6 +80,14 @@ def get_conn() -> psycopg2.extensions.connection:
     return conn
 
 def put_conn(conn: psycopg2.extensions.connection) -> None:
+    try:
+        if conn is not None:
+            dbpool.putconn(conn, close=False)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 def _prune_bad_fcm_token(bad_token: str):
     """
@@ -103,9 +111,6 @@ def _prune_bad_fcm_token(bad_token: str):
         logger.exception("prune_bad_fcm_token failed: %s", e)
     finally:
         put_conn(conn)
-
-    dbpool.putconn(conn)
-
 # =========================
 # Logging
 # =========================
@@ -2333,12 +2338,30 @@ def _ensure_pricing_bumps(cur):
     except Exception:
         pass
 
-def _bump_pricing_version(cur):
+def _bump_pricing_version(*args):
+    """Bump pricing version. Compatible with two usages:
+    - _bump_pricing_version()            -> updates meta + inserts bump row
+    - _bump_pricing_version(cur)         -> inserts bump row using provided cursor
+    """
     try:
-        _ensure_pricing_bumps(cur)
-        cur.execute("INSERT INTO public.pricing_bumps DEFAULT VALUES")
+        if args:
+            cur = args[0]
+            _ensure_pricing_bumps(cur)
+            cur.execute("INSERT INTO public.pricing_bumps DEFAULT VALUES")
+            return
+        # No-arg path: open connection and update meta + bumps
+        conn = get_conn()
+        try:
+            with conn, conn.cursor() as cur:
+                _ensure_pricing_meta_table(cur)
+                cur.execute("UPDATE public.service_pricing_meta SET updated_at = NOW() WHERE id = 1")
+                _ensure_pricing_bumps(cur)
+                cur.execute("INSERT INTO public.pricing_bumps DEFAULT VALUES")
+        finally:
+            put_conn(conn)
     except Exception:
         pass
+
 
 @app.get("/api/admin/pricing/list")
 def admin_list_pricing(
