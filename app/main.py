@@ -2187,6 +2187,25 @@ def _ensure_pricing_mode_column(cur):
     except Exception:
         pass
 
+
+def _ensure_pricing_bumps(cur):
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS public.pricing_bumps(
+                id BIGSERIAL PRIMARY KEY,
+                bumped_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+    except Exception:
+        pass
+
+def _bump_pricing_version(cur):
+    try:
+        _ensure_pricing_bumps(cur)
+        cur.execute("INSERT INTO public.pricing_bumps DEFAULT VALUES")
+    except Exception:
+        pass
+
 @app.get("/api/admin/pricing/list")
 def admin_list_pricing(
     x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
@@ -2242,17 +2261,12 @@ def admin_set_pricing(
                     updated_at  = now()
                 """,
                 (body.ui_key, Decimal(body.price_per_k), int(body.min_qty), int(body.max_qty), (body.mode or 'per_k'))
-            )
+            )\1
+        # bump pricing version so clients refresh cache on next open
+        with conn, conn.cursor() as cur:
+            _bump_pricing_version(cur)
 
-            # AFTER row for notification
-            try:
-                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, mode FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
-                _after = cur.fetchone()
-            except Exception:
-                _after = None
-
-        # Notify after commit
-        _notify_pricing_change_via_tokens(conn, body.ui_key, _before, _after)
+        \2
         return {{"ok": True}}
     finally:
         put_conn(conn)
@@ -2277,7 +2291,9 @@ def admin_clear_pricing(
                 _before = cur.fetchone()
             except Exception:
                 _before = None
-            cur.execute("DELETE FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+            \1
+            # bump version so app cache refreshes on first open
+            _bump_pricing_version(cur)
 
         # Notify after commit
         _notify_pricing_change_via_tokens(conn, body.ui_key, _before, None)
@@ -2319,7 +2335,9 @@ def admin_clear_pricing(
             except Exception:
                 _before = None
             # تنفيذ الحذف
-            cur.execute("DELETE FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+            \1
+            # bump version so app cache refreshes on first open
+            _bump_pricing_version(cur)
         # بعد الإتمام: إشعار المستخدمين
         try:
             _notify_pricing_change_via_tokens(conn, body.ui_key, _before, None)
@@ -2331,20 +2349,29 @@ def admin_clear_pricing(
 
 @app.get("/api/public/pricing/version")
 def public_pricing_version():
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            _ensure_pricing_table(cur)
-            try:
-                _ensure_pricing_mode_column(cur)
-            except Exception:
-                pass
-            cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM MAX(updated_at))*1000, 0) FROM public.service_pricing_overrides")
-            v = cur.fetchone()[0] or 0
-            return {"version": int(v)}
-    finally:
-        put_conn(conn)
 
+conn = get_conn()
+try:
+    with conn, conn.cursor() as cur:
+        _ensure_pricing_table(cur)
+        try:
+            _ensure_pricing_mode_column(cur)
+        except Exception:
+            pass
+        # v_overrides: latest update in service_pricing_overrides
+        cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM MAX(updated_at))*1000, 0) FROM public.service_pricing_overrides")
+        v_overrides = int(cur.fetchone()[0] or 0)
+        # v_bumps: latest bump timestamp
+        try:
+            _ensure_pricing_bumps(cur)
+            cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM MAX(bumped_at))*1000, 0) FROM public.pricing_bumps")
+            v_bumps = int(cur.fetchone()[0] or 0)
+        except Exception:
+            v_bumps = 0
+        v = max(v_overrides, v_bumps)
+        return {"version": int(v)}
+finally:
+    put_conn(conn)
 @app.get("/api/public/pricing/bulk")
 
 def public_pricing_bulk(keys: str):
