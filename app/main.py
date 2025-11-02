@@ -2157,51 +2157,19 @@ def admin_clear_service_id(
 # =========================
 # Pricing overrides (server-level)
 # =========================
+
+# =========================
+# Pricing overrides (server-level)
+# =========================
 class PricingIn(BaseModel):
+    ui_key: str
+    price_per_k: float
+    min_qty: int
+    max_qty: int
+    mode: Optional[str] = None  # 'per_k' (default) or 'fixed'
 
 class PricingClearIn(BaseModel):
     ui_key: str
-
-    ui_key: str
-    price_per_k: Optional[float] = None
-    min_qty: Optional[int] = None
-    max_qty: Optional[int] = None
-    mode: Optional[str] = None  # 'per_k' (default) or 'flat'
-
-def _ensure_pricing_table(cur):
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS public.service_pricing_overrides(
-            ui_key TEXT PRIMARY KEY,
-            price_per_k NUMERIC(18,6) NOT NULL,
-            min_qty INTEGER NOT NULL,
-            max_qty INTEGER NOT NULL,
-            mode TEXT NOT NULL DEFAULT 'per_k',
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-    """)
-
-def _ensure_pricing_mode_column(cur):
-    try:
-        cur.execute("ALTER TABLE public.service_pricing_overrides ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'per_k'")
-    except Exception:
-        pass
-
-@app.get("/api/admin/pricing/list")
-def admin_list_pricing(
-    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
-    password: Optional[str] = None
-):
-    _require_admin(x_admin_password or password or "")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            _ensure_pricing_table(cur)
-            cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode, 'per_k') FROM public.service_pricing_overrides ORDER BY ui_key")
-            rows = cur.fetchall()
-            out = [{"ui_key": r[0], "price_per_k": float(r[1]), "min_qty": int(r[2]), "max_qty": int(r[3]), "mode": (r[4] or "per_k")} for r in rows]
-            return {"list": out}
-    finally:
-        put_conn(conn)
 
 @app.post("/api/admin/pricing/set")
 def admin_set_pricing(
