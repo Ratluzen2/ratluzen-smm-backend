@@ -3025,7 +3025,16 @@ def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple]
 
         # حالة الإضافة
         elif (a and not b):
-            if new_amt is not None and new_price is not None:
+            # إذا لا يوجد سطر سابق لكن الخدمة من نوع تعبئة (آيتونز/أثير/آسيا/كورك/زين)،
+            # نفترض السعر الافتراضي يساوي قيمة الباقة بالدولار (مثلاً 10$ -> 10$) ونصيغ رفع/تخفيض.
+            if new_amt is not None and new_price is not None and cat in ("itunes","phone"):
+                base_old = float(new_amt)
+                direction = "رفع" if float(new_price) > base_old else ("تخفيض" if float(new_price) < base_old else None)
+                if direction:
+                    final_body = f"تم {direction} سعر {pack_for(new_amt)} من {_fmt_usd(base_old)} الى {_fmt_usd(new_price)}"
+                else:
+                    final_body = f"تم إضافة سعر {pack_for(new_amt)} = {_fmt_usd(new_price)}"
+            elif new_amt is not None and new_price is not None:
                 final_body = f"تم إضافة سعر {pack_for(new_amt)} = {_fmt_usd(new_price)}"
             elif new_price is not None:
                 final_body = f"تم إضافة سعر {svc} = {_fmt_usd(new_price)}"
