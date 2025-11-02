@@ -2187,6 +2187,58 @@ def _ensure_pricing_mode_column(cur):
     except Exception:
         pass
 
+
+# ===== Pricing version meta (for cache-busting on clear) =====
+def _ensure_pricing_meta_table(cur):
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS public.service_pricing_meta(
+                id INTEGER PRIMARY KEY,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """ )
+        cur.execute("""
+            INSERT INTO public.service_pricing_meta(id, updated_at)
+            VALUES (1, now())
+            ON CONFLICT (id) DO NOTHING
+        """ )
+    except Exception:
+        pass
+
+def _bump_pricing_version():
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_meta_table(cur)
+            cur.execute("""
+                UPDATE public.service_pricing_meta
+                SET updated_at = NOW()
+                WHERE id = 1
+            """ )
+    finally:
+        put_conn(conn)
+# =============================================================
+
+
+
+def _ensure_pricing_bumps(cur):
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS public.pricing_bumps(
+                id BIGSERIAL PRIMARY KEY,
+                bumped_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+    except Exception:
+        pass
+
+def _bump_pricing_version(cur):
+    try:
+        _ensure_pricing_bumps(cur)
+        cur.execute("INSERT INTO public.pricing_bumps DEFAULT VALUES")
+    except Exception:
+        pass
+
 @app.get("/api/admin/pricing/list")
 def admin_list_pricing(
     x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
@@ -2204,8 +2256,101 @@ def admin_list_pricing(
     finally:
         put_conn(conn)
 
+
 @app.post("/api/admin/pricing/set")
 def admin_set_pricing(
+
+
+
+@app.post("/api/admin/pricing/clear")
+def admin_clear_pricing(
+    body: PricingClearIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.ui_key:
+        raise HTTPException(422, "invalid payload")
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table(cur)
+            _ensure_pricing_mode_column(cur)
+
+            try:
+                cur.execute(
+                    "SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s",
+                    (body.ui_key,)
+                )
+                _before = cur.fetchone()
+            except Exception:
+                _before = None
+
+            cur.execute("DELETE FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+
+        # bump version for client cache refresh
+        _bump_pricing_version()
+
+        try:
+            _notify_pricing_change_via_tokens(conn, body.ui_key, _before, None)
+        except Exception as e:
+            logger.exception("notify after clear failed: %s", e)
+
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+    body: PricingIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.ui_key or body.price_per_k is None or body.min_qty is None or body.max_qty is None:
+        raise HTTPException(422, "invalid payload")
+    if body.min_qty < 0 or body.max_qty < body.min_qty:
+        raise HTTPException(422, "invalid range")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table(cur)
+            _ensure_pricing_mode_column(cur)
+
+            try:
+                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode, 'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+                _before = cur.fetchone()
+            except Exception:
+                _before = None
+
+            cur.execute(
+                """
+                INSERT INTO public.service_pricing_overrides (ui_key, price_per_k, min_qty, max_qty, mode, updated_at)
+                VALUES (%s, %s, %s, %s, COALESCE(%s,'per_k'), now())
+                ON CONFLICT (ui_key)
+                DO UPDATE SET
+                    price_per_k = EXCLUDED.price_per_k,
+                    min_qty     = EXCLUDED.min_qty,
+                    max_qty     = EXCLUDED.max_qty,
+                    mode        = COALESCE(EXCLUDED.mode,'per_k'),
+                    updated_at  = now()
+                """,
+                (body.ui_key, Decimal(body.price_per_k), int(body.min_qty), int(body.max_qty), (body.mode or 'per_k'))
+            )
+
+            try:
+                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode, 'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+                _after = cur.fetchone()
+            except Exception:
+                _after = None
+
+        # bump version for client cache refresh
+        _bump_pricing_version()
+
+        _notify_pricing_change_via_tokens(conn, body.ui_key, _before, _after)
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
     body: PricingIn,
     x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
     password: Optional[str] = None
@@ -2243,22 +2388,16 @@ def admin_set_pricing(
                 """,
                 (body.ui_key, Decimal(body.price_per_k), int(body.min_qty), int(body.max_qty), (body.mode or 'per_k'))
             )
+        # bump pricing version so clients refresh cache on next open
+        with conn, conn.cursor() as cur:
+            _bump_pricing_version(cur)
 
-            # AFTER row for notification
-            try:
-                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, mode FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
-                _after = cur.fetchone()
-            except Exception:
-                _after = None
-
-        # Notify after commit
-        _notify_pricing_change_via_tokens(conn, body.ui_key, _before, _after)
-        return {{"ok": True}}
+        
+        return {"ok": True}
     finally:
         put_conn(conn)
 
-app.post("/api/admin/pricing/clear")
-def admin_clear_pricing(
+
     body: PricingIn,
     x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
     password: Optional[str] = None
@@ -2277,7 +2416,9 @@ def admin_clear_pricing(
                 _before = cur.fetchone()
             except Exception:
                 _before = None
-            cur.execute("DELETE FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+            
+            # bump version so app cache refreshes on first open
+            _bump_pricing_version(cur)
 
         # Notify after commit
         _notify_pricing_change_via_tokens(conn, body.ui_key, _before, None)
@@ -2291,8 +2432,7 @@ def admin_clear_pricing(
 # ------------------------------
 
 
-@app.post("/api/admin/pricing/clear")
-def admin_clear_pricing(
+
     body: PricingClearIn,
     x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
     password: Optional[str] = None
@@ -2319,7 +2459,9 @@ def admin_clear_pricing(
             except Exception:
                 _before = None
             # تنفيذ الحذف
-            cur.execute("DELETE FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+            
+            # bump version so app cache refreshes on first open
+            _bump_pricing_version(cur)
         # بعد الإتمام: إشعار المستخدمين
         try:
             _notify_pricing_change_via_tokens(conn, body.ui_key, _before, None)
@@ -2329,7 +2471,9 @@ def admin_clear_pricing(
     finally:
         put_conn(conn)
 
+
 @app.get("/api/public/pricing/version")
+
 def public_pricing_version():
     conn = get_conn()
     try:
@@ -2339,12 +2483,51 @@ def public_pricing_version():
                 _ensure_pricing_mode_column(cur)
             except Exception:
                 pass
-            cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM MAX(updated_at))*1000, 0) FROM public.service_pricing_overrides")
-            v = cur.fetchone()[0] or 0
+            try:
+                _ensure_pricing_meta_table(cur)
+            except Exception:
+                pass
+
+            try:
+                cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM MAX(updated_at))*1000, 0) FROM public.service_pricing_overrides")
+                v_overrides = int(cur.fetchone()[0] or 0)
+            except Exception:
+                v_overrides = 0
+
+            try:
+                cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM updated_at)*1000, 0) FROM public.service_pricing_meta WHERE id=1")
+                v_meta = int(cur.fetchone()[0] or 0)
+            except Exception:
+                v_meta = 0
+
+            v = max(v_overrides, v_meta)
             return {"version": int(v)}
     finally:
         put_conn(conn)
 
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table(cur)
+            try:
+                _ensure_pricing_mode_column(cur)
+            except Exception:
+                pass
+            try:
+                _ensure_pricing_bumps(cur)
+            except Exception:
+                pass
+            cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM MAX(updated_at))*1000, 0) FROM public.service_pricing_overrides")
+            v_overrides = int((cur.fetchone() or [0])[0] or 0)
+            try:
+                cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM MAX(bumped_at))*1000, 0) FROM public.pricing_bumps")
+                v_bumps = int((cur.fetchone() or [0])[0] or 0)
+            except Exception:
+                v_bumps = 0
+            v = max(v_overrides, v_bumps)
+            return {"version": int(v)}
+    finally:
+        put_conn(conn)
 @app.get("/api/public/pricing/bulk")
 
 def public_pricing_bulk(keys: str):
