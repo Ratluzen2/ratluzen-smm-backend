@@ -2279,12 +2279,6 @@ def public_pricing_version():
             _ensure_pricing_table(cur)
             try:
                 _ensure_pricing_mode_column(cur)
-            # BEFORE row snapshot for notification
-            try:
-                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), EXTRACT(EPOCH FROM updated_at)*1000 FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
-                _before = cur.fetchone()
-            except Exception:
-                _before = None
             except Exception:
                 pass
             cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM MAX(updated_at))*1000, 0) FROM public.service_pricing_overrides")
@@ -2294,6 +2288,7 @@ def public_pricing_version():
         put_conn(conn)
 
 @app.get("/api/public/pricing/bulk")
+
 def public_pricing_bulk(keys: str):
     if not keys:
         return {"map": {}, "keys": []}
@@ -2306,27 +2301,23 @@ def public_pricing_bulk(keys: str):
             _ensure_pricing_table(cur)
             try:
                 _ensure_pricing_mode_column(cur)
-            # BEFORE row snapshot for notification
-            try:
-                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), EXTRACT(EPOCH FROM updated_at)*1000 FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
-                _before = cur.fetchone()
-            except Exception:
-                _before = None
             except Exception:
                 pass
-            cur.execute(
-                "SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), EXTRACT(EPOCH FROM updated_at)*1000 FROM public.service_pricing_overrides WHERE ui_key = ANY(%s)",
-                (key_list,)
-            )
+            cur.execute("""
+                SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'),
+                       EXTRACT(EPOCH FROM COALESCE(updated_at, NOW()))*1000 AS updated_at
+                FROM public.service_pricing_overrides
+                WHERE ui_key = ANY(%s)
+            """, (key_list,))
             rows = cur.fetchall()
             out = {}
-            for r in rows:
-                out[r[0]] = {
-                    "price_per_k": float(r[1]),
-                    "min_qty": int(r[2]),
-                    "max_qty": int(r[3]),
-                    "mode": r[4] or "per_k",
-                    "updated_at": int(r[5] or 0)
+            for ui_key, price_per_k, min_qty, max_qty, mode, updated_ms in rows:
+                out[ui_key] = {
+                    "price_per_k": float(price_per_k) if price_per_k is not None else None,
+                    "min_qty": int(min_qty) if min_qty is not None else None,
+                    "max_qty": int(max_qty) if max_qty is not None else None,
+                    "mode": mode or "per_k",
+                    "updated_at": int(updated_ms or 0)
                 }
             return {"map": out, "keys": key_list}
     finally:
