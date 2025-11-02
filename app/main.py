@@ -30,7 +30,7 @@ def _can_deduct(balance: float, amount: float) -> bool:
 import os
 import json
 import time
-import logging
+import loggingg
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -3234,48 +3234,48 @@ def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple]
             return "api"
 
         def _svc_name_ar(ps):
-    # ps = list of ui_key tokens (lowercased)
-    t = " ".join(ps)
-    def has(*keys): 
-        return any(k in t for k in keys)
-
-    # Platform detection
-    platform = None
-    if has("tiktok", "تيك", "تيكتوك"): platform = "تيكتوك"
-    elif has("instagram", "insta", "انستا", "ig"): platform = "انستا"
-    elif has("youtube", "يوتيوب", "yt"): platform = "يوتيوب"
-    elif has("telegram", "تيليجرام", "تلجرام", "تليجرام", "tg"): platform = "تيليجرام"
-    elif has("twitter", "x_","x-", "x.", "xapp", "تويتر"): platform = "تويتر"
-    elif has("facebook", "fb", "فيس"): platform = "فيسبوك"
-    elif has("snapchat", "snap", "سناب"): platform = "سناب"
-    elif has("kwai", "كواي"): platform = "كواي"
-    elif has("likee", "لايكي"): platform = "لايكي"
-
-    # Metric detection
-    if has("follower", "followers", "subs", "subscriber", "subscrip"):
-        return f"متابعين {platform or ''}".strip()
-    if has("like", "likes"):
-        return f"لايكات {platform or ''}".strip()
-    if has("view", "views", "play", "plays"):
-        # live / livestream views
-        if has("live", "livestream", "broadcast", "البث", "مباشر"):
-            return f"مشاهدات البث المباشر {platform or ''}".strip()
-        return f"مشاهدات {platform or ''}".strip()
-    if has("comment", "comments"):
-        return f"تعليقات {platform or ''}".strip()
-    if has("save", "saves"):
-        return f"حفظ {platform or ''}".strip()
-    if has("reaction", "reactions"):
-        return f"تفاعلات {platform or ''}".strip()
-    if has("member", "members", "join"):
-        # Common for Telegram
-        if platform == "تيليجرام":
-            return "أعضاء تيليجرام"
-
-    # Fallbacks
-    if platform:
-        return f"خدمات {platform}"
-    return "خدمة"
+        # ps = list of ui_key tokens (lowercased)
+        t = " ".join(ps)
+        def has(*keys): 
+            return any(k in t for k in keys)
+    
+        # Platform detection
+        platform = None
+        if has("tiktok", "تيك", "تيكتوك"): platform = "تيكتوك"
+        elif has("instagram", "insta", "انستا", "ig"): platform = "انستا"
+        elif has("youtube", "يوتيوب", "yt"): platform = "يوتيوب"
+        elif has("telegram", "تيليجرام", "تلجرام", "تليجرام", "tg"): platform = "تيليجرام"
+        elif has("twitter", "x_","x-", "x.", "xapp", "تويتر"): platform = "تويتر"
+        elif has("facebook", "fb", "فيس"): platform = "فيسبوك"
+        elif has("snapchat", "snap", "سناب"): platform = "سناب"
+        elif has("kwai", "كواي"): platform = "كواي"
+        elif has("likee", "لايكي"): platform = "لايكي"
+    
+        # Metric detection
+        if has("follower", "followers", "subs", "subscriber", "subscrip"):
+            return f"متابعين {platform or ''}".strip()
+        if has("like", "likes"):
+            return f"لايكات {platform or ''}".strip()
+        if has("view", "views", "play", "plays"):
+            # live / livestream views
+            if has("live", "livestream", "broadcast", "البث", "مباشر"):
+                return f"مشاهدات البث المباشر {platform or ''}".strip()
+            return f"مشاهدات {platform or ''}".strip()
+        if has("comment", "comments"):
+            return f"تعليقات {platform or ''}".strip()
+        if has("save", "saves"):
+            return f"حفظ {platform or ''}".strip()
+        if has("reaction", "reactions"):
+            return f"تفاعلات {platform or ''}".strip()
+        if has("member", "members", "join"):
+            # Common for Telegram
+            if platform == "تيليجرام":
+                return "أعضاء تيليجرام"
+    
+        # Fallbacks
+        if platform:
+            return f"خدمات {platform}"
+        return "خدمة"
 
         def _first_digits(ps):
             for p in reversed(ps):
