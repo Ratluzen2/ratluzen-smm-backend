@@ -2215,31 +2215,44 @@ def admin_set_pricing(
         with conn, conn.cursor() as cur:
             _ensure_pricing_table(cur)
             _ensure_pricing_mode_column(cur)
+
             # BEFORE row snapshot for notification
             try:
-                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), EXTRACT(EPOCH FROM updated_at)*1000 FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, mode FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
                 _before = cur.fetchone()
             except Exception:
                 _before = None
-            cur.execute("""
-                INSERT INTO public.service_pricing_overrides(ui_key, price_per_k, min_qty, max_qty, mode, updated_at)
-                VALUES(%s,%s,%s,%s,COALESCE(%s,'per_k'), now())
-                ON CONFLICT (ui_key) DO UPDATE SET price_per_k=EXCLUDED.price_per_k, min_qty=EXCLUDED.min_qty, max_qty=EXCLUDED.max_qty, mode=COALESCE(EXCLUDED.mode,'per_k'), updated_at=now()
+
+            # Upsert the new values
+            cur.execute(
+                """
+                INSERT INTO public.service_pricing_overrides (ui_key, price_per_k, min_qty, max_qty, mode, updated_at)
+                VALUES (%s, %s, %s, %s, COALESCE(%s,'per_k'), now())
+                ON CONFLICT (ui_key)
+                DO UPDATE SET
+                    price_per_k = EXCLUDED.price_per_k,
+                    min_qty     = EXCLUDED.min_qty,
+                    max_qty     = EXCLUDED.max_qty,
+                    mode        = COALESCE(EXCLUDED.mode,'per_k'),
+                    updated_at  = now()
+                """,
+                (body.ui_key, Decimal(body.price_per_k), int(body.min_qty), int(body.max_qty), (body.mode or 'per_k'))
+            )
 
             # AFTER row for notification
             try:
-                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), EXTRACT(EPOCH FROM updated_at)*1000 FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, mode FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
                 _after = cur.fetchone()
             except Exception:
                 _after = None
+
         # Notify after commit
         _notify_pricing_change_via_tokens(conn, body.ui_key, _before, _after)
-            """, (body.ui_key, Decimal(body.price_per_k), int(body.min_qty), int(body.max_qty), (body.mode or 'per_k')))
-        return {"ok": True}
+        return {{"ok": True}}
     finally:
         put_conn(conn)
 
-@app.post("/api/admin/pricing/clear")
+app.post("/api/admin/pricing/clear")
 def admin_clear_pricing(
     body: PricingIn,
     x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
