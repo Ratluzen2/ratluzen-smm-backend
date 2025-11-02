@@ -2157,19 +2157,14 @@ def admin_clear_service_id(
 # =========================
 # Pricing overrides (server-level)
 # =========================
+class PricingIn(BaseModel):
+    ui_key: str
+    price_per_k: Optional[float] = None
+    min_qty: Optional[int] = None
+    max_qty: Optional[int] = None
+    mode: Optional[str] = None  # 'per_k' (default) or 'flat'
 
-# =========================
-# Pricing overrides (server-level)
-# =========================
-
-# =========================
-# Pricing overrides helpers (table + notify)
-# =========================
 def _ensure_pricing_table(cur):
-    """
-    Make sure the pricing overrides table exists.
-    Using the same shape used elsewhere in the codebase.
-    """
     cur.execute("""
         CREATE TABLE IF NOT EXISTS public.service_pricing_overrides(
             ui_key TEXT PRIMARY KEY,
@@ -2182,126 +2177,27 @@ def _ensure_pricing_table(cur):
     """)
 
 def _ensure_pricing_mode_column(cur):
-    """
-    Older deployments might miss the 'mode' column. Add it if missing.
-    """
     try:
         cur.execute("ALTER TABLE public.service_pricing_overrides ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'per_k'")
     except Exception:
-        # Older Postgres versions always have this by now in our schema path;
-        # ignore if migration already applied.
         pass
 
-def _notify_pricing_change_via_tokens(conn, ui_key: str, before, after):
-    """
-    Emit an Arabic, user‑friendly notification + FCM broadcast
-    describing what changed for a given ui_key.
-    - Inserts a row in public.user_notifications (uid-based) for all users.
-    - Sends an FCM push to all known device tokens.
-    """
-    # Decide what exactly changed
-    def _num(x):
-        try:
-            return float(x) if x is not None else None
-        except Exception:
-            return None
-
-    was = before or {}
-    now = after or {}
-    prev_price = _num(was[1] if isinstance(was, (list, tuple)) else was.get("price_per_k"))
-    prev_min   = int(was[2]) if isinstance(was, (list, tuple)) and was[2] is not None else (was.get("min_qty") if isinstance(was, dict) else None)
-    prev_max   = int(was[3]) if isinstance(was, (list, tuple)) and was[3] is not None else (was.get("max_qty") if isinstance(was, dict) else None)
-
-    new_price = _num(now[1] if isinstance(now, (list, tuple)) else now.get("price_per_k"))
-    new_min   = int(now[2]) if isinstance(now, (list, tuple)) and now[2] is not None else (now.get("min_qty") if isinstance(now, dict) else None)
-    new_max   = int(now[3]) if isinstance(now, (list, tuple)) and now[3] is not None else (now.get("max_qty") if isinstance(now, dict) else None)
-
-    # Compose text in Arabic using our short label helper
+@app.get("/api/admin/pricing/list")
+def admin_list_pricing(
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
     try:
-        short_name = _short_label_for_ui_key(ui_key)
-    except Exception:
-        short_name = ui_key or "خدمة"
-
-    lines = []
-    if prev_price is None and new_price is not None:
-        lines.append(f"تم تحديد سعر {short_name} إلى {new_price}")
-    elif prev_price is not None and new_price is None:
-        lines.append(f"تم حذف سعر {short_name} (العودة للوضع الافتراضي)")
-    elif prev_price is not None and new_price is not None and prev_price != new_price:
-        if new_price > prev_price:
-            lines.append(f"تم رفع السعر {short_name} من {prev_price} إلى {new_price}")
-        else:
-            lines.append(f"تم تخفيض السعر {short_name} من {prev_price} إلى {new_price}")
-
-    if prev_min is not None and new_min is not None and prev_min != new_min:
-        if new_min > prev_min:
-            lines.append(f"تم رفع الحد الأدنى للكمية {short_name} من {prev_min} إلى {new_min}")
-        else:
-            lines.append(f"تم تخفيض الحد الأدنى للكمية {short_name} من {prev_min} إلى {new_min}")
-
-    if prev_max is not None and new_max is not None and prev_max != new_max:
-        if new_max > prev_max:
-            lines.append(f"تم رفع الحد الأعلى للكمية {short_name} من {prev_max} إلى {new_max}")
-        else:
-            lines.append(f"تم تخفيض الحد الأعلى للكمية {short_name} من {prev_max} إلى {new_max}")
-
-    if not lines:
-        # nothing to notify
-        return
-
-    title = "تحديث الأسعار/الكميات"
-    body = "، ".join(lines)
-
-    # 1) ensure notifications table (uid-based)
-    with conn, conn.cursor() as cur:
-        try:
-            _ensure_user_notifications_table(cur)
-        except Exception:
-            pass
-
-        # 2) Insert a notification row for EVERY user (uid-based table)
-        try:
-            cur.execute("""
-                INSERT INTO public.user_notifications (uid, type, title, body, data, created_at)
-                SELECT u.uid, 'pricing_change', %s, %s, %s::jsonb, now()
-                FROM public.users u
-                WHERE u.uid IS NOT NULL AND u.uid <> ''
-            """, (
-                title,
-                body,
-                json.dumps({"ui_key": ui_key})
-            ))
-        except Exception as e:
-            logger.exception("insert user_notifications failed: %s", e)
-
-        # 3) collect DISTINCT FCM tokens
-        cur.execute(
-            """
-            SELECT DISTINCT d.fcm_token
-            FROM public.user_devices d
-            WHERE d.fcm_token IS NOT NULL AND d.fcm_token <> ''
-            """
-        )
-        tokens = [r[0] for r in cur.fetchall()]
-
-    # 4) fan-out FCM
-    sent = 0
-    for t in tokens:
-        try:
-            _fcm_send_push(t, title, body, None)
-            sent += 1
-        except Exception as fe:
-            logger.exception("pricing change FCM send failed: %s", fe)
-    logger.info("Pricing change broadcast for %s, tokens_sent=%s", ui_key, sent)
-class PricingIn(BaseModel):
-    ui_key: str
-    price_per_k: float
-    min_qty: int
-    max_qty: int
-    mode: Optional[str] = None  # 'per_k' (default) or 'fixed'
-
-class PricingClearIn(BaseModel):
-    ui_key: str
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table(cur)
+            cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode, 'per_k') FROM public.service_pricing_overrides ORDER BY ui_key")
+            rows = cur.fetchall()
+            out = [{"ui_key": r[0], "price_per_k": float(r[1]), "min_qty": int(r[2]), "max_qty": int(r[3]), "mode": (r[4] or "per_k")} for r in rows]
+            return {"list": out}
+    finally:
+        put_conn(conn)
 
 @app.post("/api/admin/pricing/set")
 def admin_set_pricing(
@@ -2311,91 +2207,83 @@ def admin_set_pricing(
 ):
     _require_admin(x_admin_password or password or "")
     if not body.ui_key or body.price_per_k is None or body.min_qty is None or body.max_qty is None:
-        raise HTTPException(status_code=422, detail="invalid payload")
+        raise HTTPException(422, "invalid payload")
     if body.min_qty < 0 or body.max_qty < body.min_qty:
-        raise HTTPException(status_code=422, detail="invalid range")
-
+        raise HTTPException(422, "invalid range")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             _ensure_pricing_table(cur)
             _ensure_pricing_mode_column(cur)
 
-            # BEFORE snapshot
-            cur.execute("""
-                SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), updated_at
-                FROM public.service_pricing_overrides
-                WHERE ui_key=%s
-            """, (body.ui_key,))
-            _before = cur.fetchone()
+            # BEFORE row snapshot for notification
+            try:
+                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, mode FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+                _before = cur.fetchone()
+            except Exception:
+                _before = None
 
-            # UPSERT
-            cur.execute("""
-                INSERT INTO public.service_pricing_overrides
-                    (ui_key, price_per_k, min_qty, max_qty, mode, updated_at)
-                VALUES
-                    (%s, %s, %s, %s, COALESCE(%s,'per_k'), now())
-                ON CONFLICT (ui_key) DO UPDATE SET
+            # Upsert the new values
+            cur.execute(
+                """
+                INSERT INTO public.service_pricing_overrides (ui_key, price_per_k, min_qty, max_qty, mode, updated_at)
+                VALUES (%s, %s, %s, %s, COALESCE(%s,'per_k'), now())
+                ON CONFLICT (ui_key)
+                DO UPDATE SET
                     price_per_k = EXCLUDED.price_per_k,
                     min_qty     = EXCLUDED.min_qty,
                     max_qty     = EXCLUDED.max_qty,
-                    mode        = COALESCE(EXCLUDED.mode, 'per_k'),
+                    mode        = COALESCE(EXCLUDED.mode,'per_k'),
                     updated_at  = now()
-            """, (
-                body.ui_key,
-                Decimal(str(body.price_per_k)),
-                int(body.min_qty),
-                int(body.max_qty),
-                (body.mode or 'per_k'),
-            ))
+                """,
+                (body.ui_key, Decimal(body.price_per_k), int(body.min_qty), int(body.max_qty), (body.mode or 'per_k'))
+            )
 
-            # AFTER snapshot
-            cur.execute("""
-                SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), updated_at
-                FROM public.service_pricing_overrides
-                WHERE ui_key=%s
-            """, (body.ui_key,))
-            _after = cur.fetchone()
+            # AFTER row for notification
+            try:
+                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, mode FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+                _after = cur.fetchone()
+            except Exception:
+                _after = None
 
-        # notify (in-app + FCM)
+        # Notify after commit
         _notify_pricing_change_via_tokens(conn, body.ui_key, _before, _after)
-        return {"ok": True}
+        return {{"ok": True}}
     finally:
         put_conn(conn)
-@app.post("/api/admin/pricing/clear")
+
+app.post("/api/admin/pricing/clear")
 def admin_clear_pricing(
-    body: PricingClearIn,
+    body: PricingIn,
     x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
     password: Optional[str] = None
 ):
     _require_admin(x_admin_password or password or "")
     if not body.ui_key:
-        raise HTTPException(status_code=422, detail="invalid payload")
-
+        raise HTTPException(422, "invalid payload")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             _ensure_pricing_table(cur)
+            _ensure_pricing_mode_column(cur)
+            # BEFORE row snapshot for notification
+            try:
+                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), EXTRACT(EPOCH FROM updated_at)*1000 FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+                _before = cur.fetchone()
+            except Exception:
+                _before = None
+            cur.execute("DELETE FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
 
-            # BEFORE snapshot
-            cur.execute("""
-                SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), updated_at
-                FROM public.service_pricing_overrides
-                WHERE ui_key=%s
-            """, (body.ui_key,))
-            _before = cur.fetchone()
-
-            # DELETE
-            cur.execute("""
-                DELETE FROM public.service_pricing_overrides
-                WHERE ui_key=%s
-            """, (body.ui_key,))
-
-        # notify (before exists, after is None)
+        # Notify after commit
         _notify_pricing_change_via_tokens(conn, body.ui_key, _before, None)
         return {"ok": True}
     finally:
         put_conn(conn)
+
+
+# ------------------------------
+# Public pricing (read-only for clients)
+# ------------------------------
 @app.get("/api/public/pricing/version")
 def public_pricing_version():
     conn = get_conn()
@@ -2413,6 +2301,7 @@ def public_pricing_version():
         put_conn(conn)
 
 @app.get("/api/public/pricing/bulk")
+
 def public_pricing_bulk(keys: str):
     if not keys:
         return {"map": {}, "keys": []}
@@ -2427,19 +2316,21 @@ def public_pricing_bulk(keys: str):
                 _ensure_pricing_mode_column(cur)
             except Exception:
                 pass
-            cur.execute(
-                "SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'), EXTRACT(EPOCH FROM updated_at)*1000 FROM public.service_pricing_overrides WHERE ui_key = ANY(%s)",
-                (key_list,)
-            )
+            cur.execute("""
+                SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'),
+                       EXTRACT(EPOCH FROM COALESCE(updated_at, NOW()))*1000 AS updated_at
+                FROM public.service_pricing_overrides
+                WHERE ui_key = ANY(%s)
+            """, (key_list,))
             rows = cur.fetchall()
             out = {}
-            for r in rows:
-                out[r[0]] = {
-                    "price_per_k": float(r[1]),
-                    "min_qty": int(r[2]),
-                    "max_qty": int(r[3]),
-                    "mode": r[4] or "per_k",
-                    "updated_at": int(r[5] or 0)
+            for ui_key, price_per_k, min_qty, max_qty, mode, updated_ms in rows:
+                out[ui_key] = {
+                    "price_per_k": float(price_per_k) if price_per_k is not None else None,
+                    "min_qty": int(min_qty) if min_qty is not None else None,
+                    "max_qty": int(max_qty) if max_qty is not None else None,
+                    "mode": mode or "per_k",
+                    "updated_at": int(updated_ms or 0)
                 }
             return {"map": out, "keys": key_list}
     finally:
@@ -2962,118 +2853,191 @@ def admin_announcement_delete(aid: int, x_admin_password: str | None = Header(No
         put_conn(conn)
 
 
-def _service_names_ar():
-    return {
-        "itunes": "آيتونز",
-        "pubg": "ببجي",
-        "bgmi": "ببجي",
-        "ludo": "لودو",
-        "diamonds": "ألماس لودو",
-        "gold": "ذهب لودو",
-        "asiacell": "آسيا سيل",
-        "zain": "زين",
-        "korek": "كورك",
-        "atheer": "أثير",
-    }
-
-def _last_digits(parts):
-    for p in reversed(parts):
-        if p.isdigit():
-            return p
-    return None
-
 def _label_for_ui_key(ui_key: str):
-    """(category, pretty_ar) broader label for heads-up and logs."""
+    """Return (category, label) from ui_key patterns like:
+       topup.itunes.10, topup.asiacell.5000, topup.korek.10000, topup.zain.10000,
+       topup.pubg.uc.60, topup.ludo.diamonds.100, cat.pubg, cat.ludo
+    """
     try:
-        parts = [p for p in (ui_key or '').lower().split('.') if p]
-        names = _service_names_ar()
+        k = (ui_key or "").lower()
+        parts = k.split(".")
+        def first_digits(ps):
+            for p in ps[::-1]:
+                if p.isdigit():
+                    return p
+            return None
+
+        # Defaults
+        category = "service"
+        label = ui_key
+
         if not parts:
-            return "service", "خدمة"
+            return category, label
 
-        # iTunes
-        if "itunes" in parts:
-            amt = _last_digits(parts)
-            return "itunes", f"{names['itunes']} ${amt}" if amt else names['itunes']
+        if parts[0] in ("topup", "cat"):
+            # iTunes
+            if "itunes" in parts:
+                category = "itunes"
+                amt = first_digits(parts)
+                label = f"iTunes ${amt}" if amt else "iTunes"
+                return category, label
 
-        # Phone balance
-        for op in ("asiacell","zain","korek","atheer"):
-            if op in parts:
-                amt = _last_digits(parts)
-                return "phone", f"رصيد {names[op]} {amt}" if amt else f"رصيد {names[op]}"
+            # Phone balance
+            if any(x in parts for x in ("asiacell", "zain", "korek", "atheer")):
+                category = "phone"
+                op_map = {"asiacell": "آسيا سيل", "zain": "زين", "korek": "كورك", "atheer": "أثير"}
+                op = next((x for x in ("asiacell","zain","korek","atheer") if x in parts), None)
+                amt = first_digits(parts)
+                op_name = op_map.get(op, op or "الهاتف")
+                label = f"رصيد {op_name}" + (f" {amt}" if amt else "")
+                return category, label
 
-        # PUBG
-        if ("pubg" in parts) or ("bgmi" in parts) or ("uc" in parts):
-            amt = _last_digits(parts)
-            return "pubg", f"{names['pubg']} UC {amt}" if amt else f"{names['pubg']} UC"
+            # PUBG / BGMI
+            if any(x in parts for x in ("pubg", "bgmi", "uc")):
+                category = "pubg"
+                amt = first_digits(parts)
+                label = f"PUBG UC {amt}" if amt else "PUBG UC"
+                return category, label
 
-        # Ludo
-        if any("ludo" in p for p in parts):
-            base = "لودو"
-            if "diamonds" in parts:
-                base = names["diamonds"]
-            elif "gold" in parts:
-                base = names["gold"]
-            amt = _last_digits(parts)
-            return "ludo", f"{base} {amt}" if amt else base
+            # Ludo
+            if any("ludo" in x for x in parts):
+                category = "ludo"
+                # could be diamonds/gold
+                if "diamonds" in parts:
+                    base = "Ludo Diamonds"
+                elif "gold" in parts:
+                    base = "Ludo Gold"
+                else:
+                    base = "Ludo"
+                amt = first_digits(parts)
+                label = f"{base} {amt}" if amt else base
+                return category, label
 
-        return "service", ui_key or "خدمة"
+        return category, label
     except Exception:
         return "service", ui_key or "خدمة"
 
-def _short_label_for_ui_key(ui_key: str):
-    """Short label formatted per user's preference, like '5$أثير', '5$آيتونز', '60UCببجي'."""
-    try:
-        parts = [p for p in (ui_key or '').lower().split('.') if p]
-        names = _service_names_ar()
-        if not parts:
-            return "عنصر"
-
-        amt = _last_digits(parts) or ""
-        amt_dollar = f"{amt}$" if amt else ""
-
-        # iTunes
-        if "itunes" in parts:
-            return f"{amt_dollar}{names['itunes']}" if amt else names['itunes']
-
-        # Phone operators
-        for op in ("asiacell","zain","korek","atheer"):
-            if op in parts:
-                return f"{amt_dollar}{names[op]}" if amt else names[op]
-
-        # PUBG
-        if ("pubg" in parts) or ("bgmi" in parts) or ("uc" in parts):
-            return f"{(amt or '')}UC{names['pubg']}" if amt else f"UC{names['pubg']}"
-
-        # Ludo
-        if any("ludo" in p for p in parts):
-            if "diamonds" in parts:
-                base = "ألماس لودو"
-            elif "gold" in parts:
-                base = "ذهب لودو"
-            else:
-                base = "لودو"
-            return f"{amt}{base}" if amt else base
-
-        return ui_key or "عنصر"
-    except Exception:
-        return ui_key or "عنصر"
 
 def _fmt_price(v, currency: str = "$"):
     try:
-        return f"{float(v):g}{currency}"
+        f = float(v)
+        return f"{f:g}{currency}"
     except Exception:
         return f"{v}{currency}" if v is not None else ""
 
-def _ensure_user_notifications_table(cur):
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS public.user_notifications(
-            id BIGSERIAL PRIMARY KEY,
-            uid TEXT NOT NULL,
-            type TEXT NOT NULL,
-            title TEXT NOT NULL,
-            body TEXT NOT NULL,
-            data JSONB,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_uid_created ON public.user_notifications(uid, created_at DESC)")
+
+def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple], after: Optional[tuple]) -> None:
+    """
+    ترسل إشعار FCM عربي واضح عند تغيير السعر أو "الكمية" للخدمات اليدوية (ايتونز/أثير/آسيا/كورك)
+    وكذلك مفاتيح التصنيفات (PUBG/Ludo). لا نستخدم صياغة "بالألف" إطلاقاً.
+    أمثلة مطلوبة:
+      - تم تخفيض سعر 5$اثير من 7$ إلى 5$
+      - تم رفع سعر 10$ايتونز من 9$ إلى 10$
+      - تم تغيير كمية اثير من 5$اثير إلى 6$اثير
+    """
+    try:
+        def as_row_dict(r):
+            if not r:
+                return None
+            return {
+                "price_per_k": float(r[1]) if r[1] is not None else None,
+                "min_qty": int(r[2]) if (len(r) > 2 and r[2] is not None) else None,
+                "max_qty": int(r[3]) if (len(r) > 3 and r[3] is not None) else None,
+                "mode": (r[4] or "per_k") if len(r) > 4 else "per_k",
+            }
+
+        def _fmt_usd(v):
+            try:
+                f = float(v)
+                if abs(f - round(f)) < 1e-9:
+                    return f"{int(round(f))}$"
+                return f"{f:g}$"
+            except Exception:
+                return f"{v}$"
+
+        def _first_digits(parts):
+            for p in reversed(parts):
+                if p.isdigit():
+                    return int(p)
+            return None
+
+        def _svc_ar(parts):
+            if "itunes" in parts:   return "ايتونز"
+            if "atheer" in parts:   return "اثير"
+            if "asiacell" in parts: return "اسياسيل"
+            if "korek" in parts:    return "كورك"
+            if "pubg" in parts or "bgmi" in parts or "uc" in parts: return "ببجي"
+            if "ludo" in parts:
+                if "diamonds" in parts: return "لودو الماس"
+                if "gold" in parts:     return "لودو ذهب"
+                return "لودو"
+            return "خدمة"
+
+        parts = (ui_key or "").lower().split(".")
+        is_topup = parts and parts[0] == "topup"
+        svc_name = _svc_ar(parts)
+        ui_amt = _first_digits(parts)
+
+        b = as_row_dict(before)
+        a = as_row_dict(after)
+
+        old_amt = (b.get("min_qty") if b else None) or ui_amt
+        new_amt = (a.get("min_qty") if a else None) or ui_amt
+
+        old_price = b.get("price_per_k") if b else None
+        new_price = a.get("price_per_k") if a else None
+
+        lines = []
+        title = "تحديث التسعير"
+
+        if (b and not a):
+            if is_topup and old_amt:
+                pack = f"{old_amt}$" + svc_name
+                final_body = f"تم حذف تعديل سعر {pack} — عادت القيم إلى الافتراضية"
+            else:
+                final_body = f"تم حذف تعديل الأسعار لخدمة {svc_name} — عادت القيم إلى الافتراضية"
+
+        elif (a and not b):
+            if is_topup and new_amt is not None and new_price is not None:
+                pack = f"{new_amt}$" + svc_name
+                final_body = f"تم إضافة سعر {pack} = {_fmt_usd(new_price)}"
+            elif new_price is not None:
+                final_body = f"تم إضافة سعر {svc_name} = {_fmt_usd(new_price)}"
+            else:
+                final_body = f"تمت إضافة إعدادات جديدة لـ {svc_name}"
+
+        else:
+            changed_any = False
+            if old_price is not None and new_price is not None and abs(float(new_price) - float(old_price)) > 1e-9:
+                changed_any = True
+                direction = "رفع" if float(new_price) > float(old_price) else "تخفيض"
+                if is_topup and (new_amt or old_amt):
+                    ref_amt = new_amt if new_amt is not None else (old_amt or ui_amt)
+                    pack = f"{ref_amt}$" + svc_name
+                    lines.append(f"تم {direction} سعر {pack} من {_fmt_usd(old_price)} إلى {_fmt_usd(new_price)}")
+                else:
+                    lines.append(f"تم {direction} سعر {svc_name} من {_fmt_usd(old_price)} إلى {_fmt_usd(new_price)}")
+
+            if is_topup and (old_amt is not None) and (new_amt is not None) and (int(old_amt) != int(new_amt)):
+                changed_any = True
+                prev_pack = f"{old_amt}$" + svc_name
+                next_pack = f"{new_amt}$" + svc_name
+                lines.append(f"تم تغيير كمية {svc_name} من {prev_pack} إلى {next_pack}")
+
+            final_body = " — ".join(lines) if (lines and changed_any) else f"{svc_name} — تم التحديث"
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT d.fcm_token FROM public.user_devices d WHERE d.fcm_token IS NOT NULL AND d.fcm_token <> ''")
+            tokens = [r[0] for r in (cur.fetchall() or [])]
+
+        sent = 0
+        for t in tokens:
+            try:
+                _fcm_send_push(t, title, final_body, None)
+                sent += 1
+            except Exception as fe:
+                logger.exception("pricing_change FCM send failed: %s", fe)
+
+        logger.info("pricing.change.notify ui_key=%s tokens=%d sent=%d", ui_key, len(tokens), sent)
+    except Exception as e:
+        logger.exception("notify pricing change failed: %s", e)
