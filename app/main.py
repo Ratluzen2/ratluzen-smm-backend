@@ -2161,6 +2161,138 @@ def admin_clear_service_id(
 # =========================
 # Pricing overrides (server-level)
 # =========================
+
+# =========================
+# Pricing overrides helpers (table + notify)
+# =========================
+def _ensure_pricing_table(cur):
+    """
+    Make sure the pricing overrides table exists.
+    Using the same shape used elsewhere in the codebase.
+    """
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.service_pricing_overrides(
+            ui_key TEXT PRIMARY KEY,
+            price_per_k NUMERIC(18,6) NOT NULL,
+            min_qty INTEGER NOT NULL,
+            max_qty INTEGER NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'per_k',
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
+
+def _ensure_pricing_mode_column(cur):
+    """
+    Older deployments might miss the 'mode' column. Add it if missing.
+    """
+    try:
+        cur.execute("ALTER TABLE public.service_pricing_overrides ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'per_k'")
+    except Exception:
+        # Older Postgres versions always have this by now in our schema path;
+        # ignore if migration already applied.
+        pass
+
+def _notify_pricing_change_via_tokens(conn, ui_key: str, before, after):
+    """
+    Emit an Arabic, user‑friendly notification + FCM broadcast
+    describing what changed for a given ui_key.
+    - Inserts a row in public.user_notifications (uid-based) for all users.
+    - Sends an FCM push to all known device tokens.
+    """
+    # Decide what exactly changed
+    def _num(x):
+        try:
+            return float(x) if x is not None else None
+        except Exception:
+            return None
+
+    was = before or {}
+    now = after or {}
+    prev_price = _num(was[1] if isinstance(was, (list, tuple)) else was.get("price_per_k"))
+    prev_min   = int(was[2]) if isinstance(was, (list, tuple)) and was[2] is not None else (was.get("min_qty") if isinstance(was, dict) else None)
+    prev_max   = int(was[3]) if isinstance(was, (list, tuple)) and was[3] is not None else (was.get("max_qty") if isinstance(was, dict) else None)
+
+    new_price = _num(now[1] if isinstance(now, (list, tuple)) else now.get("price_per_k"))
+    new_min   = int(now[2]) if isinstance(now, (list, tuple)) and now[2] is not None else (now.get("min_qty") if isinstance(now, dict) else None)
+    new_max   = int(now[3]) if isinstance(now, (list, tuple)) and now[3] is not None else (now.get("max_qty") if isinstance(now, dict) else None)
+
+    # Compose text in Arabic using our short label helper
+    try:
+        short_name = _short_label_for_ui_key(ui_key)
+    except Exception:
+        short_name = ui_key or "خدمة"
+
+    lines = []
+    if prev_price is None and new_price is not None:
+        lines.append(f"تم تحديد سعر {short_name} إلى {new_price}")
+    elif prev_price is not None and new_price is None:
+        lines.append(f"تم حذف سعر {short_name} (العودة للوضع الافتراضي)")
+    elif prev_price is not None and new_price is not None and prev_price != new_price:
+        if new_price > prev_price:
+            lines.append(f"تم رفع السعر {short_name} من {prev_price} إلى {new_price}")
+        else:
+            lines.append(f"تم تخفيض السعر {short_name} من {prev_price} إلى {new_price}")
+
+    if prev_min is not None and new_min is not None and prev_min != new_min:
+        if new_min > prev_min:
+            lines.append(f"تم رفع الحد الأدنى للكمية {short_name} من {prev_min} إلى {new_min}")
+        else:
+            lines.append(f"تم تخفيض الحد الأدنى للكمية {short_name} من {prev_min} إلى {new_min}")
+
+    if prev_max is not None and new_max is not None and prev_max != new_max:
+        if new_max > prev_max:
+            lines.append(f"تم رفع الحد الأعلى للكمية {short_name} من {prev_max} إلى {new_max}")
+        else:
+            lines.append(f"تم تخفيض الحد الأعلى للكمية {short_name} من {prev_max} إلى {new_max}")
+
+    if not lines:
+        # nothing to notify
+        return
+
+    title = "تحديث الأسعار/الكميات"
+    body = "، ".join(lines)
+
+    # 1) ensure notifications table (uid-based)
+    with conn, conn.cursor() as cur:
+        try:
+            _ensure_user_notifications_table(cur)
+        except Exception:
+            pass
+
+        # 2) Insert a notification row for EVERY user (uid-based table)
+        try:
+            cur.execute("""
+                INSERT INTO public.user_notifications (uid, type, title, body, data, created_at)
+                SELECT u.uid, 'pricing_change', %s, %s, %s::jsonb, now()
+                FROM public.users u
+                WHERE u.uid IS NOT NULL AND u.uid <> ''
+            """, (
+                title,
+                body,
+                json.dumps({"ui_key": ui_key})
+            ))
+        except Exception as e:
+            logger.exception("insert user_notifications failed: %s", e)
+
+        # 3) collect DISTINCT FCM tokens
+        cur.execute(
+            """
+            SELECT DISTINCT d.fcm_token
+            FROM public.user_devices d
+            WHERE d.fcm_token IS NOT NULL AND d.fcm_token <> ''
+            """
+        )
+        tokens = [r[0] for r in cur.fetchall()]
+
+    # 4) fan-out FCM
+    sent = 0
+    for t in tokens:
+        try:
+            _fcm_send_push(t, title, body, None)
+            sent += 1
+        except Exception as fe:
+            logger.exception("pricing change FCM send failed: %s", fe)
+    logger.info("Pricing change broadcast for %s, tokens_sent=%s", ui_key, sent)
 class PricingIn(BaseModel):
     ui_key: str
     price_per_k: float
