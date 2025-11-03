@@ -659,6 +659,28 @@ def _parse_usd(d: Dict[str, Any]) -> int:
     return 0
 
 
+def _parse_amount_only(d: Dict[str, Any]) -> int:
+    """Parse only *amount/denomination* (integer). Ignores any 'price' keys to avoid truncating decimals."""
+    for k in ("usd","amount","amt","usd_amount"):
+        if k in d and d[k] not in (None, ""):
+            try:
+                return int(float(d[k]))
+            except Exception:
+                pass
+    return 0
+
+def _parse_price_override(d: Dict[str, Any]):
+    """Parse optional *price override* (accepts decimals). Returns float or None."""
+    for k in ("price","price_usd","priceUsd"):
+        if k in d and d[k] not in (None, ""):
+            try:
+                return float(d[k])
+            except Exception:
+                pass
+    return None
+
+
+
 
 def _push_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
     """Store notification in DB then push FCM to all user's devices (user_devices + fallback)."""
@@ -1247,7 +1269,13 @@ async def create_manual_paid(request: Request):
     data = await _read_json_object(request)
     uid = (data.get("uid") or "").strip()
     product_raw = (data.get("product") or data.get("type") or data.get("category") or data.get("title") or "").strip()
-    usd = _parse_usd(data)
+    amount = _parse_amount_only(data)
+
+    # Optional decimal price override coming from app/admin
+    price_override = _parse_price_override(data)
+
+    # Keep legacy variable name for the rest of the function
+    usd = amount
 
     # Player account / game id (optional but stored)
     account_id = (data.get("account_id") or data.get("accountId") or data.get("game_id") or "").strip()
@@ -1286,14 +1314,14 @@ async def create_manual_paid(request: Request):
         price = steps * 7.0
         title = f"شراء رصيد كورك {usd}$"
     elif product == "pubg_uc":
-        price = float(usd)
-        title = f"شحن شدات ببجي بسعر {usd}$"
+        price = float(price_override) if price_override is not None else float(usd)
+        title = f"شحن شدات ببجي بسعر {price if price_override is not None else usd}$"
     elif product == "ludo_diamond":
-        price = float(usd)
-        title = f"شراء الماسات لودو بسعر {usd}$"
+        price = float(price_override) if price_override is not None else float(usd)
+        title = f"شراء الماسات لودو بسعر {price if price_override is not None else usd}$"
     elif product == "ludo_gold":
-        price = float(usd)
-        title = f"شراء ذهب لودو بسعر {usd}$"
+        price = float(price_override) if price_override is not None else float(usd)
+        title = f"شراء ذهب لودو بسعر {price if price_override is not None else usd}$"
     else:
         raise HTTPException(422, "invalid product")
 
