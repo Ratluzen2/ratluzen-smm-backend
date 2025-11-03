@@ -58,7 +58,7 @@ OWNER_UID = os.getenv("OWNER_UID", "OWNER-0001").strip()
 PROVIDER_API_URL = os.getenv("PROVIDER_API_URL", "https://kd1s.com/api/v2")
 PROVIDER_API_KEY = os.getenv("PROVIDER_API_KEY", "25a9ceb07be0d8b2ba88e70dcbe92e06")
 
-POOL_MIN, POOL_MAX = 1, int(os.getenv("DB_POOL_MAX", "5"))
+POOL_MIN, POOL_MAX = 1, int(os.getenv("DB_POOL_MAX", "10"))
 dbpool: pool.SimpleConnectionPool = pool.SimpleConnectionPool(POOL_MIN, POOL_MAX, dsn=DATABASE_URL)
 
 def get_conn() -> psycopg2.extensions.connection:
@@ -3401,3 +3401,169 @@ def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple]
         logger.info("pricing.change.notify ui_key=%s tokens=%d sent=%d", ui_key, len(tokens), sent)
     except Exception as e:
         logger.exception("notify pricing change failed: %s", e)
+
+
+# =========================
+# Admin: Auto-Execute Pending API Orders (status/toggle/run)
+# =========================
+
+from contextlib import contextmanager
+
+@contextmanager
+def _db():
+    conn = get_conn()
+    try:
+        yield conn
+    finally:
+        put_conn(conn)
+
+def _ensure_kv_table(conn):
+    with conn, conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS public.kv_store (
+                key TEXT PRIMARY KEY,
+                value JSONB
+            )
+        """)
+
+def _kv_get(conn, key: str, default=None):
+    _ensure_kv_table(conn)
+    with conn, conn.cursor() as cur:
+        cur.execute("SELECT value FROM public.kv_store WHERE key=%s", (key,))
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            return default
+        try:
+            v = row[0]
+            # v is already JSONB -> python object
+            return v
+        except Exception:
+            return default
+
+def _kv_set(conn, key: str, value):
+    _ensure_kv_table(conn)
+    with conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO public.kv_store(key, value) VALUES(%s, %s) "
+            "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+            (key, Json(value))
+        )
+
+AUTO_EXEC_KEY = "auto_exec_enabled"
+
+@app.get("/api/admin/auto_exec/status")
+def admin_auto_exec_status(
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    with _db() as conn:
+        enabled = bool(_kv_get(conn, AUTO_EXEC_KEY, False))
+        return {"enabled": enabled}
+
+@app.post("/api/admin/auto_exec/toggle")
+def admin_auto_exec_toggle(
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    with _db() as conn:
+        cur_enabled = bool(_kv_get(conn, AUTO_EXEC_KEY, False))
+        new_enabled = not cur_enabled
+        _kv_set(conn, AUTO_EXEC_KEY, new_enabled)
+        return {"enabled": new_enabled}
+
+def _fetch_pending_api_order_ids(limit: int = 5) -> list[int]:
+    with _db() as conn:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT o.id FROM public.orders o "
+                "WHERE COALESCE(o.status,'Pending')='Pending' "
+                "AND COALESCE(o.service_id, 0) > 0 "
+                "ORDER BY COALESCE(o.created_at, NOW()) ASC "
+                "LIMIT %s",
+                (int(limit),)
+            )
+            rows = cur.fetchall()
+            return [int(r[0]) for r in rows]
+
+def _auto_exec_single(oid: int) -> dict:
+    # Read order details first (short DB usage)
+    with _db() as conn:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, user_id, service_id, link, quantity, price, status, provider_order_id, title "
+                "FROM public.orders WHERE id=%s",
+                (oid,)
+            )
+            row = cur.fetchone()
+    if not row:
+        return {"ok": False, "order_id": oid, "reason": "not_found"}
+
+    order_id, user_id, service_id, link, quantity, price, status, provider_order_id, title = row
+    status = (status or "Pending")
+    if provider_order_id:
+        return {"ok": True, "order_id": order_id, "skipped": True, "reason": "already_has_provider"}
+    if status != "Pending":
+        return {"ok": True, "order_id": order_id, "skipped": True, "reason": f"status_{status}"}
+    if not service_id or not link or not quantity:
+        return {"ok": False, "order_id": order_id, "reason": "missing_fields"}
+
+    # Call external provider OUTSIDE any DB transaction to avoid holding a pooled connection
+    try:
+        resp = requests.post(
+            PROVIDER_API_URL,
+            data={"key": PROVIDER_API_KEY, "action": "add", "service": str(service_id),
+                  "link": link, "quantity": str(quantity)},
+            timeout=25
+        )
+        if resp.status_code // 100 != 2:
+            raise Exception(f"provider_http_{resp.status_code}")
+        provider_json = resp.json()
+        provider_id = provider_json.get("order") or provider_json.get("order_id") or provider_json.get("id")
+        if not provider_id:
+            raise Exception("provider_bad_response")
+    except Exception as e:
+        # Refund & reject safely
+        with _db() as conn:
+            with conn, conn.cursor() as cur:
+                # fetch user_id & price again in case
+                cur.execute("SELECT user_id, price FROM public.orders WHERE id=%s", (order_id,))
+                r = cur.fetchone()
+                if r:
+                    u_id, eff_price = int(r[0]), float(r[1] or 0)
+                    if eff_price > 0:
+                        cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(eff_price), u_id))
+                        cur.execute(
+                            "INSERT INTO public.wallet_txns(user_id, amount, reason, meta) VALUES(%s,%s,%s,%s)",
+                            (u_id, Decimal(eff_price), "order_refund", Json({"order_id": order_id, "auto_exec": True}))
+                        )
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+        return {"ok": False, "order_id": order_id, "reason": str(e)}
+
+    # Success: update order with provider_order_id and set Processing
+    with _db() as conn:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE public.orders SET provider_order_id=%s, status='Processing' WHERE id=%s",
+                (str(provider_id), order_id)
+            )
+    return {"ok": True, "order_id": order_id, "provider_order_id": provider_id}
+
+@app.post("/api/admin/auto_exec/run")
+def admin_auto_exec_run(
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None,
+    limit: int = 5
+):
+    _require_admin(x_admin_password or password or "")
+    processed = []
+    for oid in _fetch_pending_api_order_ids(limit=limit):
+        res = _auto_exec_single(oid)
+        processed.append(res)
+    counts = {
+        "ok": sum(1 for r in processed if r.get("ok")),
+        "failed": sum(1 for r in processed if not r.get("ok")),
+        "skipped": sum(1 for r in processed if r.get("skipped")),
+    }
+    return {"summary": counts, "results": processed}
