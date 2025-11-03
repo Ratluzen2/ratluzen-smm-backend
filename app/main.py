@@ -3110,7 +3110,10 @@ def _auto_exec_one_locked(cur):
     if otype in ('manual', 'topup_card') or service_id is None:
         # mark as Done immediately for non-provider kinds to avoid blocking
         cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (oid,))
-        return {"order_id": oid, "status": "Done", "skipped": True}
+        
+    # claim row atomically so no other runner can pick it
+    cur.execute("UPDATE public.orders SET status='Processing' WHERE id=%s AND COALESCE(status,'Pending')='Pending'", (oid,))
+return {"order_id": oid, "status": "Done", "skipped": True}
     return {
         "order_id": int(oid),
         "user_id": int(user_id),
@@ -3124,7 +3127,17 @@ def _auto_exec_one_locked(cur):
 def _auto_exec_process_one(conn, rec):
     oid = rec["order_id"]; user_id = rec["user_id"]
     service_id = rec["service_id"]; link = rec["link"]; qty = rec["quantity"]; eff_price = rec["price"]
+    
+    # idempotency guard: if another worker already attached provider_order_id, skip safely
     try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT provider_order_id, status FROM public.orders WHERE id=%s", (oid,))
+            _r = cur.fetchone()
+            if _r and _r[0] is not None:
+                return {"order_id": oid, "status": "AlreadyProcessing", "provider_order_id": str(_r[0])}
+    except Exception:
+        pass
+try:
         resp = requests.post(
             PROVIDER_API_URL,
             data={"key": PROVIDER_API_KEY, "action": "add",
