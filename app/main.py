@@ -659,28 +659,6 @@ def _parse_usd(d: Dict[str, Any]) -> int:
     return 0
 
 
-def _parse_amount_only(d: Dict[str, Any]) -> int:
-    """Parse only *amount/denomination* (integer). Ignores any 'price' keys to avoid truncating decimals."""
-    for k in ("usd","amount","amt","usd_amount"):
-        if k in d and d[k] not in (None, ""):
-            try:
-                return int(float(d[k]))
-            except Exception:
-                pass
-    return 0
-
-def _parse_price_override(d: Dict[str, Any]):
-    """Parse optional *price override* (accepts decimals). Returns float or None."""
-    for k in ("price","price_usd","priceUsd"):
-        if k in d and d[k] not in (None, ""):
-            try:
-                return float(d[k])
-            except Exception:
-                pass
-    return None
-
-
-
 
 def _push_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
     """Store notification in DB then push FCM to all user's devices (user_devices + fallback)."""
@@ -1269,13 +1247,7 @@ async def create_manual_paid(request: Request):
     data = await _read_json_object(request)
     uid = (data.get("uid") or "").strip()
     product_raw = (data.get("product") or data.get("type") or data.get("category") or data.get("title") or "").strip()
-    amount = _parse_amount_only(data)
-
-    # Optional decimal price override coming from app/admin
-    price_override = _parse_price_override(data)
-
-    # Keep legacy variable name for the rest of the function
-    usd = amount
+    usd = _parse_usd(data)
 
     # Player account / game id (optional but stored)
     account_id = (data.get("account_id") or data.get("accountId") or data.get("game_id") or "").strip()
@@ -1284,6 +1256,16 @@ async def create_manual_paid(request: Request):
         raise HTTPException(422, "invalid payload")
 
     product = _normalize_product(product_raw, fallback_title=data.get("title") or "")
+    # Optional decimal price override coming from app/admin
+    price_override = None
+    for _k in ("price","price_usd","priceUsd"):
+        _v = data.get(_k)
+        if _v not in (None, ""):
+            try:
+                price_override = float(_v)
+                break
+            except Exception:
+                pass
     allowed_telco = {5,10,15,20,25,30,40,50,100}
     allowed_pubg = {2,9,15,40,55,100,185}
     allowed_ludo = {5,10,20,35,85,165,475,800}
