@@ -1319,30 +1319,6 @@ async def create_manual_paid(request: Request):
                 except Exception:
                     override_row = None
 
-            # --- Dynamic pricing overrides for PUBG/Ludo (same as iTunes) ---
-            pubg_ludo_override = None
-            if product in ("pubg_uc","ludo_diamond","ludo_gold"):
-                try:
-                    _ensure_pricing_table(cur)
-                    try:
-                        _ensure_pricing_mode_column(cur)
-                    except Exception:
-                        pass
-                    ui_keys = []
-                    if product == "pubg_uc":
-                        ui_keys = [f"pkg.pubg.{usd}", f"manual.pubg_uc.{usd}", f"pubg_uc.{usd}"]
-                    elif product == "ludo_diamond":
-                        ui_keys = [f"pkg.ludo.diamond.{usd}", f"manual.ludo_diamond.{usd}", f"ludo.diamond.{usd}"]
-                    elif product == "ludo_gold":
-                        ui_keys = [f"pkg.ludo.gold.{usd}", f"manual.ludo_gold.{usd}", f"ludo.gold.{usd}"]
-                    for _key in ui_keys:
-                        cur.execute("SELECT price_per_k FROM public.service_pricing_overrides WHERE ui_key=%s", (_key,))
-                        r = cur.fetchone()
-                        if r and r[0] is not None:
-                            pubg_ludo_override = r[0]
-                            break
-                except Exception:
-                    pubg_ludo_override = None
             # Validate amount for telco/itunes: allow admin overrides to bypass the static allowed list
             if product in ("itunes","atheer","asiacell","korek"):
                 allowed_telco = {5,10,15,20,25,30,40,50,100}
@@ -1374,18 +1350,39 @@ async def create_manual_paid(request: Request):
                         price = steps * 7.0
                         title = f"شراء رصيد كورك {usd}$"
             # ---------------------------------------------------------------------------
-            # Apply PUBG/Ludo DB override if found (overrides computed price & title)
-            if product in ("pubg_uc","ludo_diamond","ludo_gold") and ('pubg_ludo_override' in locals()) and pubg_ludo_override is not None:
+            # --- PUBG/Ludo pricing from DB (same style as iTunes) ---
+            pubg_ludo_override = None
+            if product in ("pubg_uc","ludo_diamond","ludo_gold"):
                 try:
-                    price = float(pubg_ludo_override)
+                    _ensure_pricing_table(cur)
+                    try:
+                        _ensure_pricing_mode_column(cur)
+                    except Exception:
+                        pass
+                    ui_keys = []
                     if product == "pubg_uc":
-                        title = f"شحن شدات ببجي بسعر {price}$"
+                        ui_keys = [f"pkg.pubg.{usd}", f"manual.pubg_uc.{usd}", f"pubg_uc.{usd}"]
                     elif product == "ludo_diamond":
-                        title = f"شراء الماسات لودو بسعر {price}$"
-                    else:
-                        title = f"شراء ذهب لودو بسعر {price}$"
+                        ui_keys = [f"pkg.ludo.diamond.{usd}", f"manual.ludo_diamond.{usd}", f"ludo.diamond.{usd}"]
+                    elif product == "ludo_gold":
+                        ui_keys = [f"pkg.ludo.gold.{usd}", f"manual.ludo_gold.{usd}", f"ludo.gold.{usd}"]
+                    for _key in ui_keys:
+                        cur.execute("SELECT price_per_k FROM public.service_pricing_overrides WHERE ui_key=%s", (_key,))
+                        r = cur.fetchone()
+                        if r and r[0] is not None:
+                            pubg_ludo_override = r[0]
+                            break
                 except Exception:
-                    pass
+                    pubg_ludo_override = None
+            
+            if product in ("pubg_uc","ludo_diamond","ludo_gold") and pubg_ludo_override is not None:
+                price = float(pubg_ludo_override)
+                if product == "pubg_uc":
+                    title = f"شحن شدات ببجي بسعر {price}$"
+                elif product == "ludo_diamond":
+                    title = f"شراء الماسات لودو بسعر {price}$"
+                else:
+                    title = f"شراء ذهب لودو بسعر {price}$"
             # ensure user & balance
             cur.execute("SELECT id, balance, is_banned FROM public.users WHERE uid=%s", (uid,))
             r = cur.fetchone()
