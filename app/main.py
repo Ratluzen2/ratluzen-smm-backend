@@ -1319,7 +1319,7 @@ async def create_manual_paid(request: Request):
                 except Exception:
                     override_row = None
 
-            # --- Dynamic pricing overrides for PUBG/Ludo (same as iTunes style) ---
+            # --- Dynamic pricing overrides for PUBG/Ludo (same as iTunes) ---
             pubg_ludo_override = None
             if product in ("pubg_uc","ludo_diamond","ludo_gold"):
                 try:
