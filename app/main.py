@@ -60,7 +60,7 @@ OWNER_UID = os.getenv("OWNER_UID", "OWNER-0001").strip()
 PROVIDER_API_URL = os.getenv("PROVIDER_API_URL", "https://kd1s.com/api/v2")
 PROVIDER_API_KEY = os.getenv("PROVIDER_API_KEY", "25a9ceb07be0d8b2ba88e70dcbe92e06")
 
-POOL_MIN, POOL_MAX = 1, int(os.getenv("DB_POOL_MAX", "12"))
+POOL_MIN, POOL_MAX = 1, int(os.getenv("DB_POOL_MAX", "5"))
 dbpool: pool.SimpleConnectionPool = pool.SimpleConnectionPool(POOL_MIN, POOL_MAX, dsn=DATABASE_URL)
 
 def get_conn() -> psycopg2.extensions.connection:
@@ -119,37 +119,6 @@ def _prune_bad_fcm_token(bad_token: str):
 logger = logging.getLogger("smm")
 logging.basicConfig(level=logging.INFO)
 
-
-
-def _log_pool_and_db_caps():
-    """
-    Log DB pool limits and Postgres capacity at startup.
-    Prints:
-      - Configured pool (min/max) and raw env DB_POOL_MAX
-      - Postgres max_connections
-      - Current active connections on this database (pg_stat_activity)
-    """
-    try:
-        env_val = (os.getenv("DB_POOL_MAX") or "").strip() or None
-        try:
-            # psycopg2 SimpleConnectionPool exposes .minconn/.maxconn
-            logger.info("DB pool config: POOL_MIN=%%s POOL_MAX=%%s (env DB_POOL_MAX=%%s)",
-                        getattr(dbpool, "minconn", 1), getattr(dbpool, "maxconn", None) or "?", env_val)
-        except Exception:
-            logger.info("DB pool config: POOL_MIN=%s POOL_MAX=%s (env DB_POOL_MAX=%%s)",
-                        POOL_MIN, POOL_MAX, env_val)
-        conn = get_conn()
-        try:
-            with conn, conn.cursor() as cur:
-                cur.execute("SELECT current_setting('max_connections')::int")
-                max_conn = int(cur.fetchone()[0])
-                cur.execute("SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database()")
-                used = int(cur.fetchone()[0])
-            logger.info("Postgres capacity: max_connections=%%s, active_in_current_db=%%s", max_conn, used)
-        finally:
-            put_conn(conn)
-    except Exception as e:
-        logger.exception("Startup DB capacity log failed: %s", e)
 
 # =========================
 # FCM helpers (V1 preferred; Legacy fallback)
@@ -3300,8 +3269,7 @@ async def _auto_exec_daemon():
 @app.on_event("startup")
 async def _startup_autoexec():
     try:
-                _log_pool_and_db_caps()
-if not _AUTOEXEC_DAEMON_STARTED:
+        if not _AUTOEXEC_DAEMON_STARTED:
             asyncio.create_task(_auto_exec_daemon())
     except Exception as e:
         logging.exception("failed to start auto-exec daemon: %s", e)
