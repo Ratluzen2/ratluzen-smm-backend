@@ -3094,11 +3094,15 @@ class AutoExecRunIn(BaseModel):
     only_when_enabled: bool = True
 
 def _auto_exec_one_locked(cur):
-    # pick one eligible API order
+    """Pick exactly one *API/provider* pending order and claim it.
+    Never auto-handle manual categories (iTunes, phone top-up, PUBG, Ludo, etc.).
+    """
+    # Only provider orders are eligible for auto execution
     cur.execute("""
         SELECT id, user_id, service_id, link, quantity, price, title, type
         FROM public.orders
         WHERE COALESCE(status,'Pending')='Pending'
+          AND type='provider'
         ORDER BY id ASC
         FOR UPDATE SKIP LOCKED
         LIMIT 1
@@ -3108,21 +3112,18 @@ def _auto_exec_one_locked(cur):
         return None
     (oid, user_id, service_id, link, qty, price, title, otype) = r
 
-    # Non-provider/manual kinds are marked done immediately to avoid blocking the queue
-    if otype in ('manual', 'topup_card') or service_id is None:
-        cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (oid,))
-        return {"order_id": oid, "status": "Done", "skipped": True}
+    # Defensive: if mis-labeled or missing service_id, skip silently (do NOT modify the row).
+    if service_id is None:
+        return None
 
-    # Claim the order atomically to prevent duplicate processing by other workers
+    # Claim atomically so no other worker can process it simultaneously.
     cur.execute("""
         UPDATE public.orders
         SET status='Processing'
-        WHERE id=%s AND COALESCE(status,'Pending')='Pending'
+        WHERE id=%s AND COALESCE(status,'Pending')='Pending' AND type='provider'
         RETURNING id
     """, (oid,))
-    claimed = cur.fetchone()
-    if not claimed:
-        # another worker took it
+    if not cur.fetchone():
         return None
 
     return {
