@@ -1,4 +1,6 @@
 from __future__ import annotations
+import asyncio
+
 from typing import Optional
 from fastapi import Header, HTTPException
 
@@ -58,7 +60,7 @@ OWNER_UID = os.getenv("OWNER_UID", "OWNER-0001").strip()
 PROVIDER_API_URL = os.getenv("PROVIDER_API_URL", "https://kd1s.com/api/v2")
 PROVIDER_API_KEY = os.getenv("PROVIDER_API_KEY", "25a9ceb07be0d8b2ba88e70dcbe92e06")
 
-J"))
+POOL_MIN, POOL_MAX = 1, int(os.getenv("DB_POOL_MAX", "12"))
 dbpool: pool.SimpleConnectionPool = pool.SimpleConnectionPool(POOL_MIN, POOL_MAX, dsn=DATABASE_URL)
 
 def get_conn() -> psycopg2.extensions.connection:
@@ -117,6 +119,37 @@ def _prune_bad_fcm_token(bad_token: str):
 logger = logging.getLogger("smm")
 logging.basicConfig(level=logging.INFO)
 
+
+
+def _log_pool_and_db_caps():
+    """
+    Log DB pool limits and Postgres capacity at startup.
+    Prints:
+      - Configured pool (min/max) and raw env DB_POOL_MAX
+      - Postgres max_connections
+      - Current active connections on this database (pg_stat_activity)
+    """
+    try:
+        env_val = (os.getenv("DB_POOL_MAX") or "").strip() or None
+        try:
+            # psycopg2 SimpleConnectionPool exposes .minconn/.maxconn
+            logger.info("DB pool config: POOL_MIN=%%s POOL_MAX=%%s (env DB_POOL_MAX=%%s)",
+                        getattr(dbpool, "minconn", 1), getattr(dbpool, "maxconn", None) or "?", env_val)
+        except Exception:
+            logger.info("DB pool config: POOL_MIN=%s POOL_MAX=%s (env DB_POOL_MAX=%%s)",
+                        POOL_MIN, POOL_MAX, env_val)
+        conn = get_conn()
+        try:
+            with conn, conn.cursor() as cur:
+                cur.execute("SELECT current_setting('max_connections')::int")
+                max_conn = int(cur.fetchone()[0])
+                cur.execute("SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database()")
+                used = int(cur.fetchone()[0])
+            logger.info("Postgres capacity: max_connections=%%s, active_in_current_db=%%s", max_conn, used)
+        finally:
+            put_conn(conn)
+    except Exception as e:
+        logger.exception("Startup DB capacity log failed: %s", e)
 
 # =========================
 # FCM helpers (V1 preferred; Legacy fallback)
@@ -3049,6 +3082,230 @@ def test_push_user(uid: str, title: str = "إشعار تجريبي", body: str =
 
 # =========================
 # Admin: Announcements CRUD
+
+# ======== Auto-Exec (Admin) - background daemon & endpoints ========
+from pydantic import BaseModel
+import asyncio, logging, os
+
+def _ensure_settings_table(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.settings(
+            key TEXT PRIMARY KEY,
+            value JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    """)
+
+def _get_flag(cur, key: str, default: bool = False) -> bool:
+    cur.execute("SELECT value FROM public.settings WHERE key=%s", (key,))
+    r = cur.fetchone()
+    if not r:
+        return default
+    v = r[0]
+    try:
+        if isinstance(v, dict):
+            return bool(v.get("enabled", default))
+        # If JSONB stored directly as bool
+        return bool(v)
+    except Exception:
+        return default
+
+def _set_flag(cur, key: str, enabled: bool) -> None:
+    cur.execute("""
+        INSERT INTO public.settings(key, value, updated_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+    """, (key, Json({"enabled": bool(enabled)})))
+
+class AutoExecToggleIn(BaseModel):
+    enabled: bool
+
+class AutoExecRunIn(BaseModel):
+    limit: int = 3
+    only_when_enabled: bool = True
+
+def _auto_exec_one_locked(cur):
+    # pick one eligible API order
+    cur.execute("""
+        SELECT id, user_id, service_id, link, quantity, price, title, type
+        FROM public.orders
+        WHERE COALESCE(status,'Pending')='Pending'
+        ORDER BY id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    """)
+    r = cur.fetchone()
+    if not r:
+        return None
+    (oid, user_id, service_id, link, qty, price, title, otype) = r
+    if otype in ('manual', 'topup_card') or service_id is None:
+        # mark as Done immediately for non-provider kinds to avoid blocking
+        cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (oid,))
+        return {"order_id": oid, "status": "Done", "skipped": True}
+    return {
+        "order_id": int(oid),
+        "user_id": int(user_id),
+        "service_id": int(service_id),
+        "link": link or "",
+        "quantity": int(qty or 0),
+        "price": float(price or 0.0),
+        "title": title or ""
+    }
+
+def _auto_exec_process_one(conn, rec):
+    oid = rec["order_id"]; user_id = rec["user_id"]
+    service_id = rec["service_id"]; link = rec["link"]; qty = rec["quantity"]; eff_price = rec["price"]
+    try:
+        resp = requests.post(
+            PROVIDER_API_URL,
+            data={"key": PROVIDER_API_KEY, "action": "add",
+                  "service": str(service_id), "link": link, "quantity": str(qty)},
+            timeout=25
+        )
+    except Exception:
+        with conn, conn.cursor() as cur:
+            _refund_if_needed(cur, user_id, eff_price, oid)
+            cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (oid,))
+        return {"order_id": oid, "status": "Rejected", "reason": "provider_unreachable"}
+
+    if resp.status_code // 100 != 2:
+        with conn, conn.cursor() as cur:
+            _refund_if_needed(cur, user_id, eff_price, oid)
+            cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (oid,))
+        return {"order_id": oid, "status": "Rejected", "reason": "provider_http"}
+
+    try:
+        data = resp.json()
+    except Exception:
+        with conn, conn.cursor() as cur:
+            _refund_if_needed(cur, user_id, eff_price, oid)
+            cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (oid,))
+        return {"order_id": oid, "status": "Rejected", "reason": "bad_provider_json"}
+
+    provider_id = data.get("order") or data.get("order_id")
+    if not provider_id:
+        with conn, conn.cursor() as cur:
+            _refund_if_needed(cur, user_id, eff_price, oid)
+            cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (oid,))
+        return {"order_id": oid, "status": "Rejected", "reason": "no_provider_id"}
+
+    with conn, conn.cursor() as cur:
+        cur.execute("""
+            UPDATE public.orders
+            SET provider_order_id=%s, status='Processing'
+            WHERE id=%s
+        """, (str(provider_id), oid))
+    try:
+        _notify_user(conn, user_id, oid, "تم قبول طلبك", "تم تحويل طلبك إلى المعالجة.")
+    except Exception:
+        pass
+    return {"order_id": oid, "status": "Processing", "provider_order_id": provider_id}
+
+def _auto_exec_run(conn, limit: int = 3):
+    processed = []
+    for _ in range(max(1, min(int(limit or 1), 20))):
+        with conn, conn.cursor() as cur:
+            _ensure_settings_table(cur)
+            rec = _auto_exec_one_locked(cur)
+            if not rec or rec.get("skipped"):
+                if rec and rec.get("skipped"):
+                    processed.append(rec)
+                # Nothing to do
+                break
+        out = _auto_exec_process_one(conn, rec)
+        processed.append(out)
+    return processed
+
+# ---- endpoints ----
+@app.get("/api/admin/auto_exec/status")
+def admin_auto_exec_status(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_settings_table(cur)
+            enabled = _get_flag(cur, "auto_exec_api", False)
+        return {"enabled": bool(enabled)}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/auto_exec/toggle")
+def admin_auto_exec_toggle(body: AutoExecToggleIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_settings_table(cur)
+            _set_flag(cur, "auto_exec_api", bool(body.enabled))
+        # Wake up daemon (safe if already running)
+        try:
+            asyncio.create_task(_auto_exec_daemon())
+        except Exception:
+            pass
+        return {"ok": True, "enabled": bool(body.enabled)}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/auto_exec/run")
+def admin_auto_exec_run(body: AutoExecRunIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_settings_table(cur)
+            if body.only_when_enabled and not _get_flag(cur, "auto_exec_api", False):
+                return {"ok": True, "enabled": False, "processed": []}
+        processed = _auto_exec_run(conn, limit=body.limit)
+        return {"ok": True, "enabled": True, "processed": processed}
+    finally:
+        put_conn(conn)
+
+# ---- background daemon ----
+_AUTOEXEC_DAEMON_STARTED = False
+AUTOEXEC_IDLE_SLEEP = int(os.getenv("AUTOEXEC_IDLE_SLEEP", "5"))
+AUTOEXEC_LOOP_SLEEP = int(os.getenv("AUTOEXEC_LOOP_SLEEP", "2"))
+AUTOEXEC_LIMIT      = int(os.getenv("AUTOEXEC_LIMIT", "3"))
+
+async def _auto_exec_daemon():
+    global _AUTOEXEC_DAEMON_STARTED
+    _AUTOEXEC_DAEMON_STARTED = True
+    while True:
+        try:
+            conn = get_conn()
+            try:
+                with conn, conn.cursor() as cur:
+                    _ensure_settings_table(cur)
+                    enabled = _get_flag(cur, "auto_exec_api", False)
+            finally:
+                put_conn(conn)
+
+            if not enabled:
+                await asyncio.sleep(AUTOEXEC_IDLE_SLEEP)
+                continue
+
+            processed_any = False
+            conn = get_conn()
+            try:
+                batch = _auto_exec_run(conn, limit=AUTOEXEC_LIMIT)
+                processed_any = bool(batch)
+            finally:
+                put_conn(conn)
+
+            await asyncio.sleep(0.5 if processed_any else AUTOEXEC_LOOP_SLEEP)
+
+        except Exception as e:
+            logging.exception("auto-exec daemon loop error: %s", e)
+            await asyncio.sleep(3)
+
+@app.on_event("startup")
+async def _startup_autoexec():
+    try:
+                _log_pool_and_db_caps()
+if not _AUTOEXEC_DAEMON_STARTED:
+            asyncio.create_task(_auto_exec_daemon())
+    except Exception as e:
+        logging.exception("failed to start auto-exec daemon: %s", e)
+# ======== /Auto-Exec (Admin) ========
 # =========================
 from fastapi import Header
 
