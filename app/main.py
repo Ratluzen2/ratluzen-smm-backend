@@ -1319,7 +1319,7 @@ async def create_manual_paid(request: Request):
                 except Exception:
                     override_row = None
 
-            # --- Dynamic pricing overrides for PUBG/Ludo (flat price per pack) ---
+            # --- Dynamic pricing overrides for PUBG/Ludo (same as iTunes style) ---
             pubg_ludo_override = None
             if product in ("pubg_uc","ludo_diamond","ludo_gold"):
                 try:
@@ -1328,16 +1328,18 @@ async def create_manual_paid(request: Request):
                         _ensure_pricing_mode_column(cur)
                     except Exception:
                         pass
-                    ui_keys = [f"manual.{product}.{usd}", f"{product}.{usd}"]
-                    if product == "ludo_diamond":
-                        ui_keys.append(f"ludo.diamond.{usd}")
+                    ui_keys = []
+                    if product == "pubg_uc":
+                        ui_keys = [f"pkg.pubg.{usd}", f"manual.pubg_uc.{usd}", f"pubg_uc.{usd}"]
+                    elif product == "ludo_diamond":
+                        ui_keys = [f"pkg.ludo.diamond.{usd}", f"manual.ludo_diamond.{usd}", f"ludo.diamond.{usd}"]
                     elif product == "ludo_gold":
-                        ui_keys.append(f"ludo.gold.{usd}")
+                        ui_keys = [f"pkg.ludo.gold.{usd}", f"manual.ludo_gold.{usd}", f"ludo.gold.{usd}"]
                     for _key in ui_keys:
-                        cur.execute("SELECT price_per_k, COALESCE(min_qty,0), COALESCE(max_qty,0), COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (_key,))
+                        cur.execute("SELECT price_per_k FROM public.service_pricing_overrides WHERE ui_key=%s", (_key,))
                         r = cur.fetchone()
-                        if r:
-                            pubg_ludo_override = r
+                        if r and r[0] is not None:
+                            pubg_ludo_override = r[0]
                             break
                 except Exception:
                     pubg_ludo_override = None
@@ -1372,11 +1374,10 @@ async def create_manual_paid(request: Request):
                         price = steps * 7.0
                         title = f"شراء رصيد كورك {usd}$"
             # ---------------------------------------------------------------------------
-            # Apply PUBG/Ludo override if found (overrides computed price & title)
-            if product in ("pubg_uc","ludo_diamond","ludo_gold") and ('pubg_ludo_override' in locals()) and pubg_ludo_override:
+            # Apply PUBG/Ludo DB override if found (overrides computed price & title)
+            if product in ("pubg_uc","ludo_diamond","ludo_gold") and ('pubg_ludo_override' in locals()) and pubg_ludo_override is not None:
                 try:
-                    ppk, mn, mx, mode = float(pubg_ludo_override[0] or 0), int(pubg_ludo_override[1] or 0), int(pubg_ludo_override[2] or 0), (pubg_ludo_override[3] or 'per_k')
-                    price = float(ppk)
+                    price = float(pubg_ludo_override)
                     if product == "pubg_uc":
                         title = f"شحن شدات ببجي بسعر {price}$"
                     elif product == "ludo_diamond":
