@@ -1266,7 +1266,7 @@ async def create_manual_paid(request: Request):
         if usd not in allowed_pubg:
             raise HTTPException(422, "invalid usd for pubg")
     elif product in ("ludo_diamond","ludo_gold"):
-        if usd not in allowed_ludo:
+        if usd <= 0:
             raise HTTPException(422, "invalid usd for ludo")
     else:
         raise HTTPException(422, "invalid product")
@@ -3094,15 +3094,11 @@ class AutoExecRunIn(BaseModel):
     only_when_enabled: bool = True
 
 def _auto_exec_one_locked(cur):
-    """Pick exactly one *API/provider* pending order and claim it.
-    Never auto-handle manual categories (iTunes, phone top-up, PUBG, Ludo, etc.).
-    """
-    # Only provider orders are eligible for auto execution
+    # pick one eligible API order
     cur.execute("""
         SELECT id, user_id, service_id, link, quantity, price, title, type
         FROM public.orders
         WHERE COALESCE(status,'Pending')='Pending'
-          AND type='provider'
         ORDER BY id ASC
         FOR UPDATE SKIP LOCKED
         LIMIT 1
@@ -3111,21 +3107,10 @@ def _auto_exec_one_locked(cur):
     if not r:
         return None
     (oid, user_id, service_id, link, qty, price, title, otype) = r
-
-    # Defensive: if mis-labeled or missing service_id, skip silently (do NOT modify the row).
-    if service_id is None:
-        return None
-
-    # Claim atomically so no other worker can process it simultaneously.
-    cur.execute("""
-        UPDATE public.orders
-        SET status='Processing'
-        WHERE id=%s AND COALESCE(status,'Pending')='Pending' AND type='provider'
-        RETURNING id
-    """, (oid,))
-    if not cur.fetchone():
-        return None
-
+    if otype in ('manual', 'topup_card') or service_id is None:
+        # mark as Done immediately for non-provider kinds to avoid blocking
+        cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (oid,))
+        return {"order_id": oid, "status": "Done", "skipped": True}
     return {
         "order_id": int(oid),
         "user_id": int(user_id),
