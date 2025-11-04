@@ -33,7 +33,6 @@ import os
 import json
 import time
 import logging
-import re
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -3320,33 +3319,73 @@ def _auto_exec_run(conn, limit: int = 3):
 
 # ---- endpoints ----
 @app.get("/api/admin/auto_exec/status")
-def admin_auto_exec_status(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+def admin_auto_exec_status(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+                           password: Optional[str] = None,
+                           scope: Optional[str] = None):
     _require_admin(_pick_admin_password(x_admin_password, password) or "")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             _ensure_settings_table(cur)
+            if scope:
+                flag = _scope_flag_name(scope)
+                enabled = _get_flag(cur, flag, False)
+                if scope == "itunes":
+                    try:
+                        _ensure_itunes_codes_table(cur)
+                        cur.execute("SELECT COUNT(*) FROM public.itunes_codes WHERE used=FALSE")
+                        free = int(cur.fetchone()[0])
+                    except Exception:
+                        free = 0
+                    return {"enabled": bool(enabled), "free_codes": free}
+                if scope == "cards":
+                    try:
+                        _ensure_card_codes_table(cur)
+                        cur.execute("SELECT COUNT(*) FROM public.card_codes WHERE used=FALSE")
+                        free = int(cur.fetchone()[0])
+                    except Exception:
+                        free = 0
+                    return {"enabled": bool(enabled), "free_codes": free}
+                return {"enabled": bool(enabled)}
             enabled = _get_flag(cur, "auto_exec_api", False)
         return {"enabled": bool(enabled)}
     finally:
         put_conn(conn)
 
+
 @app.post("/api/admin/auto_exec/toggle")
 def admin_auto_exec_toggle(body: AutoExecToggleIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    # Enhanced: supports scope in body, sets proper flag, schedules daemons on running loop
+    _require_admin(_pick_admin_password(x_admin_password, password, getattr(body, "dict", lambda:{})() if hasattr(body, "dict") else None) or "")
+    raw = body.dict() if hasattr(body,"dict") else {}
+    scope = (raw.get("scope") or "api").lower()
+    enabled = bool(raw.get("enabled", False))
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             _ensure_settings_table(cur)
-            _set_flag(cur, "auto_exec_api", bool(body.enabled))
-        # Wake up daemon (safe if already running)
+            flag = _scope_flag_name(scope)
+            _set_flag(cur, flag, enabled)
+        # schedule
         try:
-            asyncio.create_task(_auto_exec_daemon())
-        except Exception:
-            pass
-        return {"ok": True, "enabled": bool(body.enabled)}
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.get_event_loop()
+            if scope in ("itunes","api"):
+                loop.create_task(_itunes_autoexec_daemon())
+            if scope in ("cards","api"):
+                loop.create_task(_cards_autoexec_daemon())
+            try:
+                loop.create_task(_auto_exec_daemon())
+            except Exception:
+                pass
+        except Exception as e:
+            logging.exception("auto_exec.toggle scheduling error: %s", e)
+        return {"ok": True, "scope": scope, "enabled": enabled}
     finally:
         put_conn(conn)
+
 
 @app.post("/api/admin/auto_exec/run")
 def admin_auto_exec_run(body: AutoExecRunIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
@@ -3368,7 +3407,7 @@ AUTOEXEC_IDLE_SLEEP = int(os.getenv("AUTOEXEC_IDLE_SLEEP", "5"))
 AUTOEXEC_LOOP_SLEEP = int(os.getenv("AUTOEXEC_LOOP_SLEEP", "2"))
 AUTOEXEC_LIMIT      = int(os.getenv("AUTOEXEC_LIMIT", "3"))
 
-async def _auto_exec_daemon():
+async def asyncio.get_running_loop().create_task(_auto_exec_daemon()):
     global _AUTOEXEC_DAEMON_STARTED
     _AUTOEXEC_DAEMON_STARTED = True
     while True:
@@ -4012,58 +4051,45 @@ def auto_exec_status_scoped(x_admin_password: Optional[str] = Header(None, alias
 
 @app.post("/api/admin/auto_exec/set")
 def auto_exec_set(body: AutoScopeSetIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    _require_admin(_pick_admin_password(x_admin_password, password, (body.dict() if hasattr(body,'dict') else {})) or "")
-    scope = (body.scope or "").strip().lower()
-    if scope not in ("itunes","cards","api",""):
-        raise HTTPException(422, "invalid scope")
-    flag = _scope_flag_name(scope)
+    # Robust: sets per-scope flag and schedules the right daemon on the running loop
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             _ensure_settings_table(cur)
-            _set_flag(cur, flag, bool(body.enabled))
-        # Start daemons
+            scope = (getattr(body, "scope", None) or "api").lower()
+            enabled = bool(getattr(body, "enabled", False))
+            flag = _scope_flag_name(scope)
+            _set_flag(cur, flag, enabled)
+        # schedule
         try:
-            asyncio.create_task(_itunes_autoexec_daemon())
-            asyncio.create_task(_cards_autoexec_daemon())
-        except Exception:
-            pass
-        return {"ok": True, "scope": scope or "api", "enabled": bool(body.enabled)}
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.get_event_loop()
+            if scope in ("itunes","api"):
+                loop.create_task(_itunes_autoexec_daemon())
+            if scope in ("cards","api"):
+                loop.create_task(_cards_autoexec_daemon())
+            try:
+                loop.create_task(_auto_exec_daemon())
+            except Exception:
+                pass
+        except Exception as e:
+            logging.exception("auto_exec.set scheduling error: %s", e)
+        return {"ok": True, "scope": scope, "enabled": enabled}
     finally:
         put_conn(conn)
 
+
 # ----- Pickers & processors -----
-
 def _parse_category_from_title(title: str) -> Optional[str]:
-    """
-    Robust parser: normalizes Arabic digits and uses a local import of re to avoid NameError
-    even if top-level imports fail for any reason.
-    Returns one of: "5","10","15","20","25","30","40","50","100" or None.
-    """
-    try:
-        import re as _re
-    except Exception:
-        _re = None
-
-    # Normalize to lowercase and convert Arabic-Indic digits to ASCII
-    digits_map = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-    t = (title or "").lower().translate(digits_map)
-
-    # 1) '$' pattern like "15$" or "$ 25"
-    if _re:
-        m1 = _re.search(r"(5|10|15|20|25|30|40|50|100)\s*\$|\$\s*(5|10|15|20|25|30|40|50|100)", t)
-        if m1:
-            return m1.group(1) or m1.group(2)
-        # 2) bare number token
-        m2 = _re.search(r"\b(5|10|15|20|25|30|40|50|100)\b", t)
-        if m2:
-            return m2.group(1)
-
-    # 3) fallback contains-check (no regex)
-    for tok in ("100","50","40","30","25","20","15","10","5"):
-        if tok in t:
-            return tok
-    return None
+    t = (title or "").lower()
+    # match 5,10,15,20,25,30,40,50,100 with or without $ symbol
+    m = re.search(r"(5|10|15|20|25|30|40|50|100)\s*\$|\$\s*(5|10|15|20|25|30|40|50|100)", t)
+    if m: return m.group(1) or m.group(2)
+    m = re.search(r"\b(5|10|15|20|25|30|40|50|100)\b", t)
+    return m.group(1) if m else None
 
 def _parse_telco_from_title(title: str) -> Optional[str]:
     t = (title or "").lower()
