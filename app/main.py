@@ -649,27 +649,90 @@ def _normalize_product(raw: str, fallback_title: str = "") -> str:
     return t or "itunes"
 
 def _parse_usd(d: Dict[str, Any]) -> int:
-    """Extract a positive *pack amount* in USD-ish units from a flexible payload.
+    """Extract a positive integer USD *pack* value from a flexible payload.
 
-    We intentionally try dedicated USD fields first and treat very large
-    "amount" values (e.g. 66680 لودو ذهب) as *quantities*, not USD, so they
-    don't trigger validation errors for game services.
+    This helper is used for iTunes / رصيد الهاتف فقط.
+    For PUBG / Ludo we use separate helpers so that fractional prices مثل 2.50 أو 8.99
+    لا تُقص إلى أعداد صحيحة.
     """
-    for k in ("usd", "price_usd", "priceUsd", "usd_amount", "amount", "price", "amt"):
+    # Primary fields where the client sends the USD pack value (5,10,15,...)
+    for k in ("usd", "usd_amount", "amount", "amt"):
         if k in d and d[k] not in (None, ""):
             try:
                 v = float(d[k])
             except Exception:
                 continue
-            # Skip non-positive
             if v <= 0:
                 continue
-            # For game packs we often send amount=coins (e.g. 66680). Treat those
-            # as quantity, not USD, and fall through to other keys such as price.
-            if k == "amount" and v > 1000:
+            return int(v)
+
+    # Fallbacks (rare): treat price_usd as pack size if no explicit usd/amount
+    for k in ("price_usd", "priceUsd", "price"):
+        if k in d and d[k] not in (None, ""):
+            try:
+                v = float(d[k])
+            except Exception:
+                continue
+            if v <= 0:
+                continue
+            return int(v)
+
+    return 0
+
+
+def _parse_game_quantity(d: Dict[str, Any]) -> int:
+    """Extract quantity for game services (PUBG UC / Ludo).
+
+    Examples:
+      650 شدة، 810 الماسة، 56468 ذهب
+    """
+    for k in (
+        "quantity",
+        "qty",
+        "amount",
+        "amount_uc",
+        "amount_uc_value",
+        "amount_gold",
+        "amount_diamond",
+        "units",
+        "pack",
+    ):
+        if k in d and d[k] not in (None, ""):
+            try:
+                v = float(d[k])
+            except Exception:
+                continue
+            if v <= 0:
                 continue
             return int(v)
     return 0
+
+
+def _parse_game_price(d: Dict[str, Any]) -> float:
+    """Extract price (with decimals) for game services (PUBG / Ludo)."""
+    # Preferred explicit price fields used by the app
+    for k in ("price", "priceUsd", "price_usd", "usd_price"):
+        if k in d and d[k] not in (None, ""):
+            try:
+                v = float(d[k])
+            except Exception:
+                continue
+            if v <= 0:
+                continue
+            return float(v)
+
+    # Backwards compatibility: some أقدم إصدارات كانت ترسل السعر في حقل usd/amount
+    for k in ("usd", "usd_amount", "amount", "amt"):
+        if k in d and d[k] not in (None, ""):
+            try:
+                v = float(d[k])
+            except Exception:
+                continue
+            if v <= 0:
+                continue
+            return float(v)
+
+    return 0.0
 
 
 
@@ -1238,39 +1301,29 @@ def mark_notification_read(uid: str, nid: int):
 # =========================
 @app.post("/api/orders/create/manual_paid")
 async def create_manual_paid(request: Request):
-    """Creates a manual order (iTunes / Atheer / Asiacell / Korek / PUBG / Ludo) and atomically charges user balance.
+    """
+    Creates a manual order (iTunes / Atheer / Asiacell / Korek / PUBG / Ludo) and atomically charges user balance.
 
-    Body (flexible):
+    هذه الـ endpoint تُستخدم لكل الطلبات اليدوية التي تخصم من المحفظة مباشرة ثم تعيد المبلغ
+    في حال قام المالك برفض الطلب لاحقًا.
+
+    Body (flexible JSON), أمثلة للحقول المتوقعة:
       {
-        uid: str,
-        product: "itunes"|"atheer"|"asiacell"|"korek"|"pubg_uc"|"ludo_diamond"|"ludo_gold" | Arabic labels,
-        usd|price|priceUsd|price_usd|amount: int,
-        account_id|accountId|game_id?: str
+        "uid": "1234567",
+        "product": "pubg_uc" | "ludo_diamond" | "ludo_gold" | "itunes" | "atheer" | "asiacell" | "korek",
+        // لببجي/لودو:
+        "quantity": 650,        // 650 شدة - أو 810 الماسة - أو 56468 ذهب (كميات)
+        "price": 2.50,          // السعر بالدولار ويحتوي أجزاء
+        // أو لإصدار أقدم:
+        // "usd": 2.50           // في هذه الحالة نعتبره هو السعر
+        // لخدمات الرصيد/ايتونز:
+        // "usd": 5              // قيمة الرصيد بالدولار (5, 10, 15, ...)
+        "account_id": "PLAYER_ID(optional)"
       }
-
-    Pricing:
-      - itunes:   each 5$ = 9$
-      - atheer:   each 5$ = 7$
-      - asiacell: each 5$ = 7$
-      - korek:    each 5$ = 7$
-      - pubg_uc:  base price = usd (actual charged price may come from app, e.g. 2.3$)
-      - ludo_*:   base price = usd (actual charged price may come from app, e.g. 5.5$)
-
-    Refund: if owner rejects later, /api/admin/orders/{id}/reject auto-refunds price>0.
     """
     data = await _read_json_object(request)
     uid = (data.get("uid") or "").strip()
     product_raw = (data.get("product") or data.get("type") or data.get("category") or data.get("title") or "").strip()
-    usd = _parse_usd(data)
-
-    # Optional explicit price from client (used for PUBG / Ludo to allow fractions like 2.3$)
-    raw_price = data.get("price") or data.get("priceUsd") or data.get("price_usd")
-    client_price = None
-    try:
-        if raw_price not in (None, ""):
-            client_price = float(raw_price)
-    except Exception:
-        client_price = None
 
     # Player account / game id (optional but stored)
     account_id = (data.get("account_id") or data.get("accountId") or data.get("game_id") or "").strip()
@@ -1279,63 +1332,75 @@ async def create_manual_paid(request: Request):
         raise HTTPException(422, "invalid payload")
 
     product = _normalize_product(product_raw, fallback_title=data.get("title") or "")
-    allowed_telco = {5, 10, 15, 20, 25, 30, 40, 50, 100}
 
-    # Basic validation on product / amount.
-    # - Telco (iTunes/Atheer/Asiacell/Korek): concrete USD values are validated
-    #   later, taking admin overrides into account.
-    # - PUBG / Ludo: accept any positive pack amount so we can support
-    #   fractional prices coming from the app (e.g. 2.3$) without failing 422.
-    if product in ("itunes", "atheer", "asiacell", "korek"):
-        pass  # telco handled below
-    elif product == "pubg_uc":
-        if usd <= 0:
-            raise HTTPException(422, "invalid usd for pubg")
-    elif product in ("ludo_diamond", "ludo_gold"):
-        if usd <= 0:
-            raise HTTPException(422, "invalid usd for ludo")
-    else:
-        raise HTTPException(422, "invalid product")
+    telco_products = ("itunes", "atheer", "asiacell", "korek")
+    game_products = ("pubg_uc", "ludo_diamond", "ludo_gold")
 
-    # Pricing & title
-    steps = usd / 5.0
-    if product == "itunes":
-        price = steps * 9.0
-        title = f"شراء رصيد ايتونز {usd}$"
-    elif product == "atheer":
-        price = steps * 7.0
-        title = f"شراء رصيد اثير {usd}$"
-    elif product == "asiacell":
-        price = steps * 7.0
-        title = f"شراء رصيد اسياسيل {usd}$"
-    elif product == "korek":
-        price = steps * 7.0
-        title = f"شراء رصيد كورك {usd}$"
-    elif product == "pubg_uc":
-        base_price = float(usd)
-        price = float(client_price) if (client_price is not None and client_price > 0) else base_price
-        title = f"شحن شدات ببجي بسعر {price}$"
-    elif product == "ludo_diamond":
-        base_price = float(usd)
-        price = float(client_price) if (client_price is not None and client_price > 0) else base_price
-        title = f"شراء الماسات لودو بسعر {price}$"
-    elif product == "ludo_gold":
-        base_price = float(usd)
-        price = float(client_price) if (client_price is not None and client_price > 0) else base_price
-        title = f"شراء ذهب لودو بسعر {price}$"
+    usd = 0            # يستخدم مع ايتونز/الرصيد (5,10,15,...)
+    game_qty = 0       # 60 شدة، 650 شدة، 810 الماسة، 56468 ذهب ...
+    price = 0.0        # السعر الفعلي الذي سيتم خصمه من المحفظة (يدعم الكسور)
+    title = ""
+
+    # -------- Telco / iTunes (topups) --------
+    if product in telco_products:
+        usd = _parse_usd(data)
+        if usd <= 0:
+            raise HTTPException(422, "invalid usd for telco/itunes")
+
+        # سعر افتراضي حسب كل 5$ (يمكن أن يتغير عبر overrides بالأسفل)
+        steps = usd / 5.0
+        if product == "itunes":
+            price = steps * 9.0
+            title = f"شراء رصيد ايتونز {usd}$"
+        elif product == "atheer":
+            price = steps * 7.0
+            title = f"شراء رصيد اثير {usd}$"
+        elif product == "asiacell":
+            price = steps * 7.0
+            title = f"شراء رصيد اسياسيل {usd}$"
+        elif product == "korek":
+            price = steps * 7.0
+            title = f"شراء رصيد كورك {usd}$"
+
+    # -------- PUBG / Ludo (games) --------
+    elif product in game_products:
+        # الكمية مثل 60 شدة / 810 الماسة / 56468 ذهب
+        game_qty = _parse_game_quantity(data)
+        if game_qty <= 0:
+            # للتوافق مع إصدارات أقدم قد ترسل الكمية في usd أو amount فقط
+            game_qty = _parse_usd(data)
+        if game_qty <= 0:
+            raise HTTPException(422, "invalid quantity for game service")
+
+        # السعر الفعلي الذي يحتوي أجزاء
+        game_price = _parse_game_price(data)
+        if game_price <= 0:
+            raise HTTPException(422, "invalid price for game service")
+
+        price = float(game_price)
+        # نخزّن أيضًا نسخة تقريبية في usd فقط للاستخدامات الثانوية (مثلاً الـpayload/meta القديمة)
+        usd = int(price) if price > 0 else 0
+
+        if product == "pubg_uc":
+            title = f"شحن شدات ببجي {game_qty} شدة بسعر {price}$"
+        elif product == "ludo_diamond":
+            title = f"شراء الماسات لودو {game_qty} الماسة بسعر {price}$"
+        elif product == "ludo_gold":
+            title = f"شراء ذهب لودو {game_qty} ذهب بسعر {price}$"
     else:
         raise HTTPException(422, "invalid product")
 
     if account_id:
         title = f"{title} | ID: {account_id}"
+
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
 
             # --- Dynamic pricing overrides for topup (iTunes/Atheer/Asiacell/Korek) ---
-            # If admin set a pricing override like ui_key = "topup.<product>.<usd>" we will use it as a flat price
+            # إذا كان هناك override مثل ui_key = "topup.<product>.<usd>" نستخدمه كسعر ثابت للبكج.
             override_row = None
-            if product in ("itunes", "atheer", "asiacell", "korek"):
+            if product in telco_products:
                 try:
                     _ensure_pricing_table(cur)
                     try:
@@ -1346,28 +1411,30 @@ async def create_manual_paid(request: Request):
                     cur.execute(
                         "SELECT price_per_k, COALESCE(min_qty,0), COALESCE(max_qty,0), COALESCE(mode,'per_k') "
                         "FROM public.service_pricing_overrides WHERE ui_key=%s",
-                        (ui_key,),
+                        (ui_key,)
                     )
                     override_row = cur.fetchone()
                 except Exception:
                     override_row = None
 
-            # Validate amount for telco/itunes: allow admin overrides to bypass the static allowed list
-            if product in ("itunes", "atheer", "asiacell", "korek"):
+            # التحقق من قيم ايتونز/الرصيد: نسمح بقيم مخصّصة إذا وجد override
+            if product in telco_products:
+                allowed_telco = {5, 10, 15, 20, 25, 30, 40, 50, 100}
                 if (usd not in allowed_telco) and (not override_row):
                     raise HTTPException(422, "invalid usd for telco/itunes")
 
-            # Compute price & title (apply override first if present) - for telco only
-            if product in ("itunes", "atheer", "asiacell", "korek"):
+            # حساب السعر النهائي والعنوان مع تطبيق override إن وجد (لخدمات الرصيد فقط)
+            if product in telco_products:
                 if override_row:
                     ppk, mn, mx, mode = float(override_row[0]), int(override_row[1] or 0), int(override_row[2] or 0), (override_row[3] or "per_k")
-                    # For topups we treat override price as a FLAT price per pack
+                    # في حالة الـ topup نعامل price_per_k كسعر ثابت للبكج
                     price = float(ppk)
                     effective_usd = int(mn) if mn and mn > 0 else int(usd)
                     usd = effective_usd
                     ar_label = {"itunes": "ايتونز", "atheer": "اثير", "asiacell": "اسياسيل", "korek": "كورك"}.get(product, product)
                     title = f"شراء رصيد {ar_label} {usd}$"
                 else:
+                    # إعادة حساب احتياطية في حال تغيّر usd
                     steps = usd / 5.0
                     if product == "itunes":
                         price = steps * 9.0
@@ -1397,19 +1464,38 @@ async def create_manual_paid(request: Request):
 
             # charge
             cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (Decimal(price), user_id))
+            # meta: نحتفظ بكل من السعر والكمية لألعاب ببجي/لودو، و usd للبقية
+            meta: Dict[str, Any] = {"product": product, "account_id": account_id}
+            if product in telco_products:
+                meta["usd"] = usd
+            else:
+                meta["usd"] = price  # للتوافق مع البيانات القديمة
+                meta["game_qty"] = game_qty
+                meta["price"] = price
             cur.execute(
                 "INSERT INTO public.wallet_txns(user_id, amount, reason, meta) VALUES(%s,%s,%s,%s)",
-                (user_id, Decimal(-price), "order_charge", Json({"product": product, "usd": usd, "account_id": account_id})),
+                (user_id, Decimal(-price), "order_charge", Json(meta))
             )
 
             # create pending manual order carrying the price for future refund if rejected
-            payload = {"product": product, "usd": usd, "charged": float(price)}
+            payload: Dict[str, Any] = {"product": product, "charged": float(price)}
+            if product in telco_products:
+                payload["usd"] = usd
+            else:
+                payload["usd"] = price
+                payload["game_qty"] = game_qty
             if account_id:
                 payload["account_id"] = account_id
+
+            quantity_value = usd if product in telco_products else (game_qty or usd)
             cur.execute(
-                "INSERT INTO public.orders(user_id, title, quantity, price, status, payload, type) "
-                "VALUES(%s,%s,%s,%s,'Pending',%s,'manual') RETURNING id",
-                (user_id, title, usd, float(price), Json(payload)),
+                """
+                INSERT INTO public.orders(user_id, title, quantity, price, status, payload, type)
+                VALUES(%s,%s,%s,%s,'Pending',%s,'manual')
+                RETURNING id
+                """
+                ,
+                (user_id, title, quantity_value, float(price), Json(payload))
             )
             oid = cur.fetchone()[0]
 
@@ -1421,6 +1507,7 @@ async def create_manual_paid(request: Request):
         return {"ok": True, "order_id": oid, "charged": float(price)}
     finally:
         put_conn(conn)
+
 
 # Additional compat aliases for manual_paid (covering multiple potential paths from the app)
 @app.post("/api/create/manual_paid")
