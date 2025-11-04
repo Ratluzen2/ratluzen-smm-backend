@@ -1,6 +1,5 @@
 from __future__ import annotations
 import asyncio
-import re
 
 from typing import Optional
 from fastapi import Header, HTTPException
@@ -3319,43 +3318,61 @@ def _auto_exec_run(conn, limit: int = 3):
     return processed
 
 # ---- endpoints ----
+
 @app.get("/api/admin/auto_exec/status")
-def admin_auto_exec_status(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+def admin_auto_exec_status(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+                           password: Optional[str] = None,
+                           scope: Optional[str] = None):
     _require_admin(_pick_admin_password(x_admin_password, password) or "")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             _ensure_settings_table(cur)
+            if scope:
+                flag = _scope_flag_name(scope)
+                enabled = _get_flag(cur, flag, False)
+                if scope == "itunes":
+                    try:
+                        _ensure_itunes_codes_table(cur)
+                        cur.execute(
+                            "SELECT COUNT(*) FROM public.itunes_codes "
+                            "WHERE used=FALSE"
+                        )
+                        free = int(cur.fetchone()[0])
+                    except Exception:
+                        free = 0
+                    return {"enabled": bool(enabled), "free_codes": free}
+                if scope == "cards":
+                    try:
+                        _ensure_card_codes_table(cur)
+                        cur.execute(
+                            "SELECT COUNT(*) FROM public.card_codes "
+                            "WHERE used=FALSE"
+                        )
+                        free = int(cur.fetchone()[0])
+                    except Exception:
+                        free = 0
+                    return {"enabled": bool(enabled), "free_codes": free}
+                return {"enabled": bool(enabled)}
             enabled = _get_flag(cur, "auto_exec_api", False)
         return {"enabled": bool(enabled)}
     finally:
         put_conn(conn)
 
-
 @app.post("/api/admin/auto_exec/toggle")
-async def admin_auto_exec_toggle(
-    body: AutoExecToggleIn,
-    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
-    password: Optional[str] = None,
-    scope: Optional[str] = None
-):
+def admin_auto_exec_toggle(body: AutoExecToggleIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(_pick_admin_password(x_admin_password, password) or "")
-    # choose correct flag based on optional scope (itunes|cards|api)
-    flag = _scope_flag_name((scope or "").strip().lower())
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             _ensure_settings_table(cur)
-            _set_flag(cur, flag, bool(body.enabled))
-        # schedule daemons safely on the running loop (no direct awaits)
+            _set_flag(cur, "auto_exec_api", bool(body.enabled))
+        # Wake up daemon (safe if already running)
         try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        if loop is not None:
-            loop.create_task(_itunes_autoexec_daemon())
-            loop.create_task(_cards_autoexec_daemon())
-        return {"ok": True, "scope": (scope or "api"), "enabled": bool(body.enabled)}
+            asyncio.create_task(_auto_exec_daemon())
+        except Exception:
+            pass
+        return {"ok": True, "enabled": bool(body.enabled)}
     finally:
         put_conn(conn)
 
@@ -4011,13 +4028,18 @@ def auto_exec_status_scoped(x_admin_password: Optional[str] = Header(None, alias
                     return {"enabled": bool(enabled), "free_codes": free}
                 if scope == "cards":
                     _ensure_card_codes_table(cur)
-                    cur.execute("SELECT COUNT(*) FROM public.card_codes 
+                    cur.execute("SELECT COUNT(*) FROM public.card_codes WHERE used=FALSE")
+                    free = int(cur.fetchone()[0])
+                    return {"enabled": bool(enabled), "free_codes": free}
+                return {"enabled": bool(enabled)}
+            else:
+                enabled = _get_flag(cur, "auto_exec_api", False)
+                return {"enabled": bool(enabled)}
+    finally:
+        put_conn(conn)
+
 @app.post("/api/admin/auto_exec/set")
-async def auto_exec_set(
-    body: AutoScopeSetIn,
-    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
-    password: Optional[str] = None
-):
+def auto_exec_set(body: AutoScopeSetIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(_pick_admin_password(x_admin_password, password, (body.dict() if hasattr(body,'dict') else {})) or "")
     scope = (body.scope or "").strip().lower()
     if scope not in ("itunes","cards","api",""):
@@ -4028,18 +4050,6 @@ async def auto_exec_set(
         with conn, conn.cursor() as cur:
             _ensure_settings_table(cur)
             _set_flag(cur, flag, bool(body.enabled))
-        # schedule daemons safely on the running loop (no direct awaits)
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        if loop is not None:
-            loop.create_task(_itunes_autoexec_daemon())
-            loop.create_task(_cards_autoexec_daemon())
-        return {"ok": True, "scope": scope or "api", "enabled": bool(body.enabled)}
-    finally:
-        put_conn(conn)
-     _set_flag(cur, flag, bool(body.enabled))
         # Start daemons
         try:
             asyncio.create_task(_itunes_autoexec_daemon())
