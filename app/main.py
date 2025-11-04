@@ -649,14 +649,28 @@ def _normalize_product(raw: str, fallback_title: str = "") -> str:
     return t or "itunes"
 
 def _parse_usd(d: Dict[str, Any]) -> int:
-    for k in ("usd","price_usd","priceUsd","price","amount","amt","usd_amount"):
+    """Extract a positive *pack amount* in USD-ish units from a flexible payload.
+
+    We intentionally try dedicated USD fields first and treat very large
+    "amount" values (e.g. 66680 لودو ذهب) as *quantities*, not USD, so they
+    don't trigger validation errors for game services.
+    """
+    for k in ("usd", "price_usd", "priceUsd", "usd_amount", "amount", "price", "amt"):
         if k in d and d[k] not in (None, ""):
             try:
-                val = int(float(d[k]))
-                return val
+                v = float(d[k])
             except Exception:
-                pass
+                continue
+            # Skip non-positive
+            if v <= 0:
+                continue
+            # For game packs we often send amount=coins (e.g. 66680). Treat those
+            # as quantity, not USD, and fall through to other keys such as price.
+            if k == "amount" and v > 1000:
+                continue
+            return int(v)
     return 0
+
 
 
 
@@ -1224,8 +1238,8 @@ def mark_notification_read(uid: str, nid: int):
 # =========================
 @app.post("/api/orders/create/manual_paid")
 async def create_manual_paid(request: Request):
-    """
-    Creates a manual order (iTunes / Atheer / Asiacell / Korek / PUBG / Ludo) and atomically charges user balance.
+    """Creates a manual order (iTunes / Atheer / Asiacell / Korek / PUBG / Ludo) and atomically charges user balance.
+
     Body (flexible):
       {
         uid: str,
@@ -1239,8 +1253,8 @@ async def create_manual_paid(request: Request):
       - atheer:   each 5$ = 7$
       - asiacell: each 5$ = 7$
       - korek:    each 5$ = 7$
-      - pubg_uc:  price = usd (allowed {2,9,15,40,55,100,185})
-      - ludo_*:   price = usd (allowed {5,10,20,35,85,165,475,800})
+      - pubg_uc:  base price = usd (actual charged price may come from app, e.g. 2.3$)
+      - ludo_*:   base price = usd (actual charged price may come from app, e.g. 5.5$)
 
     Refund: if owner rejects later, /api/admin/orders/{id}/reject auto-refunds price>0.
     """
@@ -1249,6 +1263,15 @@ async def create_manual_paid(request: Request):
     product_raw = (data.get("product") or data.get("type") or data.get("category") or data.get("title") or "").strip()
     usd = _parse_usd(data)
 
+    # Optional explicit price from client (used for PUBG / Ludo to allow fractions like 2.3$)
+    raw_price = data.get("price") or data.get("priceUsd") or data.get("price_usd")
+    client_price = None
+    try:
+        if raw_price not in (None, ""):
+            client_price = float(raw_price)
+    except Exception:
+        client_price = None
+
     # Player account / game id (optional but stored)
     account_id = (data.get("account_id") or data.get("accountId") or data.get("game_id") or "").strip()
 
@@ -1256,17 +1279,20 @@ async def create_manual_paid(request: Request):
         raise HTTPException(422, "invalid payload")
 
     product = _normalize_product(product_raw, fallback_title=data.get("title") or "")
-    allowed_telco = {5,10,15,20,25,30,40,50,100}
-    allowed_pubg = {2,9,15,40,55,100,185}
-    allowed_ludo = {5,10,20,35,85,165,475,800}
+    allowed_telco = {5, 10, 15, 20, 25, 30, 40, 50, 100}
 
-    if product in ("itunes","atheer","asiacell","korek"):
-        pass  # allow overrides to supply custom amounts
+    # Basic validation on product / amount.
+    # - Telco (iTunes/Atheer/Asiacell/Korek): concrete USD values are validated
+    #   later, taking admin overrides into account.
+    # - PUBG / Ludo: accept any positive pack amount so we can support
+    #   fractional prices coming from the app (e.g. 2.3$) without failing 422.
+    if product in ("itunes", "atheer", "asiacell", "korek"):
+        pass  # telco handled below
     elif product == "pubg_uc":
-        if usd not in allowed_pubg:
+        if usd <= 0:
             raise HTTPException(422, "invalid usd for pubg")
-    elif product in ("ludo_diamond","ludo_gold"):
-        if usd not in allowed_ludo:
+    elif product in ("ludo_diamond", "ludo_gold"):
+        if usd <= 0:
             raise HTTPException(422, "invalid usd for ludo")
     else:
         raise HTTPException(422, "invalid product")
@@ -1286,14 +1312,17 @@ async def create_manual_paid(request: Request):
         price = steps * 7.0
         title = f"شراء رصيد كورك {usd}$"
     elif product == "pubg_uc":
-        price = float(usd)
-        title = f"شحن شدات ببجي بسعر {usd}$"
+        base_price = float(usd)
+        price = float(client_price) if (client_price is not None and client_price > 0) else base_price
+        title = f"شحن شدات ببجي بسعر {price}$"
     elif product == "ludo_diamond":
-        price = float(usd)
-        title = f"شراء الماسات لودو بسعر {usd}$"
+        base_price = float(usd)
+        price = float(client_price) if (client_price is not None and client_price > 0) else base_price
+        title = f"شراء الماسات لودو بسعر {price}$"
     elif product == "ludo_gold":
-        price = float(usd)
-        title = f"شراء ذهب لودو بسعر {usd}$"
+        base_price = float(usd)
+        price = float(client_price) if (client_price is not None and client_price > 0) else base_price
+        title = f"شراء ذهب لودو بسعر {price}$"
     else:
         raise HTTPException(422, "invalid product")
 
@@ -1306,7 +1335,7 @@ async def create_manual_paid(request: Request):
             # --- Dynamic pricing overrides for topup (iTunes/Atheer/Asiacell/Korek) ---
             # If admin set a pricing override like ui_key = "topup.<product>.<usd>" we will use it as a flat price
             override_row = None
-            if product in ("itunes","atheer","asiacell","korek"):
+            if product in ("itunes", "atheer", "asiacell", "korek"):
                 try:
                     _ensure_pricing_table(cur)
                     try:
@@ -1314,26 +1343,29 @@ async def create_manual_paid(request: Request):
                     except Exception:
                         pass
                     ui_key = f"topup.{product}.{usd}"
-                    cur.execute("SELECT price_per_k, COALESCE(min_qty,0), COALESCE(max_qty,0), COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (ui_key,))
+                    cur.execute(
+                        "SELECT price_per_k, COALESCE(min_qty,0), COALESCE(max_qty,0), COALESCE(mode,'per_k') "
+                        "FROM public.service_pricing_overrides WHERE ui_key=%s",
+                        (ui_key,),
+                    )
                     override_row = cur.fetchone()
                 except Exception:
                     override_row = None
 
             # Validate amount for telco/itunes: allow admin overrides to bypass the static allowed list
-            if product in ("itunes","atheer","asiacell","korek"):
-                allowed_telco = {5,10,15,20,25,30,40,50,100}
+            if product in ("itunes", "atheer", "asiacell", "korek"):
                 if (usd not in allowed_telco) and (not override_row):
                     raise HTTPException(422, "invalid usd for telco/itunes")
 
-            # Compute price & title (apply override first if present)
-            if product in ("itunes","atheer","asiacell","korek"):
+            # Compute price & title (apply override first if present) - for telco only
+            if product in ("itunes", "atheer", "asiacell", "korek"):
                 if override_row:
                     ppk, mn, mx, mode = float(override_row[0]), int(override_row[1] or 0), int(override_row[2] or 0), (override_row[3] or "per_k")
                     # For topups we treat override price as a FLAT price per pack
                     price = float(ppk)
                     effective_usd = int(mn) if mn and mn > 0 else int(usd)
                     usd = effective_usd
-                    ar_label = {"itunes":"ايتونز","atheer":"اثير","asiacell":"اسياسيل","korek":"كورك"}.get(product, product)
+                    ar_label = {"itunes": "ايتونز", "atheer": "اثير", "asiacell": "اسياسيل", "korek": "كورك"}.get(product, product)
                     title = f"شراء رصيد {ar_label} {usd}$"
                 else:
                     steps = usd / 5.0
@@ -1349,6 +1381,7 @@ async def create_manual_paid(request: Request):
                     elif product == "korek":
                         price = steps * 7.0
                         title = f"شراء رصيد كورك {usd}$"
+
             # ---------------------------------------------------------------------------
             # ensure user & balance
             cur.execute("SELECT id, balance, is_banned FROM public.users WHERE uid=%s", (uid,))
@@ -1366,7 +1399,7 @@ async def create_manual_paid(request: Request):
             cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (Decimal(price), user_id))
             cur.execute(
                 "INSERT INTO public.wallet_txns(user_id, amount, reason, meta) VALUES(%s,%s,%s,%s)",
-                (user_id, Decimal(-price), "order_charge", Json({"product": product, "usd": usd, "account_id": account_id}))
+                (user_id, Decimal(-price), "order_charge", Json({"product": product, "usd": usd, "account_id": account_id})),
             )
 
             # create pending manual order carrying the price for future refund if rejected
@@ -1374,12 +1407,9 @@ async def create_manual_paid(request: Request):
             if account_id:
                 payload["account_id"] = account_id
             cur.execute(
-                """
-                INSERT INTO public.orders(user_id, title, quantity, price, status, payload, type)
-                VALUES(%s,%s,%s,%s,'Pending',%s,'manual')
-                RETURNING id
-                """,
-                (user_id, title, usd, float(price), Json(payload))
+                "INSERT INTO public.orders(user_id, title, quantity, price, status, payload, type) "
+                "VALUES(%s,%s,%s,%s,'Pending',%s,'manual') RETURNING id",
+                (user_id, title, usd, float(price), Json(payload)),
             )
             oid = cur.fetchone()[0]
 
