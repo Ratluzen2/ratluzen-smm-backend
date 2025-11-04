@@ -1,6 +1,5 @@
 from __future__ import annotations
 import asyncio
-import re
 
 from typing import Optional
 from fastapi import Header, HTTPException
@@ -34,6 +33,7 @@ import os
 import json
 import time
 import logging
+import re
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -3118,11 +3118,6 @@ def admin_provider_balance(x_admin_password: _Optional[str] = Header(None, alias
     # Returns provider balance as JSON: { "balance": <number> }
     # Uses PROVIDER_API_URL / PROVIDER_API_KEY if configured (kd1s compatible).
     _require_admin(_pick_admin_password(x_admin_password, password) or "")
-    if scope is None:
-        try:
-            scope = getattr(body, "scope", None)
-        except Exception:
-            scope = None
     bal = 0.0
     try:
         resp = requests.post(
@@ -3211,9 +3206,7 @@ def _set_flag(cur, key: str, enabled: bool) -> None:
 
 class AutoExecToggleIn(BaseModel):
     enabled: bool
-    scope: Optional[str] = None
-    class Config:
-        extra = "allow"
+
 class AutoExecRunIn(BaseModel):
     limit: int = 3
     only_when_enabled: bool = True
@@ -3329,11 +3322,6 @@ def _auto_exec_run(conn, limit: int = 3):
 @app.get("/api/admin/auto_exec/status")
 def admin_auto_exec_status(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(_pick_admin_password(x_admin_password, password) or "")
-    if scope is None:
-        try:
-            scope = getattr(body, "scope", None)
-        except Exception:
-            scope = None
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -3345,34 +3333,51 @@ def admin_auto_exec_status(x_admin_password: Optional[str] = Header(None, alias=
 
 @app.post("/api/admin/auto_exec/toggle")
 def admin_auto_exec_toggle(body: AutoExecToggleIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    _require_admin(_pick_admin_password(x_admin_password, password) or "")
-    if scope is None:
-        try:
-            scope = getattr(body, "scope", None)
-        except Exception:
-            scope = None
+    """
+    Enhanced toggle: accepts optional scope ('api'|'itunes'|'cards') inside body,
+    adds rich logging, and starts relevant daemons.
+    Backward compatible: when scope is omitted, it toggles the old 'auto_exec_api' flag.
+    """
+    try:
+        raw = body.dict()
+    except Exception:
+        raw = {}
+    scope = (raw.get("scope") or "").strip().lower()
+    passwd = _pick_admin_password(x_admin_password, password, raw)
+
+    if passwd != ADMIN_PASSWORD:
+        logger.warning("auto_exec.toggle auth failed (wrong password) scope=%s", scope or "api")
+        raise HTTPException(status_code=401, detail="bad admin password")
+
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             _ensure_settings_table(cur)
-            _set_flag(cur, _scope_flag_name(scope), bool(body.enabled))
-        # Wake up daemon (safe if already running)
+            if scope in ("itunes", "cards"):
+                flag = _scope_flag_name(scope)
+                _set_flag(cur, flag, bool(body.enabled))
+                logger.info("auto_exec.toggle scope=%s -> enabled=%s", scope, bool(body.enabled))
+                try:
+                    asyncio.create_task(_itunes_autoexec_daemon())
+                    asyncio.create_task(_cards_autoexec_daemon())
+                except Exception as e:
+                    logger.exception("failed to start scoped daemons: %s", e)
+                return {"ok": True, "scope": scope, "enabled": bool(body.enabled)}
+            # default to API behavior for backward compatibility
+            _set_flag(cur, "auto_exec_api", bool(body.enabled))
+            logger.info("auto_exec.toggle scope=api -> enabled=%s", bool(body.enabled))
         try:
-            asyncio.get_running_loop().create_task(_auto_exec_daemon())
-        except Exception:
-            pass
-        return {"ok": True, "enabled": bool(body.enabled)}
+            asyncio.create_task(_auto_exec_daemon())
+        except Exception as e:
+            logger.exception("failed to start api daemon: %s", e)
+        return {"ok": True, "scope": "api", "enabled": bool(body.enabled)}
     finally:
         put_conn(conn)
+
 
 @app.post("/api/admin/auto_exec/run")
 def admin_auto_exec_run(body: AutoExecRunIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(_pick_admin_password(x_admin_password, password) or "")
-    if scope is None:
-        try:
-            scope = getattr(body, "scope", None)
-        except Exception:
-            scope = None
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -3421,116 +3426,13 @@ async def _auto_exec_daemon():
             logging.exception("auto-exec daemon loop error: %s", e)
             await asyncio.sleep(3)
 
-
-
-def _ensure_orders_payload_jsonb(conn):
-    """
-    Root-fix: if public.orders.payload is TEXT, migrate it in-place to JSONB safely.
-    This runs once at startup and is idempotent.
-    """
-    try:
-        with conn, conn.cursor() as cur:
-            # Check column type
-            cur.execute("""
-                SELECT data_type
-                FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='orders' AND column_name='payload'
-            """)
-            row = cur.fetchone()
-            if not row:  # no payload column => nothing to do
-                return
-            if str(row[0]).lower() in ('jsonb','json'):
-                return  # already json/jsonb
-
-            # Create safe casting helper only if needed
-            cur.execute("""
-            CREATE OR REPLACE FUNCTION public.to_jsonb_safe(txt text)
-            RETURNS jsonb
-            LANGUAGE plpgsql
-            IMMUTABLE
-            AS $$
-            BEGIN
-              IF txt IS NULL OR btrim(txt) = '' THEN
-                RETURN '{}'::jsonb;
-              END IF;
-              BEGIN
-                RETURN txt::jsonb;
-              EXCEPTION
-                WHEN others THEN
-                  RETURN jsonb_build_object('raw', txt);
-              END;
-            END;
-            $$;
-            """)
-
-            # Add temp jsonb column, backfill, swap
-            cur.execute("""
-                DO $$
-                BEGIN
-                  IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_schema='public' AND table_name='orders' AND column_name='payload_jsonb'
-                  ) THEN
-                    ALTER TABLE public.orders ADD COLUMN payload_jsonb jsonb NOT NULL DEFAULT '{}'::jsonb;
-                  END IF;
-                END;
-                $$;
-            """)
-            cur.execute("""
-                UPDATE public.orders
-                SET payload_jsonb = public.to_jsonb_safe(payload);
-            """)
-            cur.execute("""
-                ALTER TABLE public.orders DROP COLUMN payload;
-            """)
-            cur.execute("""
-                ALTER TABLE public.orders RENAME COLUMN payload_jsonb TO payload;
-            """)
-            cur.execute("""
-                ALTER TABLE public.orders ALTER COLUMN payload SET DEFAULT '{}'::jsonb;
-            """)
-            # Optional: GIN index
-            cur.execute("""
-                DO $$
-                BEGIN
-                  IF NOT EXISTS (
-                    SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname='idx_orders_payload_gin'
-                  ) THEN
-                    CREATE INDEX idx_orders_payload_gin ON public.orders USING GIN (payload);
-                  END IF;
-                END;
-                $$;
-            """)
-    except Exception as e:
-        import logging
-        logging.exception("payload jsonb migration skipped/failed: %s", e)
-
-
 @app.on_event("startup")
 async def _startup_autoexec():
-    # Run JSONB migration safely (idempotent)
     try:
-        _ensure_orders_payload_jsonb(get_conn())
-    except Exception:
-        pass
-    # Start background daemons safely
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        import asyncio as _asyncio
-        loop = _asyncio.get_event_loop()
-    try:
-        loop.create_task(_auto_exec_daemon())
-    except Exception:
-        pass
-    try:
-        loop.create_task(_itunes_autoexec_daemon())
-    except Exception:
-        pass
-    try:
-        loop.create_task(_cards_autoexec_daemon())
-    except Exception:
-        pass
+        if not _AUTOEXEC_DAEMON_STARTED:
+            asyncio.create_task(_auto_exec_daemon())
+    except Exception as e:
+        logging.exception("failed to start auto-exec daemon: %s", e)
 # ======== /Auto-Exec (Admin) ========
 # =========================
 from fastapi import Header
@@ -3538,11 +3440,6 @@ from fastapi import Header
 @app.get("/api/admin/announcements")
 def admin_announcements_list(limit: int = 200, x_admin_password: str | None = Header(None, alias="x-admin-password"), password: str | None = None):
     _require_admin(_pick_admin_password(x_admin_password, password) or "")
-    if scope is None:
-        try:
-            scope = getattr(body, "scope", None)
-        except Exception:
-            scope = None
     if limit <= 0 or limit > 500: limit = 200
     conn = get_conn()
     try:
@@ -3601,11 +3498,6 @@ async def admin_announcement_update(aid: int, request: Request, x_admin_password
 @app.post("/api/admin/announcement/{aid}/delete")
 def admin_announcement_delete(aid: int, x_admin_password: str | None = Header(None, alias="x-admin-password"), password: str | None = None):
     _require_admin(_pick_admin_password(x_admin_password, password) or "")
-    if scope is None:
-        try:
-            scope = getattr(body, "scope", None)
-        except Exception:
-            scope = None
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -3923,22 +3815,11 @@ def _ensure_itunes_codes_table(cur):
     cur.execute("CREATE INDEX IF NOT EXISTS idx_itunes_codes_used ON public.itunes_codes(used)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_itunes_codes_cat ON public.itunes_codes(category)")
 
-
-def _migrate_card_codes_telco_constraint(cur):
-    try:
-        cur.execute("ALTER TABLE public.card_codes DROP CONSTRAINT IF EXISTS card_codes_telco_check")
-    except Exception:
-        pass
-    try:
-        cur.execute("ALTER TABLE public.card_codes ADD CONSTRAINT card_codes_telco_check CHECK (telco IN ('atheer','asiacell','korek'))")
-    except Exception:
-        pass
-
 def _ensure_card_codes_table(cur):
     cur.execute("""
         CREATE TABLE IF NOT EXISTS public.card_codes(
             id BIGSERIAL PRIMARY KEY,
-            telco TEXT NOT NULL CHECK (telco IN ('atheer','asiacell','korek')),
+            telco TEXT NOT NULL CHECK (telco IN ('atheir','asiacell','korek')),
             code TEXT NOT NULL,
             category TEXT NOT NULL DEFAULT 'generic',
             used BOOLEAN NOT NULL DEFAULT FALSE,
@@ -3948,7 +3829,6 @@ def _ensure_card_codes_table(cur):
             UNIQUE(telco, code)
         );
     """)
-    _migrate_card_codes_telco_constraint(cur)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_card_codes_used ON public.card_codes(used)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_card_codes_tcat ON public.card_codes(telco, category)")
 
@@ -4003,11 +3883,6 @@ def api_admin_codes_itunes_add(body: CodesIn, x_admin_password: Optional[str] = 
 @app.get("/api/admin/codes/itunes/list")
 def api_admin_codes_itunes_list(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None, status: str = "unused", limit: int = 200, offset: int = 0, category: Optional[str] = None):
     _require_admin(_pick_admin_password(x_admin_password, password) or "")
-    if scope is None:
-        try:
-            scope = getattr(body, "scope", None)
-        except Exception:
-            scope = None
     where = ["TRUE"]
     params: List[Any] = []
     if (status or "unused").lower() in ("unused","free","available"):
@@ -4040,11 +3915,6 @@ def api_admin_codes_itunes_list(x_admin_password: Optional[str] = Header(None, a
 @app.post("/api/admin/codes/itunes/{cid}/delete")
 def api_admin_codes_itunes_delete(cid: int, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(_pick_admin_password(x_admin_password, password) or "")
-    if scope is None:
-        try:
-            scope = getattr(body, "scope", None)
-        except Exception:
-            scope = None
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -4059,7 +3929,7 @@ def api_admin_codes_itunes_delete(cid: int, x_admin_password: Optional[str] = He
 def api_admin_codes_cards_add(telco: str, body: CodesIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(_pick_admin_password(x_admin_password, password, (body.dict() if hasattr(body,'dict') else {})) or "")
     telco = (telco or "").strip().lower()
-    if telco not in ("atheer","asiacell","korek"):
+    if telco not in ("atheir","asiacell","korek"):
         raise HTTPException(422, "invalid telco")
     codes = _normalize_codes(body)
     if not codes:
@@ -4084,13 +3954,8 @@ def api_admin_codes_cards_add(telco: str, body: CodesIn, x_admin_password: Optio
 @app.get("/api/admin/codes/cards/{telco}/list")
 def api_admin_codes_cards_list(telco: str, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None, status: str = "unused", limit: int = 200, offset: int = 0, category: Optional[str] = None):
     _require_admin(_pick_admin_password(x_admin_password, password) or "")
-    if scope is None:
-        try:
-            scope = getattr(body, "scope", None)
-        except Exception:
-            scope = None
     telco = (telco or "").strip().lower()
-    if telco not in ("atheer","asiacell","korek"):
+    if telco not in ("atheir","asiacell","korek"):
         raise HTTPException(422, "invalid telco")
     where = ["telco=%s"]; params: List[Any] = [telco]
     if (status or "unused").lower() in ("unused","free","available"):
@@ -4123,13 +3988,8 @@ def api_admin_codes_cards_list(telco: str, x_admin_password: Optional[str] = Hea
 @app.post("/api/admin/codes/cards/{telco}/{cid}/delete")
 def api_admin_codes_cards_delete(telco: str, cid: int, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(_pick_admin_password(x_admin_password, password) or "")
-    if scope is None:
-        try:
-            scope = getattr(body, "scope", None)
-        except Exception:
-            scope = None
     telco = (telco or "").strip().lower()
-    if telco not in ("atheer","asiacell","korek"):
+    if telco not in ("atheir","asiacell","korek"):
         raise HTTPException(422, "invalid telco")
     conn = get_conn()
     try:
@@ -4151,13 +4011,9 @@ def _scope_flag_name(scope: str) -> str:
 
 @app.get("/api/admin/auto_exec/status", name="auto_exec_status_scoped")
 def auto_exec_status_scoped(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None, scope: Optional[str] = None):
+    logger.info("auto_exec.status (scoped) called with scope=%s", scope)
     # Backward compatible: if no scope -> return the generic flag
     _require_admin(_pick_admin_password(x_admin_password, password) or "")
-    if scope is None:
-        try:
-            scope = getattr(body, "scope", None)
-        except Exception:
-            scope = None
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -4184,6 +4040,7 @@ def auto_exec_status_scoped(x_admin_password: Optional[str] = Header(None, alias
 
 @app.post("/api/admin/auto_exec/set")
 def auto_exec_set(body: AutoScopeSetIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    logger.info("auto_exec.set called with scope=%s enabled=%s", getattr(body,'scope',None), getattr(body,'enabled',None))
     _require_admin(_pick_admin_password(x_admin_password, password, (body.dict() if hasattr(body,'dict') else {})) or "")
     scope = (body.scope or "").strip().lower()
     if scope not in ("itunes","cards","api",""):
@@ -4196,8 +4053,8 @@ def auto_exec_set(body: AutoScopeSetIn, x_admin_password: Optional[str] = Header
             _set_flag(cur, flag, bool(body.enabled))
         # Start daemons
         try:
-            asyncio.get_running_loop().create_task(asyncio.get_running_loop().create_task(_itunes_autoexec_daemon()))
-            asyncio.get_running_loop().create_task(asyncio.get_running_loop().create_task(_cards_autoexec_daemon()))
+            asyncio.create_task(_itunes_autoexec_daemon())
+            asyncio.create_task(_cards_autoexec_daemon())
         except Exception:
             pass
         return {"ok": True, "scope": scope or "api", "enabled": bool(body.enabled)}
@@ -4206,54 +4063,23 @@ def auto_exec_set(body: AutoScopeSetIn, x_admin_password: Optional[str] = Header
 
 # ----- Pickers & processors -----
 def _parse_category_from_title(title: str) -> Optional[str]:
-    # Local import guard & Arabic digits normalization
-    try:
-        import re as _re
-    except Exception:
-        _re = None
-    t = (title or "").lower().translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
-    if _re:
-        m1 = _re.search(r"(5|10|15|20|25|30|40|50|100)\s*\$|\$\s*(5|10|15|20|25|30|40|50|100)", t)
-        if m1:
-            return m1.group(1) or m1.group(2)
-        m2 = _re.search(r"\b(5|10|15|20|25|30|40|50|100)\b", t)
-        if m2:
-            return m2.group(1)
-    for tok in ("100","50","40","30","25","20","15","10","5"):
-        if tok in t:
-            return tok
-    return None
-
     t = (title or "").lower()
-    # convert Arabic-Indic digits to ASCII
-    ar = "٠١٢٣٤٥٦٧٨٩"
-    t = t.translate(str.maketrans(ar, "0123456789"))
-
-    if _re:
-        # $5  OR  5$
-        m1 = _re.search(r"(5|10|15|20|25|30|40|50|100)\s*\$|\$\s*(5|10|15|20|25|30|40|50|100)", t)
-        if m1:
-            return m1.group(1) or m1.group(2)
-        # plain 5|10|.. if $ missing
-        m2 = _re.search(r"\b(5|10|15|20|25|30|40|50|100)\b", t)
-        if m2:
-            return m2.group(1)
-    # Fallback if regex unavailable
-    for tok in ("100","50","40","30","25","20","15","10","5"):
-        if tok in t:
-            return tok
-    return None
+    # match 5,10,15,20,25,30,40,50,100 with or without $ symbol
+    m = re.search(r"(5|10|15|20|25|30|40|50|100)\s*\$|\$\s*(5|10|15|20|25|30|40|50|100)", t)
+    if m: return m.group(1) or m.group(2)
+    m = re.search(r"\b(5|10|15|20|25|30|40|50|100)\b", t)
+    return m.group(1) if m else None
 
 def _parse_telco_from_title(title: str) -> Optional[str]:
     t = (title or "").lower()
-    if any(x in t for x in ["اثير","أثير","atheer","atheer","zain"]): return "atheer"
+    if any(x in t for x in ["اثير","أثير","atheer","atheir","zain"]): return "atheir"
     if any(x in t for x in ["asiacell","اسيا","اسياسيل","أسيا"]): return "asiacell"
     if any(x in t for x in ["korek","كورك"]): return "korek"
     return None
 
 def _itunes_pick_one_locked(cur):
     cur.execute("""
-        SELECT o.id, o.user_id, o.title, COALESCE(NULLIF(o.payload::text,'')::jsonb, '{}'::jsonb), '{}'::jsonb)
+        SELECT o.id, o.user_id, o.title, COALESCE(o.payload, '{}'::jsonb)
         FROM public.orders o
         WHERE COALESCE(o.status,'Pending')='Pending'
           AND (LOWER(o.title) LIKE '%itunes%' OR o.title LIKE '%ايتونز%')
@@ -4281,14 +4107,10 @@ def _itunes_pick_code_locked(cur, category: str):
 
 def _cards_pick_one_locked(cur):
     cur.execute("""
-        SELECT o.id, o.user_id, o.title, COALESCE(NULLIF(o.payload::text,'')::jsonb, '{}'::jsonb), '{}'::jsonb)
+        SELECT o.id, o.user_id, o.title, COALESCE(o.payload, '{}'::jsonb)
         FROM public.orders o
-        WHERE COALESCE(o.status,'Pending')='Pending' AND (o.type='manual') AND (
-      LOWER(o.title) LIKE '%asiacell%' OR o.title LIKE '%اسياسيل%' OR o.title LIKE '%أسيا%' OR
-      LOWER(o.title) LIKE '%korek%' OR o.title LIKE '%كورك%' OR
-      LOWER(o.title) LIKE '%atheer%' OR o.title LIKE '%اثير%' OR o.title LIKE '%أثير%' OR
-      LOWER(o.title) LIKE '%zain%')
-ORDER BY o.id ASC
+        WHERE COALESCE(o.status,'Pending')='Pending' AND o.type='topup_card'
+        ORDER BY o.id ASC
         FOR UPDATE SKIP LOCKED
         LIMIT 1
     """)
@@ -4320,11 +4142,6 @@ def _itunes_auto_process_one(conn):
         if not code:
             return {"order_id": rec["order_id"], "skipped": True, "reason": "no_code_available", "category": rec["category"]}
         payload = rec.get("payload") or {}
-        if not isinstance(payload, dict):
-            try:
-                payload = json.loads(payload or '{}')
-            except Exception:
-                payload = {}
         if isinstance(payload, dict):
             payload["code"] = code["code"]
             payload["card"] = code["code"]
@@ -4352,11 +4169,6 @@ def _cards_auto_process_one(conn):
         if not code:
             return {"order_id": rec["order_id"], "skipped": True, "reason": "no_code_available", "telco": rec["telco"], "category": rec["category"]}
         payload = rec.get("payload") or {}
-        if not isinstance(payload, dict):
-            try:
-                payload = json.loads(payload or '{}')
-            except Exception:
-                payload = {}
         if isinstance(payload, dict):
             payload["code"] = code["code"]
             payload["card"] = code["code"]
@@ -4439,11 +4251,96 @@ try:
     @app.on_event("startup")
     async def _startup_scoped_autoexec():
         try:
-            asyncio.get_running_loop().create_task(asyncio.get_running_loop().create_task(_itunes_autoexec_daemon()))
-            asyncio.get_running_loop().create_task(asyncio.get_running_loop().create_task(_cards_autoexec_daemon()))
+            asyncio.create_task(_itunes_autoexec_daemon())
+            asyncio.create_task(_cards_autoexec_daemon())
         except Exception as e:
             logging.exception("failed to start scoped autoexec daemons: %s", e)
 except Exception:
     pass
 
 # ========= END Patch =========
+
+# Deep diagnostics endpoint to explain auto-exec state and "why" toggles appear off
+@app.get("/api/admin/auto_exec/diagnose")
+def admin_auto_exec_diagnose(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+                             password: Optional[str] = None,
+                             scope: Optional[str] = None):
+    passwd = _pick_admin_password(x_admin_password, password) or ""
+    if passwd != ADMIN_PASSWORD:
+        logger.warning("auto_exec.diagnose auth failed")
+        raise HTTPException(status_code=401, detail="bad admin password")
+
+    conn = get_conn()
+    try:
+        flags = {}
+        settings_rows = []
+        codes = {"itunes_free": None, "cards_free": None}
+        with conn, conn.cursor() as cur:
+            _ensure_settings_table(cur)
+            for k in ("auto_exec_api","auto_exec_itunes","auto_exec_cards"):
+                try:
+                    flags[k] = _get_flag(cur, k, False)
+                except Exception:
+                    flags[k] = None
+            try:
+                cur.execute("""
+                    SELECT key, (value->>'enabled')::boolean AS enabled,
+                           (EXTRACT(EPOCH FROM updated_at)*1000)::BIGINT AS updated_at
+                    FROM public.settings
+                    WHERE key IN ('auto_exec_api','auto_exec_itunes','auto_exec_cards')
+                    ORDER BY key
+                """)
+                rows = cur.fetchall() or []
+                for r in rows:
+                    settings_rows.append({
+                        "key": r[0],
+                        "enabled": bool(r[1]) if r[1] is not None else None,
+                        "updated_at": int(r[2]) if r[2] is not None else None
+                    })
+            except Exception as e:
+                logger.exception("diagnose settings dump failed: %s", e)
+
+            # free code counts
+            try:
+                _ensure_itunes_codes_table(cur)
+                cur.execute("SELECT COUNT(*) FROM public.itunes_codes WHERE used=FALSE")
+                codes["itunes_free"] = int(cur.fetchone()[0])
+            except Exception as e:
+                codes["itunes_free"] = None
+                logger.exception("diagnose itunes count failed: %s", e)
+
+            try:
+                _ensure_card_codes_table(cur)
+                cur.execute("SELECT COUNT(*) FROM public.card_codes WHERE used=FALSE")
+                codes["cards_free"] = int(cur.fetchone()[0])
+            except Exception as e:
+                codes["cards_free"] = None
+                logger.exception("diagnose cards count failed: %s", e)
+
+        out = {
+            "ok": True,
+            "scope": (scope or "all"),
+            "flags": flags,
+            "settings": settings_rows,
+            "codes": codes,
+            "daemon": {
+                "api_started": bool(globals().get("_AUTOEXEC_DAEMON_STARTED", False)),
+                "itunes_started": bool(globals().get("_ITUNES_DAEMON_STARTED", False)),
+                "cards_started": bool(globals().get("_CARDS_DAEMON_STARTED", False)),
+            },
+            "env": {
+                "AUTOEXEC_LIMIT": int(globals().get("AUTOEXEC_LIMIT", 3)),
+                "AUTOEXEC_IDLE_SLEEP": int(globals().get("AUTOEXEC_IDLE_SLEEP", 5)),
+                "AUTOEXEC_LOOP_SLEEP": int(globals().get("AUTOEXEC_LOOP_SLEEP", 2)),
+            },
+            "notes": [
+                "If you enabled iTunes/cards using /api/admin/auto_exec/toggle, include {'scope':'itunes'|'cards'} in the body or use /api/admin/auto_exec/set.",
+                "iTunes/cards execution requires available unused codes in their respective categories.",
+                "All admin calls must include x-admin-password header (or ?password=) matching ADMIN_PASSWORD env."
+            ]
+        }
+        logger.info("auto_exec.diagnose -> %s", out)
+        return out
+    finally:
+        put_conn(conn)
+
