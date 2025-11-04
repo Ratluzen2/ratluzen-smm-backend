@@ -1812,7 +1812,7 @@ def admin_pending_pubg(x_admin_password: Optional[str] = Header(None, alias="x-a
                 SELECT o.id, o.title, o.quantity, o.price, o.status,
                        EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
                        o.link, u.uid,
-                       COALESCE((COALESCE(NULLIF(o.payload,''),'{}')::jsonb->>'account_id'),'') AS account_id
+                       o.payload AS payload_text
                 FROM public.orders o
                 JOIN public.users u ON u.id = o.user_id
                 WHERE o.status='Pending' AND (
@@ -1827,7 +1827,15 @@ def admin_pending_pubg(x_admin_password: Optional[str] = Header(None, alias="x-a
             """)
             rows = cur.fetchall()
         out = []
-        for (oid, title, qty, price, status, created_at, link, uid, account_id) in rows:
+        for (oid, title, qty, price, status, created_at, link, uid, payload_text) in rows:
+account_id = ""
+if payload_text:
+    try:
+        import json as _json
+        j = _json.loads(payload_text)
+        account_id = str(j.get("account_id","") or "")
+    except Exception as e:
+        logger.warning(f"%s: invalid payload JSON for order {oid}: {e}", "admin_pending_pubg")
             d = {
                 "id": oid, "title": title, "quantity": qty,
                 "price": float(price or 0), "status": status,
@@ -1850,7 +1858,7 @@ def admin_pending_ludo(x_admin_password: Optional[str] = Header(None, alias="x-a
                 SELECT o.id, o.title, o.quantity, o.price, o.status,
                        EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
                        o.link, u.uid,
-                       COALESCE((COALESCE(NULLIF(o.payload,''),'{}')::jsonb->>'account_id'),'') AS account_id
+                       o.payload AS payload_text
                 FROM public.orders o
                 JOIN public.users u ON u.id = o.user_id
                 WHERE o.status='Pending' AND (
@@ -1863,7 +1871,15 @@ def admin_pending_ludo(x_admin_password: Optional[str] = Header(None, alias="x-a
             """)
             rows = cur.fetchall()
         out = []
-        for (oid, title, qty, price, status, created_at, link, uid, account_id) in rows:
+        for (oid, title, qty, price, status, created_at, link, uid, payload_text) in rows:
+account_id = ""
+if payload_text:
+    try:
+        import json as _json
+        j = _json.loads(payload_text)
+        account_id = str(j.get("account_id","") or "")
+    except Exception as e:
+        logger.warning(f"%s: invalid payload JSON for order {oid}: {e}", "admin_pending_ludo")
             d = {
                 "id": oid, "title": title, "quantity": qty,
                 "price": float(price or 0), "status": status,
@@ -4151,13 +4167,11 @@ def _itunes_auto_process_one(conn):
     with conn, conn.cursor() as cur:
         _ensure_itunes_codes_table(cur)
         rec = _itunes_pick_one_locked(cur)
-        if not rec:
-            return None
+        if not rec: return None
         code = _itunes_pick_code_locked(cur, rec["category"])
-        if not code:
-            # Log skip for visibility
-            logger.info('itunes_auto: skipped order due to no free code (category=%s)', rec.get('category'))
-            return None
+        \1
+    # Log skip for visibility
+    logger.info('itunes_auto: skipped order due to no free code (category=%s)', rec.get('category'))
         payload = rec.get("payload") or {}
         if isinstance(payload, dict):
             payload["code"] = code["code"]
@@ -4170,7 +4184,7 @@ def _itunes_auto_process_one(conn):
         cur.execute("UPDATE public.itunes_codes SET used=TRUE, used_by_order_id=%s, used_at=NOW() WHERE id=%s", (rec["order_id"], code["id"]))
         out = {"order_id": rec["order_id"], "user_id": rec["user_id"], "code_id": code["id"]}
     try:
-        _notify_user(conn, out["user_id"], out["order_id"], "تم تنفيذ الطلب تلقائيًا (iTunes)", f"الفئة {rec['category']} - الكود: {code['code']}")
+        _notify_user(conn, out["user_id"], out["order_id"], "تم تنفيذ طلبك ايتونز", f"الفئة {rec['category']} - الكود: {code['code']}")
     except Exception:
         pass
     return out
@@ -4179,13 +4193,13 @@ def _cards_auto_process_one(conn):
     with conn, conn.cursor() as cur:
         _ensure_card_codes_table(cur)
         rec = _cards_pick_one_locked(cur)
-        if not rec:
-            return None
+        if not rec: return None
+        \1
+    logger.info('cards_auto: skipped order due to unknown telco (title=%s)', rec.get('title', ''))
         code = _cards_pick_code_locked(cur, rec["telco"], rec["category"])
-        if not code:
-            # Log skip for visibility
-            logger.info('cards_auto: skipped order due to no free code (telco=%s, category=%s)', rec.get('telco'), rec.get('category'))
-            return None
+        \1
+    # Log skip for visibility
+    logger.info('itunes_auto: skipped order due to no free code (category=%s)', rec.get('category'))
         payload = rec.get("payload") or {}
         if isinstance(payload, dict):
             payload["code"] = code["code"]
@@ -4199,7 +4213,7 @@ def _cards_auto_process_one(conn):
         cur.execute("UPDATE public.card_codes SET used=TRUE, used_by_order_id=%s, used_at=NOW() WHERE id=%s", (rec["order_id"], code["id"]))
         out = {"order_id": rec["order_id"], "user_id": rec["user_id"], "code_id": code["id"]}
     try:
-        _notify_user(conn, out["user_id"], out["order_id"], "تم تنفيذ الطلب تلقائيًا (كارت)", f"{rec['telco']} | الفئة {rec['category']} - الكود: {code['code']}")
+        _notify_user(conn, out["user_id"], out["order_id"], "تم تنفيذ طلبك رصيد الهاتف", f"{rec['telco']} | الفئة {rec['category']} - الكود: {code['code']}")
     except Exception:
         pass
     return out
