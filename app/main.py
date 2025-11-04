@@ -1,3 +1,4 @@
+import re
 from __future__ import annotations
 import asyncio
 
@@ -4023,8 +4024,8 @@ def auto_exec_set(body: AutoScopeSetIn, x_admin_password: Optional[str] = Header
             _set_flag(cur, flag, bool(body.enabled))
         # Start daemons
         try:
-            asyncio.create_task(_itunes_autoexec_daemon())
-            asyncio.create_task(_cards_autoexec_daemon())
+            getattr(asyncio, 'get_running_loop', asyncio.get_event_loop)().create_task(_itunes_autoexec_daemon())
+            getattr(asyncio, 'get_running_loop', asyncio.get_event_loop)().create_task(_cards_autoexec_daemon())
         except Exception:
             pass
         return {"ok": True, "scope": scope or "api", "enabled": bool(body.enabled)}
@@ -4032,22 +4033,9 @@ def auto_exec_set(body: AutoScopeSetIn, x_admin_password: Optional[str] = Header
         put_conn(conn)
 
 # ----- Pickers & processors -----
-def _parse_category_from_title(title: str) -> Optional[str]:
-    t = (title or "").lower()
-    # match 5,10,15,20,25,30,40,50,100 with or without $ symbol
-    m = re.search(r"(5|10|15|20|25|30|40|50|100)\s*\$|\$\s*(5|10|15|20|25|30|40|50|100)", t)
-    if m: return m.group(1) or m.group(2)
-    m = re.search(r"\b(5|10|15|20|25|30|40|50|100)\b", t)
-    return m.group(1) if m else None
-
-def _parse_telco_from_title(title: str) -> Optional[str]:
-    t = (title or "").lower()
-    if any(x in t for x in ["اثير","أثير","atheer","atheir","zain"]): return "atheir"
-    if any(x in t for x in ["asiacell","اسيا","اسياسيل","أسيا"]): return "asiacell"
-    if any(x in t for x in ["korek","كورك"]): return "korek"
-    return None
-
-def _itunes_pick_one_locked(cur):
+def _parse_category_from_title(t: str):
+    # local import guard (prevents NameError if someone removes top import)
+    import re as _re
     cur.execute("""
         SELECT o.id, o.user_id, o.title
         FROM public.orders o
@@ -4225,8 +4213,8 @@ try:
     @app.on_event("startup")
     async def _startup_scoped_autoexec():
         try:
-            asyncio.create_task(_itunes_autoexec_daemon())
-            asyncio.create_task(_cards_autoexec_daemon())
+            getattr(asyncio, 'get_running_loop', asyncio.get_event_loop)().create_task(_itunes_autoexec_daemon())
+            getattr(asyncio, 'get_running_loop', asyncio.get_event_loop)().create_task(_cards_autoexec_daemon())
         except Exception as e:
             logging.exception("failed to start scoped autoexec daemons: %s", e)
 except Exception:
