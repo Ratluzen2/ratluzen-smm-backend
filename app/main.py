@@ -1819,7 +1819,6 @@ def admin_pending_pubg(x_admin_password: Optional[str] = Header(None, alias="x-a
                 LOWER(o.title) LIKE '%pubg%' OR
                 LOWER(o.title) LIKE '%bgmi%' OR
                 LOWER(o.title) LIKE '%uc%' OR
-                o.title LIKE '%شدات%' OR
                 o.title LIKE '%بيجي%' OR
                 o.title LIKE '%ببجي%'
             )
@@ -1828,14 +1827,14 @@ def admin_pending_pubg(x_admin_password: Optional[str] = Header(None, alias="x-a
             rows = cur.fetchall()
         out = []
         for (oid, title, qty, price, status, created_at, link, uid, payload_text) in rows:
-account_id = ""
-if payload_text:
-    try:
-        import json as _json
-        j = _json.loads(payload_text)
-        account_id = str(j.get("account_id","") or "")
-    except Exception as e:
-        logger.warning(f"%s: invalid payload JSON for order {oid}: {e}", "admin_pending_pubg")
+            account_id = ""
+            if payload_text:
+                try:
+                    j = json.loads(payload_text) if isinstance(payload_text, str) else payload_text
+                    if isinstance(j, dict):
+                        account_id = str(j.get("account_id","") or "")
+                except Exception as e:
+                    logger.warning("%s: invalid payload JSON for order %s: %s", "admin_pending_pubg", oid, e)
             d = {
                 "id": oid, "title": title, "quantity": qty,
                 "price": float(price or 0), "status": status,
@@ -1847,7 +1846,6 @@ if payload_text:
         return out
     finally:
         put_conn(conn)
-
 @app.get("/api/admin/pending/ludo")
 def admin_pending_ludo(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(x_admin_password or password or "")
@@ -1872,14 +1870,14 @@ def admin_pending_ludo(x_admin_password: Optional[str] = Header(None, alias="x-a
             rows = cur.fetchall()
         out = []
         for (oid, title, qty, price, status, created_at, link, uid, payload_text) in rows:
-account_id = ""
-if payload_text:
-    try:
-        import json as _json
-        j = _json.loads(payload_text)
-        account_id = str(j.get("account_id","") or "")
-    except Exception as e:
-        logger.warning(f"%s: invalid payload JSON for order {oid}: {e}", "admin_pending_ludo")
+            account_id = ""
+            if payload_text:
+                try:
+                    j = json.loads(payload_text) if isinstance(payload_text, str) else payload_text
+                    if isinstance(j, dict):
+                        account_id = str(j.get("account_id","") or "")
+                except Exception as e:
+                    logger.warning("%s: invalid payload JSON for order %s: %s", "admin_pending_ludo", oid, e)
             d = {
                 "id": oid, "title": title, "quantity": qty,
                 "price": float(price or 0), "status": status,
@@ -1891,8 +1889,6 @@ if payload_text:
         return out
     finally:
         put_conn(conn)
-
-# Pending topup cards (Asiacell via card)
 @app.get("/api/admin/pending/cards")
 def admin_pending_cards(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(x_admin_password or password or "")
@@ -4167,18 +4163,26 @@ def _itunes_auto_process_one(conn):
     with conn, conn.cursor() as cur:
         _ensure_itunes_codes_table(cur)
         rec = _itunes_pick_one_locked(cur)
-        if not rec: return None
+        if not rec:
+            return None
         code = _itunes_pick_code_locked(cur, rec["category"])
-        \1
-    # Log skip for visibility
-    logger.info('itunes_auto: skipped order due to no free code (category=%s)', rec.get('category'))
+        if not code:
+            logger.info("itunes_auto: skipped order due to no free code (category=%s)", rec.get("category"))
+            return {"skipped": True, "reason": "no_free_code", "category": rec.get("category")}
         payload = rec.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload) or {}
+            except Exception:
+                payload = {}
         if isinstance(payload, dict):
             payload["code"] = code["code"]
             payload["card"] = code["code"]
             payload["category"] = rec["category"]
-        if _payload_is_jsonb(conn) and isinstance(payload, dict):
-            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(payload), rec["order_id"]))
+            if _payload_is_jsonb(conn):
+                cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(payload), rec["order_id"]))
+            else:
+                cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (rec["order_id"],))
         else:
             cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (rec["order_id"],))
         cur.execute("UPDATE public.itunes_codes SET used=TRUE, used_by_order_id=%s, used_at=NOW() WHERE id=%s", (rec["order_id"], code["id"]))
@@ -4188,36 +4192,44 @@ def _itunes_auto_process_one(conn):
     except Exception:
         pass
     return out
-
 def _cards_auto_process_one(conn):
     with conn, conn.cursor() as cur:
         _ensure_card_codes_table(cur)
         rec = _cards_pick_one_locked(cur)
-        if not rec: return None
-        \1
-    logger.info('cards_auto: skipped order due to unknown telco (title=%s)', rec.get('title', ''))
-        code = _cards_pick_code_locked(cur, rec["telco"], rec["category"])
-        \1
-    # Log skip for visibility
-    logger.info('itunes_auto: skipped order due to no free code (category=%s)', rec.get('category'))
+        if not rec:
+            return None
+        telco = rec.get("telco")
+        if not telco:
+            logger.info("cards_auto: skipped order due to unknown telco")
+            return {"skipped": True, "reason": "unknown_telco"}
+        code = _cards_pick_code_locked(cur, telco, rec["category"])
+        if not code:
+            logger.info("cards_auto: skipped order due to no free code (telco=%s, category=%s)", telco, rec.get("category"))
+            return {"skipped": True, "reason": "no_free_code", "telco": telco, "category": rec.get("category")}
         payload = rec.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload) or {}
+            except Exception:
+                payload = {}
         if isinstance(payload, dict):
             payload["code"] = code["code"]
             payload["card"] = code["code"]
-            payload["telco"] = rec["telco"]
+            payload["telco"] = telco
             payload["category"] = rec["category"]
-        if _payload_is_jsonb(conn) and isinstance(payload, dict):
-            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(payload), rec["order_id"]))
+            if _payload_is_jsonb(conn):
+                cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(payload), rec["order_id"]))
+            else:
+                cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (rec["order_id"],))
         else:
             cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (rec["order_id"],))
         cur.execute("UPDATE public.card_codes SET used=TRUE, used_by_order_id=%s, used_at=NOW() WHERE id=%s", (rec["order_id"], code["id"]))
         out = {"order_id": rec["order_id"], "user_id": rec["user_id"], "code_id": code["id"]}
     try:
-        _notify_user(conn, out["user_id"], out["order_id"], "تم تنفيذ طلبك رصيد الهاتف", f"{rec['telco']} | الفئة {rec['category']} - الكود: {code['code']}")
+        _notify_user(conn, out["user_id"], out["order_id"], f"تم تنفيذ طلبك رصيد {telco}", f"الفئة {rec['category']} - الكود: {code['code']}")
     except Exception:
         pass
     return out
-
 # ----- Daemons -----
 _ITUNES_DAEMON_STARTED = False
 _CARDS_DAEMON_STARTED  = False
