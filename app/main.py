@@ -3211,11 +3211,12 @@ class AutoExecRunIn(BaseModel):
     only_when_enabled: bool = True
 
 def _auto_exec_one_locked(cur):
-    # pick one eligible API order
+    # pick one eligible API/provider order only (ignore manual/topup_card/etc.)
     cur.execute("""
         SELECT id, user_id, service_id, link, quantity, price, title, type
         FROM public.orders
         WHERE COALESCE(status,'Pending')='Pending'
+          AND type='provider'
         ORDER BY id ASC
         FOR UPDATE SKIP LOCKED
         LIMIT 1
@@ -3225,10 +3226,10 @@ def _auto_exec_one_locked(cur):
         return None
     (oid, user_id, service_id, link, qty, price, title, otype) = r
 
-    # Non-provider/manual kinds are marked done immediately to avoid blocking the queue
-    if otype in ('manual', 'topup_card') or service_id is None:
-        cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (oid,))
-        return {"order_id": oid, "status": "Done", "skipped": True}
+    # Safety: if for أي سبب كان service_id فارغ، اعتبر الطلب غير صالح وارفُضه
+    if service_id is None:
+        cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (oid,))
+        return {"order_id": oid, "status": "Rejected", "reason": "missing_service_id"}
 
     # Claim the order atomically to prevent duplicate processing by other workers
     cur.execute("""
