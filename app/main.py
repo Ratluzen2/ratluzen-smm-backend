@@ -3343,6 +3343,10 @@ def admin_auto_exec_toggle(body: AutoExecToggleIn, x_admin_password: Optional[st
     except Exception:
         raw = {}
     scope = (raw.get("scope") or "").strip().lower()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
     passwd = _pick_admin_password(x_admin_password, password, raw)
 
     if passwd != ADMIN_PASSWORD:
@@ -3358,8 +3362,8 @@ def admin_auto_exec_toggle(body: AutoExecToggleIn, x_admin_password: Optional[st
                 _set_flag(cur, flag, bool(body.enabled))
                 logger.info("auto_exec.toggle scope=%s -> enabled=%s", scope, bool(body.enabled))
                 try:
-                    asyncio.create_task(_itunes_autoexec_daemon())
-                    asyncio.create_task(_cards_autoexec_daemon())
+                    asyncio.create_task(loop.create_task(_itunes_autoexec_daemon()))
+                    asyncio.create_task(loop.create_task(_cards_autoexec_daemon()))
                 except Exception as e:
                     logger.exception("failed to start scoped daemons: %s", e)
                 return {"ok": True, "scope": scope, "enabled": bool(body.enabled)}
@@ -3367,7 +3371,7 @@ def admin_auto_exec_toggle(body: AutoExecToggleIn, x_admin_password: Optional[st
             _set_flag(cur, "auto_exec_api", bool(body.enabled))
             logger.info("auto_exec.toggle scope=api -> enabled=%s", bool(body.enabled))
         try:
-            asyncio.create_task(_auto_exec_daemon())
+            asyncio.create_task(loop.create_task(_auto_exec_daemon()))
         except Exception as e:
             logger.exception("failed to start api daemon: %s", e)
         return {"ok": True, "scope": "api", "enabled": bool(body.enabled)}
@@ -3397,6 +3401,8 @@ AUTOEXEC_LIMIT      = int(os.getenv("AUTOEXEC_LIMIT", "3"))
 
 async def _auto_exec_daemon():
     global _AUTOEXEC_DAEMON_STARTED
+    global _AUTOEXEC_DAEMON_STARTED
+    _AUTOEXEC_DAEMON_STARTED = True
     _AUTOEXEC_DAEMON_STARTED = True
     while True:
         try:
@@ -4041,6 +4047,10 @@ def auto_exec_status_scoped(x_admin_password: Optional[str] = Header(None, alias
 @app.post("/api/admin/auto_exec/set")
 def auto_exec_set(body: AutoScopeSetIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     logger.info("auto_exec.set called with scope=%s enabled=%s", getattr(body,'scope',None), getattr(body,'enabled',None))
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
     _require_admin(_pick_admin_password(x_admin_password, password, (body.dict() if hasattr(body,'dict') else {})) or "")
     scope = (body.scope or "").strip().lower()
     if scope not in ("itunes","cards","api",""):
@@ -4053,8 +4063,8 @@ def auto_exec_set(body: AutoScopeSetIn, x_admin_password: Optional[str] = Header
             _set_flag(cur, flag, bool(body.enabled))
         # Start daemons
         try:
-            asyncio.create_task(_itunes_autoexec_daemon())
-            asyncio.create_task(_cards_autoexec_daemon())
+            asyncio.create_task(loop.create_task(_itunes_autoexec_daemon()))
+            asyncio.create_task(loop.create_task(_cards_autoexec_daemon()))
         except Exception:
             pass
         return {"ok": True, "scope": scope or "api", "enabled": bool(body.enabled)}
@@ -4192,6 +4202,8 @@ _CARDS_DAEMON_STARTED  = False
 
 async def _itunes_autoexec_daemon():
     global _ITUNES_DAEMON_STARTED
+    global _ITUNES_DAEMON_STARTED
+    _ITUNES_DAEMON_STARTED = True
     if _ITUNES_DAEMON_STARTED: return
     _ITUNES_DAEMON_STARTED = True
     while True:
@@ -4220,6 +4232,8 @@ async def _itunes_autoexec_daemon():
 
 async def _cards_autoexec_daemon():
     global _CARDS_DAEMON_STARTED
+    global _CARDS_DAEMON_STARTED
+    _CARDS_DAEMON_STARTED = True
     if _CARDS_DAEMON_STARTED: return
     _CARDS_DAEMON_STARTED = True
     while True:
