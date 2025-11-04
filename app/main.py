@@ -1816,32 +1816,35 @@ def admin_pending_pubg(x_admin_password: Optional[str] = Header(None, alias="x-a
                 FROM public.orders o
                 JOIN public.users u ON u.id = o.user_id
                 WHERE o.status='Pending' AND (
-                LOWER(o.title) LIKE '%pubg%' OR
-                LOWER(o.title) LIKE '%bgmi%' OR
-                LOWER(o.title) LIKE '%uc%' OR
-                o.title LIKE '%بيجي%' OR
-                o.title LIKE '%ببجي%'
-            )
+                    LOWER(o.title) LIKE '%pubg%' OR
+                    LOWER(o.title) LIKE '%bgmi%' OR
+                    LOWER(o.title) LIKE '%uc%' OR
+                    o.title LIKE '%شدات%' OR
+                    o.title LIKE '%بيجي%' OR
+                    o.title LIKE '%ببجي%'
+                )
                 ORDER BY o.id DESC
             """)
             rows = cur.fetchall()
         out = []
         for (oid, title, qty, price, status, created_at, link, uid, payload_text) in rows:
-            account_id = ""
-            if payload_text:
-                try:
-                    j = json.loads(payload_text) if isinstance(payload_text, str) else payload_text
-                    if isinstance(j, dict):
-                        account_id = str(j.get("account_id","") or "")
-                except Exception as e:
-                    logger.warning("%s: invalid payload JSON for order %s: %s", "admin_pending_pubg", oid, e)
             d = {
                 "id": oid, "title": title, "quantity": qty,
                 "price": float(price or 0), "status": status,
                 "created_at": int(created_at or 0), "link": link, "uid": uid
             }
-            if account_id:
-                d["account_id"] = account_id
+            # (Optional) parse payload to recover player_id or category if present
+            if payload_text:
+                try:
+                    import json as _json
+                    j = _json.loads(payload_text) if isinstance(payload_text, str) else payload_text
+                    if isinstance(j, dict):
+                        if j.get("player_id"):
+                            d["player_id"] = str(j.get("player_id"))
+                        if j.get("category"):
+                            d["category"] = str(j.get("category"))
+                except Exception as e:
+                    logger.warning("admin_pending_pubg: bad JSON in payload for order %s: %s", oid, e)
             out.append(d)
         return out
     finally:
@@ -1860,31 +1863,31 @@ def admin_pending_ludo(x_admin_password: Optional[str] = Header(None, alias="x-a
                 FROM public.orders o
                 JOIN public.users u ON u.id = o.user_id
                 WHERE o.status='Pending' AND (
-                LOWER(o.title) LIKE '%ludo%' OR
-                LOWER(o.title) LIKE '%yalla%' OR
-                o.title LIKE '%يلا لودو%' OR
-                o.title LIKE '%لودو%'
-            )
+                    LOWER(o.title) LIKE '%ludo%' OR
+                    o.title LIKE '%لودو%' OR
+                    o.title LIKE '%ليدو%'
+                )
                 ORDER BY o.id DESC
             """)
             rows = cur.fetchall()
         out = []
         for (oid, title, qty, price, status, created_at, link, uid, payload_text) in rows:
-            account_id = ""
-            if payload_text:
-                try:
-                    j = json.loads(payload_text) if isinstance(payload_text, str) else payload_text
-                    if isinstance(j, dict):
-                        account_id = str(j.get("account_id","") or "")
-                except Exception as e:
-                    logger.warning("%s: invalid payload JSON for order %s: %s", "admin_pending_ludo", oid, e)
             d = {
                 "id": oid, "title": title, "quantity": qty,
                 "price": float(price or 0), "status": status,
                 "created_at": int(created_at or 0), "link": link, "uid": uid
             }
-            if account_id:
-                d["account_id"] = account_id
+            if payload_text:
+                try:
+                    import json as _json
+                    j = _json.loads(payload_text) if isinstance(payload_text, str) else payload_text
+                    if isinstance(j, dict):
+                        if j.get("player_id"):
+                            d["player_id"] = str(j.get("player_id"))
+                        if j.get("category"):
+                            d["category"] = str(j.get("category"))
+                except Exception as e:
+                    logger.warning("admin_pending_ludo: bad JSON in payload for order %s: %s", oid, e)
             out.append(d)
         return out
     finally:
@@ -1896,19 +1899,64 @@ def admin_pending_cards(x_admin_password: Optional[str] = Header(None, alias="x-
     try:
         with conn, conn.cursor() as cur:
             cur.execute("""
-                SELECT o.id, u.uid, COALESCE((COALESCE(NULLIF(o.payload,''),'{}')::jsonb->>'card'), '') AS card,
-                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at
+                SELECT o.id, o.title, o.quantity, o.price, o.status,
+                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
+                       o.link, u.uid,
+                       o.payload AS payload_text
                 FROM public.orders o
                 JOIN public.users u ON u.id = o.user_id
-                WHERE o.status='Pending' AND o.type='topup_card'
+                WHERE o.status='Pending' AND (
+                    LOWER(o.title) LIKE '%asiacell%' OR
+                    LOWER(o.title) LIKE '%atheer%' OR
+                    o.title LIKE '%اسياسيل%' OR
+                    o.title LIKE '%أسياسيل%' OR
+                    o.title LIKE '%اثير%' OR
+                    LOWER(o.title) LIKE '%korek%' OR
+                    o.title LIKE '%كورك%' OR
+                    LOWER(o.title) LIKE '%zain%' OR
+                    o.title LIKE '%زين%'
+                )
                 ORDER BY o.id DESC
             """)
             rows = cur.fetchall()
-        return [{"id": r[0], "uid": r[1], "card": r[2], "created_at": int(r[3] or 0)} for r in rows]
+        out = []
+        for (oid, title, qty, price, status, created_at, link, uid, payload_text) in rows:
+            account_id = ""
+            telco = ""
+            category = ""
+            if payload_text:
+                try:
+                    import json as _json
+                    j = _json.loads(payload_text) if isinstance(payload_text, str) else payload_text
+                    if isinstance(j, dict):
+                        account_id = str(j.get("account_id","") or "")
+                        telco = str(j.get("telco","") or "")
+                        category = str(j.get("category","") or "")
+                except Exception as e:
+                    logger.warning("admin_pending_cards: bad JSON in payload for order %s: %s", oid, e)
+            low = (title or "").lower()
+            if not telco:
+                if any(k in low for k in ["asiacell"]) or ("اثير" in (title or "")) or ("اسياسيل" in (title or "")) or ("أسياسيل" in (title or "")):
+                    telco = "asiacell"
+                elif any(k in low for k in ["korek"]) or ("كورك" in (title or "")):
+                    telco = "korek"
+                elif any(k in low for k in ["zain"]) or ("زين" in (title or "")):
+                    telco = "atheer"
+            d = {
+                "id": oid, "title": title, "quantity": qty,
+                "price": float(price or 0), "status": status,
+                "created_at": int(created_at or 0), "link": link, "uid": uid
+            }
+            if account_id:
+                d["account_id"] = account_id
+            if telco:
+                d["telco"] = telco
+            if category:
+                d["category"] = category
+            out.append(d)
+        return out
     finally:
         put_conn(conn)
-
-# Pending balance purchase (Atheer/Asiacell/Korek vouchers)
 @app.get("/api/admin/pending/balances")
 def admin_pending_balances(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(x_admin_password or password or "")
@@ -4163,26 +4211,18 @@ def _itunes_auto_process_one(conn):
     with conn, conn.cursor() as cur:
         _ensure_itunes_codes_table(cur)
         rec = _itunes_pick_one_locked(cur)
-        if not rec:
-            return None
+        if not rec: return None
         code = _itunes_pick_code_locked(cur, rec["category"])
-        if not code:
-            logger.info("itunes_auto: skipped order due to no free code (category=%s)", rec.get("category"))
-            return {"skipped": True, "reason": "no_free_code", "category": rec.get("category")}
+        \1
+    # Log skip for visibility
+    logger.info('itunes_auto: skipped order due to no free code (category=%s)', rec.get('category'))
         payload = rec.get("payload") or {}
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload) or {}
-            except Exception:
-                payload = {}
         if isinstance(payload, dict):
             payload["code"] = code["code"]
             payload["card"] = code["code"]
             payload["category"] = rec["category"]
-            if _payload_is_jsonb(conn):
-                cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(payload), rec["order_id"]))
-            else:
-                cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (rec["order_id"],))
+        if _payload_is_jsonb(conn) and isinstance(payload, dict):
+            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(payload), rec["order_id"]))
         else:
             cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (rec["order_id"],))
         cur.execute("UPDATE public.itunes_codes SET used=TRUE, used_by_order_id=%s, used_at=NOW() WHERE id=%s", (rec["order_id"], code["id"]))
@@ -4192,44 +4232,36 @@ def _itunes_auto_process_one(conn):
     except Exception:
         pass
     return out
+
 def _cards_auto_process_one(conn):
     with conn, conn.cursor() as cur:
         _ensure_card_codes_table(cur)
         rec = _cards_pick_one_locked(cur)
-        if not rec:
-            return None
-        telco = rec.get("telco")
-        if not telco:
-            logger.info("cards_auto: skipped order due to unknown telco")
-            return {"skipped": True, "reason": "unknown_telco"}
-        code = _cards_pick_code_locked(cur, telco, rec["category"])
-        if not code:
-            logger.info("cards_auto: skipped order due to no free code (telco=%s, category=%s)", telco, rec.get("category"))
-            return {"skipped": True, "reason": "no_free_code", "telco": telco, "category": rec.get("category")}
+        if not rec: return None
+        \1
+    logger.info('cards_auto: skipped order due to unknown telco (title=%s)', rec.get('title', ''))
+        code = _cards_pick_code_locked(cur, rec["telco"], rec["category"])
+        \1
+    # Log skip for visibility
+    logger.info('itunes_auto: skipped order due to no free code (category=%s)', rec.get('category'))
         payload = rec.get("payload") or {}
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload) or {}
-            except Exception:
-                payload = {}
         if isinstance(payload, dict):
             payload["code"] = code["code"]
             payload["card"] = code["code"]
-            payload["telco"] = telco
+            payload["telco"] = rec["telco"]
             payload["category"] = rec["category"]
-            if _payload_is_jsonb(conn):
-                cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(payload), rec["order_id"]))
-            else:
-                cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (rec["order_id"],))
+        if _payload_is_jsonb(conn) and isinstance(payload, dict):
+            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(payload), rec["order_id"]))
         else:
             cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (rec["order_id"],))
         cur.execute("UPDATE public.card_codes SET used=TRUE, used_by_order_id=%s, used_at=NOW() WHERE id=%s", (rec["order_id"], code["id"]))
         out = {"order_id": rec["order_id"], "user_id": rec["user_id"], "code_id": code["id"]}
     try:
-        _notify_user(conn, out["user_id"], out["order_id"], f"تم تنفيذ طلبك رصيد {telco}", f"الفئة {rec['category']} - الكود: {code['code']}")
+        _notify_user(conn, out["user_id"], out["order_id"], "تم تنفيذ طلبك رصيد الهاتف", f"{rec['telco']} | الفئة {rec['category']} - الكود: {code['code']}")
     except Exception:
         pass
     return out
+
 # ----- Daemons -----
 _ITUNES_DAEMON_STARTED = False
 _CARDS_DAEMON_STARTED  = False
