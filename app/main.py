@@ -1,5 +1,15 @@
 from __future__ import annotations
 import asyncio
+# === Auto-exec task holders (avoid 'no running event loop' on Heroku) ===
+_itunes_task: 'asyncio.Task|None' = None
+_cards_task: 'asyncio.Task|None' = None
+
+def _task_alive(t):
+    try:
+        return t is not None and not t.done()
+    except Exception:
+        return False
+
 
 from typing import Optional
 from fastapi import Header, HTTPException
@@ -33,7 +43,6 @@ import os
 import json
 import time
 import logging
-import re
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -3333,51 +3342,20 @@ def admin_auto_exec_status(x_admin_password: Optional[str] = Header(None, alias=
 
 @app.post("/api/admin/auto_exec/toggle")
 def admin_auto_exec_toggle(body: AutoExecToggleIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    """
-    Enhanced toggle: accepts optional scope ('api'|'itunes'|'cards') inside body,
-    adds rich logging, and starts relevant daemons.
-    Backward compatible: when scope is omitted, it toggles the old 'auto_exec_api' flag.
-    """
-    try:
-        raw = body.dict()
-    except Exception:
-        raw = {}
-    scope = (raw.get("scope") or "").strip().lower()
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-    passwd = _pick_admin_password(x_admin_password, password, raw)
-
-    if passwd != ADMIN_PASSWORD:
-        logger.warning("auto_exec.toggle auth failed (wrong password) scope=%s", scope or "api")
-        raise HTTPException(status_code=401, detail="bad admin password")
-
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             _ensure_settings_table(cur)
-            if scope in ("itunes", "cards"):
-                flag = _scope_flag_name(scope)
-                _set_flag(cur, flag, bool(body.enabled))
-                logger.info("auto_exec.toggle scope=%s -> enabled=%s", scope, bool(body.enabled))
-                try:
-                    asyncio.create_task(loop.create_task(_itunes_autoexec_daemon()))
-                    asyncio.create_task(loop.create_task(_cards_autoexec_daemon()))
-                except Exception as e:
-                    logger.exception("failed to start scoped daemons: %s", e)
-                return {"ok": True, "scope": scope, "enabled": bool(body.enabled)}
-            # default to API behavior for backward compatibility
             _set_flag(cur, "auto_exec_api", bool(body.enabled))
-            logger.info("auto_exec.toggle scope=api -> enabled=%s", bool(body.enabled))
+        # Wake up daemon (safe if already running)
         try:
-            asyncio.create_task(loop.create_task(_auto_exec_daemon()))
-        except Exception as e:
-            logger.exception("failed to start api daemon: %s", e)
-        return {"ok": True, "scope": "api", "enabled": bool(body.enabled)}
+            asyncio.create_task(_auto_exec_daemon())
+        except Exception:
+            pass
+        return {"ok": True, "enabled": bool(body.enabled)}
     finally:
         put_conn(conn)
-
 
 @app.post("/api/admin/auto_exec/run")
 def admin_auto_exec_run(body: AutoExecRunIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
@@ -3401,8 +3379,6 @@ AUTOEXEC_LIMIT      = int(os.getenv("AUTOEXEC_LIMIT", "3"))
 
 async def _auto_exec_daemon():
     global _AUTOEXEC_DAEMON_STARTED
-    global _AUTOEXEC_DAEMON_STARTED
-    _AUTOEXEC_DAEMON_STARTED = True
     _AUTOEXEC_DAEMON_STARTED = True
     while True:
         try:
@@ -4017,7 +3993,6 @@ def _scope_flag_name(scope: str) -> str:
 
 @app.get("/api/admin/auto_exec/status", name="auto_exec_status_scoped")
 def auto_exec_status_scoped(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None, scope: Optional[str] = None):
-    logger.info("auto_exec.status (scoped) called with scope=%s", scope)
     # Backward compatible: if no scope -> return the generic flag
     _require_admin(_pick_admin_password(x_admin_password, password) or "")
     conn = get_conn()
@@ -4045,12 +4020,7 @@ def auto_exec_status_scoped(x_admin_password: Optional[str] = Header(None, alias
         put_conn(conn)
 
 @app.post("/api/admin/auto_exec/set")
-def auto_exec_set(body: AutoScopeSetIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    logger.info("auto_exec.set called with scope=%s enabled=%s", getattr(body,'scope',None), getattr(body,'enabled',None))
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
+async def auto_exec_set(body: AutoScopeSetIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(_pick_admin_password(x_admin_password, password, (body.dict() if hasattr(body,'dict') else {})) or "")
     scope = (body.scope or "").strip().lower()
     if scope not in ("itunes","cards","api",""):
@@ -4063,10 +4033,11 @@ def auto_exec_set(body: AutoScopeSetIn, x_admin_password: Optional[str] = Header
             _set_flag(cur, flag, bool(body.enabled))
         # Start daemons
         try:
-            asyncio.create_task(loop.create_task(_itunes_autoexec_daemon()))
-            asyncio.create_task(loop.create_task(_cards_autoexec_daemon()))
+            loop = asyncio.get_running_loop()
+            # kick the unified auto-exec daemon (it observes flags and dispatches per-scope)
+            loop.create_task(_auto_exec_daemon())
         except Exception:
-            pass
+            logger.exception("auto_exec.set: failed to start auto-exec daemon")
         return {"ok": True, "scope": scope or "api", "enabled": bool(body.enabled)}
     finally:
         put_conn(conn)
@@ -4202,8 +4173,6 @@ _CARDS_DAEMON_STARTED  = False
 
 async def _itunes_autoexec_daemon():
     global _ITUNES_DAEMON_STARTED
-    global _ITUNES_DAEMON_STARTED
-    _ITUNES_DAEMON_STARTED = True
     if _ITUNES_DAEMON_STARTED: return
     _ITUNES_DAEMON_STARTED = True
     while True:
@@ -4232,8 +4201,6 @@ async def _itunes_autoexec_daemon():
 
 async def _cards_autoexec_daemon():
     global _CARDS_DAEMON_STARTED
-    global _CARDS_DAEMON_STARTED
-    _CARDS_DAEMON_STARTED = True
     if _CARDS_DAEMON_STARTED: return
     _CARDS_DAEMON_STARTED = True
     while True:
@@ -4273,88 +4240,3 @@ except Exception:
     pass
 
 # ========= END Patch =========
-
-# Deep diagnostics endpoint to explain auto-exec state and "why" toggles appear off
-@app.get("/api/admin/auto_exec/diagnose")
-def admin_auto_exec_diagnose(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
-                             password: Optional[str] = None,
-                             scope: Optional[str] = None):
-    passwd = _pick_admin_password(x_admin_password, password) or ""
-    if passwd != ADMIN_PASSWORD:
-        logger.warning("auto_exec.diagnose auth failed")
-        raise HTTPException(status_code=401, detail="bad admin password")
-
-    conn = get_conn()
-    try:
-        flags = {}
-        settings_rows = []
-        codes = {"itunes_free": None, "cards_free": None}
-        with conn, conn.cursor() as cur:
-            _ensure_settings_table(cur)
-            for k in ("auto_exec_api","auto_exec_itunes","auto_exec_cards"):
-                try:
-                    flags[k] = _get_flag(cur, k, False)
-                except Exception:
-                    flags[k] = None
-            try:
-                cur.execute("""
-                    SELECT key, (value->>'enabled')::boolean AS enabled,
-                           (EXTRACT(EPOCH FROM updated_at)*1000)::BIGINT AS updated_at
-                    FROM public.settings
-                    WHERE key IN ('auto_exec_api','auto_exec_itunes','auto_exec_cards')
-                    ORDER BY key
-                """)
-                rows = cur.fetchall() or []
-                for r in rows:
-                    settings_rows.append({
-                        "key": r[0],
-                        "enabled": bool(r[1]) if r[1] is not None else None,
-                        "updated_at": int(r[2]) if r[2] is not None else None
-                    })
-            except Exception as e:
-                logger.exception("diagnose settings dump failed: %s", e)
-
-            # free code counts
-            try:
-                _ensure_itunes_codes_table(cur)
-                cur.execute("SELECT COUNT(*) FROM public.itunes_codes WHERE used=FALSE")
-                codes["itunes_free"] = int(cur.fetchone()[0])
-            except Exception as e:
-                codes["itunes_free"] = None
-                logger.exception("diagnose itunes count failed: %s", e)
-
-            try:
-                _ensure_card_codes_table(cur)
-                cur.execute("SELECT COUNT(*) FROM public.card_codes WHERE used=FALSE")
-                codes["cards_free"] = int(cur.fetchone()[0])
-            except Exception as e:
-                codes["cards_free"] = None
-                logger.exception("diagnose cards count failed: %s", e)
-
-        out = {
-            "ok": True,
-            "scope": (scope or "all"),
-            "flags": flags,
-            "settings": settings_rows,
-            "codes": codes,
-            "daemon": {
-                "api_started": bool(globals().get("_AUTOEXEC_DAEMON_STARTED", False)),
-                "itunes_started": bool(globals().get("_ITUNES_DAEMON_STARTED", False)),
-                "cards_started": bool(globals().get("_CARDS_DAEMON_STARTED", False)),
-            },
-            "env": {
-                "AUTOEXEC_LIMIT": int(globals().get("AUTOEXEC_LIMIT", 3)),
-                "AUTOEXEC_IDLE_SLEEP": int(globals().get("AUTOEXEC_IDLE_SLEEP", 5)),
-                "AUTOEXEC_LOOP_SLEEP": int(globals().get("AUTOEXEC_LOOP_SLEEP", 2)),
-            },
-            "notes": [
-                "If you enabled iTunes/cards using /api/admin/auto_exec/toggle, include {'scope':'itunes'|'cards'} in the body or use /api/admin/auto_exec/set.",
-                "iTunes/cards execution requires available unused codes in their respective categories.",
-                "All admin calls must include x-admin-password header (or ?password=) matching ADMIN_PASSWORD env."
-            ]
-        }
-        logger.info("auto_exec.diagnose -> %s", out)
-        return out
-    finally:
-        put_conn(conn)
-
