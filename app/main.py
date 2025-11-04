@@ -3505,17 +3505,32 @@ def _ensure_orders_payload_jsonb(conn):
         import logging
         logging.exception("payload jsonb migration skipped/failed: %s", e)
 
+
 @app.on_event("startup")
 async def _startup_autoexec():
-    try:
+    # Run JSONB migration safely (idempotent)
     try:
         _ensure_orders_payload_jsonb(get_conn())
     except Exception:
         pass
-        if not _AUTOEXEC_DAEMON_STARTED:
-            asyncio.get_running_loop().create_task(_auto_exec_daemon())
-    except Exception as e:
-        logging.exception("failed to start auto-exec daemon: %s", e)
+    # Start background daemons safely
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        import asyncio as _asyncio
+        loop = _asyncio.get_event_loop()
+    try:
+        loop.create_task(_auto_exec_daemon())
+    except Exception:
+        pass
+    try:
+        loop.create_task(_itunes_autoexec_daemon())
+    except Exception:
+        pass
+    try:
+        loop.create_task(_cards_autoexec_daemon())
+    except Exception:
+        pass
 # ======== /Auto-Exec (Admin) ========
 # =========================
 from fastapi import Header
