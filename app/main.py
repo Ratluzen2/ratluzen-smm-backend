@@ -1350,14 +1350,9 @@ async def create_manual_paid(request: Request):
                         price = steps * 7.0
                         title = f"شراء رصيد كورك {usd}$"
             # ---------------------------------------------------------------------------
-            # === STRICT: PUBG/Ludo pricing must come from DB (same as iTunes). No fallback. ===
+            # === PUBG/Ludo pricing by PRICE (client sends price); validate it exists in DB like iTunes ===
             from decimal import Decimal
             from fastapi import HTTPException
-            pack = None
-            try:
-                pack = str(int(float(usd)))
-            except Exception:
-                raise HTTPException(status_code=400, detail="invalid_usd_pack")
             if product in ("pubg_uc","ludo_diamond","ludo_gold"):
                 try:
                     _ensure_pricing_table(cur)
@@ -1365,25 +1360,19 @@ async def create_manual_paid(request: Request):
                         _ensure_pricing_mode_column(cur)
                     except Exception:
                         pass
+                    price_client = Decimal(str(usd))
                     if product == "pubg_uc":
-                        ui_keys = [f"pkg.pubg.{pack}", f"manual.pubg_uc.{pack}", f"pubg_uc.{pack}"]
+                        prefix = "pkg.pubg.%"
                     elif product == "ludo_diamond":
-                        ui_keys = [f"pkg.ludo.diamond.{pack}", f"manual.ludo_diamond.{pack}", f"ludo.diamond.{pack}"]
+                        prefix = "pkg.ludo.diamond.%"
                     else:
-                        ui_keys = [f"pkg.ludo.gold.{pack}", f"manual.ludo_gold.{pack}", f"ludo.gold.{pack}"]
-                    found_key = None
-                    price_row = None
-                    for _key in ui_keys:
-                        cur.execute("SELECT price_per_k FROM public.service_pricing_overrides WHERE ui_key=%s", (_key,))
-                        r = cur.fetchone()
-                        if r and r[0] is not None:
-                            price_row = r[0]
-                            found_key = _key
-                            break
-                    if price_row is None:
+                        prefix = "pkg.ludo.gold.%"
+                    cur.execute("SELECT ui_key, price_per_k FROM public.service_pricing_overrides WHERE ui_key LIKE %s AND price_per_k = %s LIMIT 1", (prefix, price_client))
+                    row = cur.fetchone()
+                    if not row:
                         raise HTTPException(status_code=400, detail="pricing_override_not_found")
-                    price = Decimal(str(price_row))
-                    logger.info(f"manual_paid pricing: product={product} pack={pack} key={found_key} price={price}")
+                    price = Decimal(str(row[1]))
+                    logger.info(f"manual_paid pricing: product={product} ui_key={row[0]} price={price}")
                     if product == "pubg_uc":
                         title = f"شحن شدات ببجي بسعر {price}$"
                     elif product == "ludo_diamond":
@@ -1393,7 +1382,7 @@ async def create_manual_paid(request: Request):
                 except HTTPException:
                     raise
                 except Exception as e:
-                    logger.exception(f"manual_paid pricing override error: {e}")
+                    logger.exception(f"manual_paid price-match override error: {e}")
                     raise HTTPException(status_code=500, detail="pricing_lookup_failed")
             # ensure user & balance
             cur.execute("SELECT id, balance, is_banned FROM public.users WHERE uid=%s", (uid,))
