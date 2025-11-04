@@ -4378,7 +4378,7 @@ def _cards_auto_process_one(conn):
 _ITUNES_DAEMON_STARTED = False
 _CARDS_DAEMON_STARTED  = False
 
-async def asyncio.get_running_loop().create_task(_itunes_autoexec_daemon()):
+async def _itunes_autoexec_daemon():
     global _ITUNES_DAEMON_STARTED
     if _ITUNES_DAEMON_STARTED: return
     _ITUNES_DAEMON_STARTED = True
@@ -4406,7 +4406,7 @@ async def asyncio.get_running_loop().create_task(_itunes_autoexec_daemon()):
             logging.exception("itunes auto-exec loop error: %s", e)
             await asyncio.sleep(3)
 
-async def asyncio.get_running_loop().create_task(_cards_autoexec_daemon()):
+async def _cards_autoexec_daemon():
     global _CARDS_DAEMON_STARTED
     if _CARDS_DAEMON_STARTED: return
     _CARDS_DAEMON_STARTED = True
