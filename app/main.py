@@ -3758,3 +3758,322 @@ def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple]
         logger.info("pricing.change.notify ui_key=%s tokens=%d sent=%d", ui_key, len(tokens), sent)
     except Exception as e:
         logger.exception("notify pricing change failed: %s", e)
+
+
+
+# =========================
+# Voucher codes (iTunes & Telco) + Auto-Exec wiring
+# =========================
+from typing import List, Literal
+
+def _ensure_voucher_table(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.voucher_codes(
+            id SERIAL PRIMARY KEY,
+            scope TEXT NOT NULL,                 -- 'itunes' or 'telco'
+            telco TEXT NULL,                     -- for telco only: 'asiacell','korek','atheer'
+            denom INTEGER NOT NULL,              -- 5,10,15,...
+            code TEXT NOT NULL,
+            used BOOLEAN NOT NULL DEFAULT FALSE,
+            used_at TIMESTAMPTZ NULL,
+            order_id INTEGER NULL REFERENCES public.orders(id) ON DELETE SET NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_voucher_scope_used ON public.voucher_codes(scope, used)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_voucher_telco ON public.voucher_codes(telco)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_voucher_denom ON public.voucher_codes(denom)")
+
+def _norm_telco(x: Optional[str]) -> str:
+    k = _normalize_ui_key(x)
+    if k in ("asiacell","اسيا","اسياسيل","اسياسل","اسيا سيل","اسيا سيل"):
+        return "asiacell"
+    if k in ("korek","كورك"):
+        return "korek"
+    if k in ("atheer","اثير","zain","زين","زين العراق","زain"):
+        return "atheer"
+    return k
+
+class _AutoExecSetIn(BaseModel):
+    scope: Literal['itunes','telco']
+    enabled: bool
+
+@app.post("/api/admin/auto_exec/set")
+def admin_auto_exec_set(body: _AutoExecSetIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_settings_table(cur)
+            key = "auto_exec_itunes" if body.scope == "itunes" else "auto_exec_telco"
+            _set_flag(cur, key, bool(body.enabled))
+        return {"ok": True, "scope": body.scope, "enabled": bool(body.enabled)}
+    finally:
+        put_conn(conn)
+
+@app.get("/api/admin/auto_exec/status")
+def admin_auto_exec_status(scope: Optional[str] = None, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_settings_table(cur)
+            sc = (scope or "").strip().lower()
+            if sc in ("itunes","telco"):
+                key = "auto_exec_itunes" if sc == "itunes" else "auto_exec_telco"
+                enabled = _get_flag(cur, key, False)
+            else:
+                enabled = _get_flag(cur, "auto_exec_api", False)
+        return {"enabled": bool(enabled)}
+    finally:
+        put_conn(conn)
+
+# ---- Codes CRUD ----
+class CodeAddIn(BaseModel):
+    denom: int = Field(..., ge=1)
+    code: Optional[str] = None
+    codes: Optional[List[str]] = None
+
+def _parse_codes_payload(p: CodeAddIn) -> List[str]:
+    vals: List[str] = []
+    if p.code:
+        vals.append(str(p.code).strip())
+    if p.codes:
+        for c in p.codes:
+            c = str(c or "").strip()
+            if c:
+                vals.append(c)
+    # also support multi-line in 'code'
+    if len(vals) == 1 and "\n" in vals[0]:
+        split = [x.strip() for x in vals[0].splitlines() if x.strip()]
+        vals = split
+    # dedupe
+    seen = set()
+    out: List[str] = []
+    for v in vals:
+        if v not in seen:
+            out.append(v)
+            seen.add(v)
+    return out
+
+@app.post("/api/admin/codes/itunes/add")
+def admin_codes_itunes_add(body: CodeAddIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_voucher_table(cur)
+            codes = _parse_codes_payload(body)
+            for c in codes:
+                cur.execute("""
+                    INSERT INTO public.voucher_codes(scope, telco, denom, code, used)
+                    VALUES('itunes', NULL, %s, %s, FALSE)
+                """, (int(body.denom), c))
+        return {"ok": True, "added": len(codes)}
+    finally:
+        put_conn(conn)
+
+@app.get("/api/admin/codes/itunes/list")
+def admin_codes_itunes_list(available_only: bool = True, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_voucher_table(cur)
+            if available_only:
+                cur.execute("""SELECT id, denom, code FROM public.voucher_codes WHERE scope='itunes' AND used=FALSE ORDER BY denom, id""")
+            else:
+                cur.execute("""SELECT id, denom, code, used, used_at FROM public.voucher_codes WHERE scope='itunes' ORDER BY denom, id""")
+            rows = cur.fetchall()
+        # map results
+        out = []
+        for r in rows:
+            if available_only:
+                out.append({"id": r[0], "denom": int(r[1] or 0), "code": r[2]})
+            else:
+                out.append({"id": r[0], "denom": int(r[1] or 0), "code": r[2], "used": bool(r[3]), "used_at": r[4].isoformat() if r[4] else None})
+        return out
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/codes/cards/{telco}/add")
+def admin_codes_cards_add(telco: str, body: CodeAddIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    tel = _norm_telco(telco)
+    if tel not in ("asiacell","korek","atheer"):
+        raise HTTPException(422, "unsupported telco")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_voucher_table(cur)
+            codes = _parse_codes_payload(body)
+            for c in codes:
+                cur.execute("""
+                    INSERT INTO public.voucher_codes(scope, telco, denom, code, used)
+                    VALUES('telco', %s, %s, %s, FALSE)
+                """, (tel, int(body.denom), c))
+        return {"ok": True, "added": len(codes)}
+    finally:
+        put_conn(conn)
+
+@app.get("/api/admin/codes/cards/{telco}/list")
+def admin_codes_cards_list(telco: str, available_only: bool = True, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    tel = _norm_telco(telco)
+    if tel not in ("asiacell","korek","atheer"):
+        raise HTTPException(422, "unsupported telco")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_voucher_table(cur)
+            if available_only:
+                cur.execute("""SELECT id, denom, code FROM public.voucher_codes WHERE scope='telco' AND telco=%s AND used=FALSE ORDER BY denom, id""", (tel,))
+            else:
+                cur.execute("""SELECT id, denom, code, used, used_at FROM public.voucher_codes WHERE scope='telco' AND telco=%s ORDER BY denom, id""", (tel,))
+            rows = cur.fetchall()
+        out = []
+        for r in rows:
+            if available_only:
+                out.append({"id": r[0], "denom": int(r[1] or 0), "code": r[2]})
+            else:
+                out.append({"id": r[0], "denom": int(r[1] or 0), "code": r[2], "used": bool(r[3]), "used_at": r[4].isoformat() if r[4] else None})
+        return out
+    finally:
+        put_conn(conn)
+
+# ---- Auto execution for vouchers (iTunes / Telco) ----
+
+def _pick_pending_itunes_locked(cur):
+    # lock one pending iTunes manual order (oldest), skip locked
+    cur.execute(r"""
+        SELECT o.id, o.user_id, COALESCE((COALESCE(NULLIF(o.payload,''),'{}')::jsonb->>'usd')::int, 0) AS denom
+        FROM public.orders o
+        WHERE COALESCE(o.status,'Pending')='Pending'
+          AND o.type='manual'
+          AND (
+                LOWER(o.title) LIKE '%itunes%' OR
+                o.title LIKE '%ايتونز%'
+          )
+        ORDER BY o.id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    """)
+    return cur.fetchone()
+
+def _pick_pending_telco_locked(cur):
+    # lock one pending telco manual order (oldest), skip locked
+    cur.execute(r"""
+        SELECT o.id, o.user_id,
+               COALESCE((COALESCE(NULLIF(o.payload,''),'{}')::jsonb->>'usd')::int, 0) AS denom,
+               CASE
+                 WHEN LOWER(o.title) LIKE '%asiacell%' OR o.title LIKE '%اسياسيل%' OR o.title LIKE '%أسيا%' THEN 'asiacell'
+                 WHEN LOWER(o.title) LIKE '%korek%' OR o.title LIKE '%كورك%' THEN 'korek'
+                 ELSE 'atheer'
+               END AS telco
+        FROM public.orders o
+        WHERE COALESCE(o.status,'Pending')='Pending'
+          AND o.type='manual'
+          AND (
+               LOWER(o.title) LIKE '%asiacell%' OR o.title LIKE '%أسيا%' OR o.title LIKE '%اسياسيل%' OR
+               LOWER(o.title) LIKE '%korek%' OR o.title LIKE '%كورك%' OR
+               LOWER(o.title) LIKE '%atheer%' OR o.title LIKE '%اثير%' OR LOWER(o.title) LIKE '%zain%' OR o.title LIKE '%زين%'
+          )
+        ORDER BY o.id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    """)
+    return cur.fetchone()
+
+def _fulfill_with_code(conn, order_id: int, user_id: int, code: str, title: str):
+    # update order -> Done + payload.code
+    with conn, conn.cursor() as cur:
+        # merge payload json
+        cur.execute("SELECT payload FROM public.orders WHERE id=%s", (order_id,))
+        r = cur.fetchone()
+        payload = r[0] if r else {}
+        try:
+            if not isinstance(payload, dict):
+                payload = {}
+        except Exception:
+            payload = {}
+        payload['code'] = code
+        cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(payload), order_id))
+    try:
+        _notify_user(conn, user_id, order_id, "تم التنفيذ", f"الكود: {code}")
+    except Exception:
+        pass
+
+def _auto_exec_itunes_once(conn):
+    with conn, conn.cursor() as cur:
+        _ensure_voucher_table(cur)
+        row = _pick_pending_itunes_locked(cur)
+        if not row:
+            return False
+        oid, uid, denom = int(row[0]), int(row[1]), int(row[2] or 0)
+        cur.execute("""SELECT id, code FROM public.voucher_codes WHERE scope='itunes' AND used=FALSE AND denom=%s ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED""", (denom,))
+        vr = cur.fetchone()
+        if not vr:
+            # nothing available for this denom -> skip gracefully
+            return {"skipped": True, "order_id": oid, "reason": "no_code_for_denom", "denom": denom}
+        vid, vcode = vr[0], vr[1]
+        # mark used + tie to order
+        cur.execute("UPDATE public.voucher_codes SET used=TRUE, used_at=NOW(), order_id=%s WHERE id=%s", (oid, vid))
+        user_id = uid
+    _fulfill_with_code(conn, oid, user_id, vcode, "ايتونز")
+    return {"ok": True, "order_id": oid, "code_id": vid}
+
+def _auto_exec_telco_once(conn):
+    with conn, conn.cursor() as cur:
+        _ensure_voucher_table(cur)
+        row = _pick_pending_telco_locked(cur)
+        if not row:
+            return False
+        oid, uid, denom, telco = int(row[0]), int(row[1]), int(row[2] or 0), str(row[3])
+        cur.execute("""SELECT id, code FROM public.voucher_codes WHERE scope='telco' AND telco=%s AND used=FALSE AND denom=%s ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED""", (telco, denom))
+        vr = cur.fetchone()
+        if not vr:
+            return {"skipped": True, "order_id": oid, "reason": "no_code_for_denom", "denom": denom, "telco": telco}
+        vid, vcode = vr[0], vr[1]
+        cur.execute("UPDATE public.voucher_codes SET used=TRUE, used_at=NOW(), order_id=%s WHERE id=%s", (oid, vid))
+        user_id = uid
+    _fulfill_with_code(conn, oid, user_id, vcode, telco)
+    return {"ok": True, "order_id": oid, "code_id": vid}
+
+AUTOEXEC_VOUCHER_LIMIT = 3
+
+async def _voucher_autoexec_daemon():
+    await asyncio.sleep(2)
+    while True:
+        try:
+            conn = get_conn()
+            try:
+                any_work = False
+                with conn, conn.cursor() as cur:
+                    _ensure_settings_table(cur)
+                    itunes_on = _get_flag(cur, "auto_exec_itunes", False)
+                    telco_on  = _get_flag(cur, "auto_exec_telco", False)
+                if itunes_on:
+                    for _ in range(AUTOEXEC_VOUCHER_LIMIT):
+                        r = _auto_exec_itunes_once(conn)
+                        if not r or (isinstance(r, dict) and r.get("skipped")):
+                            break
+                        any_work = True
+                if telco_on:
+                    for _ in range(AUTOEXEC_VOUCHER_LIMIT):
+                        r = _auto_exec_telco_once(conn)
+                        if not r or (isinstance(r, dict) and r.get("skipped")):
+                            break
+                        any_work = True
+            finally:
+                put_conn(conn)
+            await asyncio.sleep(0.5 if any_work else 3.0)
+        except Exception as e:
+            logging.exception("voucher auto-exec loop error: %s", e)
+            await asyncio.sleep(5)
+
+@app.on_event("startup")
+async def _startup_voucher_autoexec():
+    try:
+        asyncio.create_task(_voucher_autoexec_daemon())
+    except Exception as e:
+        logging.exception("failed to start voucher auto-exec: %s", e)
