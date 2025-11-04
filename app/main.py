@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 
+import re
 from typing import Optional
 from fastapi import Header, HTTPException
 
@@ -4104,11 +4105,24 @@ def _itunes_pick_code_locked(cur, category: str):
     r = cur.fetchone()
     return ({"id": int(r[0]), "code": r[1]} if r else None)
 
+
 def _cards_pick_one_locked(cur):
+    # Pick manual phone-balance voucher orders (NOT direct topup_card)
     cur.execute("""
         SELECT o.id, o.user_id, o.title, COALESCE(o.payload, '{}'::jsonb)
         FROM public.orders o
-        WHERE COALESCE(o.status,'Pending')='Pending' AND o.type='topup_card'
+        JOIN public.users u ON u.id = o.user_id
+        WHERE COALESCE(o.status,'Pending')='Pending'
+          AND (o.type IS NULL OR o.type <> 'topup_card')
+          AND (
+                LOWER(o.title) LIKE '%asiacell%' OR
+                o.title LIKE '%اسياسيل%' OR o.title LIKE '%أسيا%' OR
+                LOWER(o.title) LIKE '%korek%' OR
+                o.title LIKE '%كورك%' OR
+                LOWER(o.title) LIKE '%atheer%' OR LOWER(o.title) LIKE '%atheir%' OR
+                o.title LIKE '%اثير%' OR o.title LIKE '%أثير%' OR
+                LOWER(o.title) LIKE '%zain%' OR o.title LIKE '%زين%'
+          )
         ORDER BY o.id ASC
         FOR UPDATE SKIP LOCKED
         LIMIT 1
@@ -4119,6 +4133,7 @@ def _cards_pick_one_locked(cur):
     tel = _parse_telco_from_title(title)
     category = _parse_category_from_title(title) or "generic"
     return {"order_id": int(r[0]), "user_id": int(r[1]), "payload": r[3], "telco": tel, "category": category}
+
 
 def _cards_pick_code_locked(cur, telco: str, category: str):
     cur.execute("""
@@ -4138,8 +4153,9 @@ def _itunes_auto_process_one(conn):
         rec = _itunes_pick_one_locked(cur)
         if not rec: return None
         code = _itunes_pick_code_locked(cur, rec["category"])
-        if not code:
-            return {"order_id": rec["order_id"], "skipped": True, "reason": "no_code_available", "category": rec["category"]}
+        \1
+    # Log skip for visibility
+    logger.info('itunes_auto: skipped order due to no free code (category=%s)', rec.get('category'))
         payload = rec.get("payload") or {}
         if isinstance(payload, dict):
             payload["code"] = code["code"]
@@ -4162,11 +4178,12 @@ def _cards_auto_process_one(conn):
         _ensure_card_codes_table(cur)
         rec = _cards_pick_one_locked(cur)
         if not rec: return None
-        if not rec["telco"]:
-            return {"order_id": rec["order_id"], "skipped": True, "reason": "unknown_telco"}
+        \1
+    logger.info('cards_auto: skipped order due to unknown telco (title=%s)', rec.get('title', ''))
         code = _cards_pick_code_locked(cur, rec["telco"], rec["category"])
-        if not code:
-            return {"order_id": rec["order_id"], "skipped": True, "reason": "no_code_available", "telco": rec["telco"], "category": rec["category"]}
+        \1
+    # Log skip for visibility
+    logger.info('itunes_auto: skipped order due to no free code (category=%s)', rec.get('category'))
         payload = rec.get("payload") or {}
         if isinstance(payload, dict):
             payload["code"] = code["code"]
