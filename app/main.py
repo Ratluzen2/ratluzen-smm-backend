@@ -1266,7 +1266,7 @@ async def create_manual_paid(request: Request):
         if usd not in allowed_pubg:
             raise HTTPException(422, "invalid usd for pubg")
     elif product in ("ludo_diamond","ludo_gold"):
-        if usd <= 0:
+        if usd not in allowed_ludo:
             raise HTTPException(422, "invalid usd for ludo")
     else:
         raise HTTPException(422, "invalid product")
@@ -1350,72 +1350,6 @@ async def create_manual_paid(request: Request):
                         price = steps * 7.0
                         title = f"شراء رصيد كورك {usd}$"
             # ---------------------------------------------------------------------------
-            # === PUBG/Ludo pricing (Dual-Match like iTunes): try PACK key then PRICE under prefix ===
-            from decimal import Decimal
-            from fastapi import HTTPException
-            if product in ("pubg_uc","ludo_diamond","ludo_gold"):
-                try:
-                    _ensure_pricing_table(cur)
-                    try:
-                        _ensure_pricing_mode_column(cur)
-                    except Exception:
-                        pass
-                    # 1) Try PACK-based match (pkg.*.<pack>)
-                    pack = None
-                    try:
-                        pack = str(int(float(usd)))
-                    except Exception:
-                        pack = None
-                    ui_keys_pack = []
-                    if product == "pubg_uc":
-                        ui_keys_pack = [f"pkg.pubg.{pack}", f"manual.pubg_uc.{pack}", f"pubg_uc.{pack}"] if pack else []
-                        prefix = "pkg.pubg.%"
-                    elif product == "ludo_diamond":
-                        ui_keys_pack = [f"pkg.ludo.diamond.{pack}", f"manual.ludo_diamond.{pack}", f"ludo.diamond.{pack}"] if pack else []
-                        prefix = "pkg.ludo.diamond.%"
-                    else:
-                        ui_keys_pack = [f"pkg.ludo.gold.{pack}", f"manual.ludo_gold.{pack}", f"ludo.gold.{pack}"] if pack else []
-                        prefix = "pkg.ludo.gold.%"
-                    found_key = None
-                    price_row = None
-                    # PACK first
-                    if ui_keys_pack:
-                        for _key in ui_keys_pack:
-                            cur.execute("SELECT price_per_k FROM public.service_pricing_overrides WHERE ui_key=%s", (_key,))
-                            r = cur.fetchone()
-                            if r and r[0] is not None:
-                                price_row = r[0]
-                                found_key = _key
-                                break
-                    # 2) If not found by pack, try PRICE under service prefix (exact match)
-                    if price_row is None:
-                        price_client = None
-                        try:
-                            price_client = Decimal(str(usd))
-                        except Exception:
-                            price_client = None
-                        if price_client is not None:
-                            cur.execute("SELECT ui_key, price_per_k FROM public.service_pricing_overrides WHERE ui_key LIKE %s AND price_per_k = %s LIMIT 1", (prefix, price_client))
-                            r = cur.fetchone()
-                            if r and r[1] is not None:
-                                found_key = r[0]
-                                price_row = r[1]
-                    if price_row is None:
-                        logger.warning(f"manual_paid pricing not found: product={product} raw_usd={usd} pack={pack} prefix={prefix}")
-                        raise HTTPException(status_code=400, detail="pricing_override_not_found")
-                    price = Decimal(str(price_row))
-                    logger.info(f"manual_paid pricing resolved: product={product} raw_usd={usd} pack={pack} key={found_key} price={price}")
-                    if product == "pubg_uc":
-                        title = f"شحن شدات ببجي بسعر {price}$"
-                    elif product == "ludo_diamond":
-                        title = f"شراء الماسات لودو بسعر {price}$"
-                    else:
-                        title = f"شراء ذهب لودو بسعر {price}$"
-                except HTTPException:
-                    raise
-                except Exception as e:
-                    logger.exception(f"manual_paid pricing dual-match error: {e}")
-                    raise HTTPException(status_code=500, detail="pricing_lookup_failed")
             # ensure user & balance
             cur.execute("SELECT id, balance, is_banned FROM public.users WHERE uid=%s", (uid,))
             r = cur.fetchone()
@@ -3173,10 +3107,24 @@ def _auto_exec_one_locked(cur):
     if not r:
         return None
     (oid, user_id, service_id, link, qty, price, title, otype) = r
+
+    # Non-provider/manual kinds are marked done immediately to avoid blocking the queue
     if otype in ('manual', 'topup_card') or service_id is None:
-        # mark as Done immediately for non-provider kinds to avoid blocking
         cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (oid,))
         return {"order_id": oid, "status": "Done", "skipped": True}
+
+    # Claim the order atomically to prevent duplicate processing by other workers
+    cur.execute("""
+        UPDATE public.orders
+        SET status='Processing'
+        WHERE id=%s AND COALESCE(status,'Pending')='Pending'
+        RETURNING id
+    """, (oid,))
+    claimed = cur.fetchone()
+    if not claimed:
+        # another worker took it
+        return None
+
     return {
         "order_id": int(oid),
         "user_id": int(user_id),
