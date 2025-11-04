@@ -4049,7 +4049,7 @@ def _parse_telco_from_title(title: str) -> Optional[str]:
 
 def _itunes_pick_one_locked(cur):
     cur.execute("""
-        SELECT o.id, o.user_id, o.title, COALESCE(o.payload, '{}'::jsonb)
+        SELECT o.id, o.user_id, o.title
         FROM public.orders o
         WHERE COALESCE(o.status,'Pending')='Pending'
           AND (LOWER(o.title) LIKE '%itunes%' OR o.title LIKE '%ايتونز%')
@@ -4077,7 +4077,7 @@ def _itunes_pick_code_locked(cur, category: str):
 
 def _cards_pick_one_locked(cur):
     cur.execute("""
-        SELECT o.id, o.user_id, o.title, COALESCE(o.payload, '{}'::jsonb)
+        SELECT o.id, o.user_id, o.title
         FROM public.orders o
         WHERE COALESCE(o.status,'Pending')='Pending' AND o.type='topup_card'
         ORDER BY o.id ASC
@@ -4112,6 +4112,8 @@ def _itunes_auto_process_one(conn):
         if not code:
             return {"order_id": rec["order_id"], "skipped": True, "reason": "no_code_available", "category": rec["category"]}
         payload = rec.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
         if isinstance(payload, dict):
             payload["code"] = code["code"]
             payload["card"] = code["code"]
@@ -4139,6 +4141,8 @@ def _cards_auto_process_one(conn):
         if not code:
             return {"order_id": rec["order_id"], "skipped": True, "reason": "no_code_available", "telco": rec["telco"], "category": rec["category"]}
         payload = rec.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
         if isinstance(payload, dict):
             payload["code"] = code["code"]
             payload["card"] = code["code"]
