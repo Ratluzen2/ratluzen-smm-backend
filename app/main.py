@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import re
 
 from typing import Optional
 from fastapi import Header, HTTPException
@@ -33,7 +34,6 @@ import os
 import json
 import time
 import logging
-import re
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -3319,76 +3319,43 @@ def _auto_exec_run(conn, limit: int = 3):
     return processed
 
 # ---- endpoints ----
-
 @app.get("/api/admin/auto_exec/status")
-def admin_auto_exec_status(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
-                           password: Optional[str] = None,
-                           scope: Optional[str] = None):
+def admin_auto_exec_status(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(_pick_admin_password(x_admin_password, password) or "")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             _ensure_settings_table(cur)
-            if scope:
-                flag = _scope_flag_name(scope)
-                enabled = _get_flag(cur, flag, False)
-                if scope == "itunes":
-                    try:
-                        _ensure_itunes_codes_table(cur)
-                        cur.execute("SELECT COUNT(*) FROM public.itunes_codes WHERE used=FALSE")
-                        free = int(cur.fetchone()[0])
-                    except Exception:
-                        free = 0
-                    return {"enabled": bool(enabled), "free_codes": free}
-                if scope == "cards":
-                    try:
-                        _ensure_card_codes_table(cur)
-                        cur.execute("SELECT COUNT(*) FROM public.card_codes WHERE used=FALSE")
-                        free = int(cur.fetchone()[0])
-                    except Exception:
-                        free = 0
-                    return {"enabled": bool(enabled), "free_codes": free}
-                return {"enabled": bool(enabled)}
             enabled = _get_flag(cur, "auto_exec_api", False)
         return {"enabled": bool(enabled)}
     finally:
         put_conn(conn)
 
+
 @app.post("/api/admin/auto_exec/toggle")
-def admin_auto_exec_toggle(body: AutoExecToggleIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    """
-    Backward compatible toggle. Accepts optional {"scope":"itunes|cards|api"} in body.
-    """
-    # allow body.dict() if available
-    raw = {}
-    try:
-        raw = body.dict()
-    except Exception:
-        pass
-    scope = (raw.get("scope") or "api").lower()
-    _require_admin(_pick_admin_password(x_admin_password, password, raw) or "")
+async def admin_auto_exec_toggle(
+    body: AutoExecToggleIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None,
+    scope: Optional[str] = None
+):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    # choose correct flag based on optional scope (itunes|cards|api)
+    flag = _scope_flag_name((scope or "").strip().lower())
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             _ensure_settings_table(cur)
-            _set_flag(cur, _scope_flag_name(scope), bool(getattr(body, "enabled", False)))
-        # schedule on running loop
+            _set_flag(cur, flag, bool(body.enabled))
+        # schedule daemons safely on the running loop (no direct awaits)
         try:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = asyncio.get_event_loop()
-            if scope in ("itunes","api"):
-                loop.create_task(_itunes_autoexec_daemon())
-            if scope in ("cards","api"):
-                loop.create_task(_cards_autoexec_daemon())
-            try:
-                loop.create_task(_auto_exec_daemon())
-            except Exception:
-                pass
-        except Exception as e:
-            logging.exception("auto_exec.toggle scheduling error: %s", e)
-        return {"ok": True, "scope": scope, "enabled": bool(getattr(body, "enabled", False))}
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            loop.create_task(_itunes_autoexec_daemon())
+            loop.create_task(_cards_autoexec_daemon())
+        return {"ok": True, "scope": (scope or "api"), "enabled": bool(body.enabled)}
     finally:
         put_conn(conn)
 
@@ -4044,48 +4011,240 @@ def auto_exec_status_scoped(x_admin_password: Optional[str] = Header(None, alias
                     return {"enabled": bool(enabled), "free_codes": free}
                 if scope == "cards":
                     _ensure_card_codes_table(cur)
-                    cur.execute("SELECT COUNT(*) FROM public.card_codes WHERE used=FALSE")
-                    free = int(cur.fetchone()[0])
-                    return {"enabled": bool(enabled), "free_codes": free}
-                return {"enabled": bool(enabled)}
-            else:
-                enabled = _get_flag(cur, "auto_exec_api", False)
-                return {"enabled": bool(enabled)}
-    finally:
-        put_conn(conn)
-
-
+                    cur.execute("SELECT COUNT(*) FROM public.card_codes 
 @app.post("/api/admin/auto_exec/set")
-def admin_auto_exec_set(body: AutoScopeSetIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    """
-    Sets per-scope flag and schedules daemons on the running loop (safe on Python 3.11 / Heroku).
-    Body: {"scope":"api|itunes|cards","enabled":true|false}
-    """
-    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+async def auto_exec_set(
+    body: AutoScopeSetIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(_pick_admin_password(x_admin_password, password, (body.dict() if hasattr(body,'dict') else {})) or "")
+    scope = (body.scope or "").strip().lower()
+    if scope not in ("itunes","cards","api",""):
+        raise HTTPException(422, "invalid scope")
+    flag = _scope_flag_name(scope)
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             _ensure_settings_table(cur)
-            scope = (getattr(body, "scope", None) or "api").lower()
-            enabled = bool(getattr(body, "enabled", False))
-            _set_flag(cur, _scope_flag_name(scope), enabled)
-        # schedule on running loop
+            _set_flag(cur, flag, bool(body.enabled))
+        # schedule daemons safely on the running loop (no direct awaits)
         try:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = asyncio.get_event_loop()
-            if scope in ("itunes","api"):
-                loop.create_task(_itunes_autoexec_daemon())
-            if scope in ("cards","api"):
-                loop.create_task(_cards_autoexec_daemon())
-            # wake generic if exists
-            try:
-                loop.create_task(_auto_exec_daemon())
-            except Exception:
-                pass
-        except Exception as e:
-            logging.exception("auto_exec.set scheduling error: %s", e)
-        return {"ok": True, "scope": scope, "enabled": enabled}
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            loop.create_task(_itunes_autoexec_daemon())
+            loop.create_task(_cards_autoexec_daemon())
+        return {"ok": True, "scope": scope or "api", "enabled": bool(body.enabled)}
     finally:
         put_conn(conn)
+     _set_flag(cur, flag, bool(body.enabled))
+        # Start daemons
+        try:
+            asyncio.create_task(_itunes_autoexec_daemon())
+            asyncio.create_task(_cards_autoexec_daemon())
+        except Exception:
+            pass
+        return {"ok": True, "scope": scope or "api", "enabled": bool(body.enabled)}
+    finally:
+        put_conn(conn)
+
+# ----- Pickers & processors -----
+def _parse_category_from_title(title: str) -> Optional[str]:
+    t = (title or "").lower()
+    # match 5,10,15,20,25,30,40,50,100 with or without $ symbol
+    m = re.search(r"(5|10|15|20|25|30|40|50|100)\s*\$|\$\s*(5|10|15|20|25|30|40|50|100)", t)
+    if m: return m.group(1) or m.group(2)
+    m = re.search(r"\b(5|10|15|20|25|30|40|50|100)\b", t)
+    return m.group(1) if m else None
+
+def _parse_telco_from_title(title: str) -> Optional[str]:
+    t = (title or "").lower()
+    if any(x in t for x in ["اثير","أثير","atheer","atheir","zain"]): return "atheir"
+    if any(x in t for x in ["asiacell","اسيا","اسياسيل","أسيا"]): return "asiacell"
+    if any(x in t for x in ["korek","كورك"]): return "korek"
+    return None
+
+def _itunes_pick_one_locked(cur):
+    cur.execute("""
+        SELECT o.id, o.user_id, o.title, COALESCE(o.payload, '{}'::jsonb)
+        FROM public.orders o
+        WHERE COALESCE(o.status,'Pending')='Pending'
+          AND (LOWER(o.title) LIKE '%itunes%' OR o.title LIKE '%ايتونز%')
+        ORDER BY o.id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    """)
+    r = cur.fetchone()
+    if not r: return None
+    title = r[2] or ""
+    category = _parse_category_from_title(title) or "generic"
+    return {"order_id": int(r[0]), "user_id": int(r[1]), "payload": r[3], "category": category}
+
+def _itunes_pick_code_locked(cur, category: str):
+    cur.execute("""
+        SELECT id, code
+        FROM public.itunes_codes
+        WHERE used=FALSE AND category=%s
+        ORDER BY id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    """, (category,))
+    r = cur.fetchone()
+    return ({"id": int(r[0]), "code": r[1]} if r else None)
+
+def _cards_pick_one_locked(cur):
+    cur.execute("""
+        SELECT o.id, o.user_id, o.title, COALESCE(o.payload, '{}'::jsonb)
+        FROM public.orders o
+        WHERE COALESCE(o.status,'Pending')='Pending' AND o.type='topup_card'
+        ORDER BY o.id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    """)
+    r = cur.fetchone()
+    if not r: return None
+    title = r[2] or ""
+    tel = _parse_telco_from_title(title)
+    category = _parse_category_from_title(title) or "generic"
+    return {"order_id": int(r[0]), "user_id": int(r[1]), "payload": r[3], "telco": tel, "category": category}
+
+def _cards_pick_code_locked(cur, telco: str, category: str):
+    cur.execute("""
+        SELECT id, code
+        FROM public.card_codes
+        WHERE used=FALSE AND telco=%s AND category=%s
+        ORDER BY id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    """, (telco, category))
+    r = cur.fetchone()
+    return ({"id": int(r[0]), "code": r[1]} if r else None)
+
+def _itunes_auto_process_one(conn):
+    with conn, conn.cursor() as cur:
+        _ensure_itunes_codes_table(cur)
+        rec = _itunes_pick_one_locked(cur)
+        if not rec: return None
+        code = _itunes_pick_code_locked(cur, rec["category"])
+        if not code:
+            return {"order_id": rec["order_id"], "skipped": True, "reason": "no_code_available", "category": rec["category"]}
+        payload = rec.get("payload") or {}
+        if isinstance(payload, dict):
+            payload["code"] = code["code"]
+            payload["card"] = code["code"]
+            payload["category"] = rec["category"]
+        if _payload_is_jsonb(conn) and isinstance(payload, dict):
+            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(payload), rec["order_id"]))
+        else:
+            cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (rec["order_id"],))
+        cur.execute("UPDATE public.itunes_codes SET used=TRUE, used_by_order_id=%s, used_at=NOW() WHERE id=%s", (rec["order_id"], code["id"]))
+        out = {"order_id": rec["order_id"], "user_id": rec["user_id"], "code_id": code["id"]}
+    try:
+        _notify_user(conn, out["user_id"], out["order_id"], "تم تنفيذ طلبك ايتونز", f"الفئة {rec['category']} - الكود: {code['code']}")
+    except Exception:
+        pass
+    return out
+
+def _cards_auto_process_one(conn):
+    with conn, conn.cursor() as cur:
+        _ensure_card_codes_table(cur)
+        rec = _cards_pick_one_locked(cur)
+        if not rec: return None
+        if not rec["telco"]:
+            return {"order_id": rec["order_id"], "skipped": True, "reason": "unknown_telco"}
+        code = _cards_pick_code_locked(cur, rec["telco"], rec["category"])
+        if not code:
+            return {"order_id": rec["order_id"], "skipped": True, "reason": "no_code_available", "telco": rec["telco"], "category": rec["category"]}
+        payload = rec.get("payload") or {}
+        if isinstance(payload, dict):
+            payload["code"] = code["code"]
+            payload["card"] = code["code"]
+            payload["telco"] = rec["telco"]
+            payload["category"] = rec["category"]
+        if _payload_is_jsonb(conn) and isinstance(payload, dict):
+            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(payload), rec["order_id"]))
+        else:
+            cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (rec["order_id"],))
+        cur.execute("UPDATE public.card_codes SET used=TRUE, used_by_order_id=%s, used_at=NOW() WHERE id=%s", (rec["order_id"], code["id"]))
+        out = {"order_id": rec["order_id"], "user_id": rec["user_id"], "code_id": code["id"]}
+    try:
+        _notify_user(conn, out["user_id"], out["order_id"], "تم تنفيذ طلبك رصيد الهاتف", f"{rec['telco']} | الفئة {rec['category']} - الكود: {code['code']}")
+    except Exception:
+        pass
+    return out
+
+# ----- Daemons -----
+_ITUNES_DAEMON_STARTED = False
+_CARDS_DAEMON_STARTED  = False
+
+async def _itunes_autoexec_daemon():
+    global _ITUNES_DAEMON_STARTED
+    if _ITUNES_DAEMON_STARTED: return
+    _ITUNES_DAEMON_STARTED = True
+    while True:
+        try:
+            conn = get_conn()
+            try:
+                with conn, conn.cursor() as cur:
+                    _ensure_settings_table(cur)
+                    enabled = _get_flag(cur, "auto_exec_itunes", False)
+            finally:
+                put_conn(conn)
+            if not enabled:
+                await asyncio.sleep(AUTOEXEC_IDLE_SLEEP)
+                continue
+            processed_any = False
+            conn = get_conn()
+            try:
+                out = _itunes_auto_process_one(conn)
+                processed_any = bool(out and not out.get("skipped"))
+            finally:
+                put_conn(conn)
+            await asyncio.sleep(0.5 if processed_any else AUTOEXEC_LOOP_SLEEP)
+        except Exception as e:
+            logging.exception("itunes auto-exec loop error: %s", e)
+            await asyncio.sleep(3)
+
+async def _cards_autoexec_daemon():
+    global _CARDS_DAEMON_STARTED
+    if _CARDS_DAEMON_STARTED: return
+    _CARDS_DAEMON_STARTED = True
+    while True:
+        try:
+            conn = get_conn()
+            try:
+                with conn, conn.cursor() as cur:
+                    _ensure_settings_table(cur)
+                    enabled = _get_flag(cur, "auto_exec_cards", False)
+            finally:
+                put_conn(conn)
+            if not enabled:
+                await asyncio.sleep(AUTOEXEC_IDLE_SLEEP)
+                continue
+            processed_any = False
+            conn = get_conn()
+            try:
+                out = _cards_auto_process_one(conn)
+                processed_any = bool(out and not out.get("skipped"))
+            finally:
+                put_conn(conn)
+            await asyncio.sleep(0.5 if processed_any else AUTOEXEC_LOOP_SLEEP)
+        except Exception as e:
+            logging.exception("cards auto-exec loop error: %s", e)
+            await asyncio.sleep(3)
+
+# Also hook them on startup to keep parity with existing daemon
+try:
+    @app.on_event("startup")
+    async def _startup_scoped_autoexec():
+        try:
+            asyncio.create_task(_itunes_autoexec_daemon())
+            asyncio.create_task(_cards_autoexec_daemon())
+        except Exception as e:
+            logging.exception("failed to start scoped autoexec daemons: %s", e)
+except Exception:
+    pass
+
+# ========= END Patch =========
