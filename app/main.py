@@ -1,15 +1,5 @@
 from __future__ import annotations
 import asyncio
-# === Auto-exec task holders (avoid 'no running event loop' on Heroku) ===
-_itunes_task: 'asyncio.Task|None' = None
-_cards_task: 'asyncio.Task|None' = None
-
-def _task_alive(t):
-    try:
-        return t is not None and not t.done()
-    except Exception:
-        return False
-
 
 from typing import Optional
 from fastapi import Header, HTTPException
@@ -43,6 +33,7 @@ import os
 import json
 import time
 import logging
+import re
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -4020,7 +4011,7 @@ def auto_exec_status_scoped(x_admin_password: Optional[str] = Header(None, alias
         put_conn(conn)
 
 @app.post("/api/admin/auto_exec/set")
-async def auto_exec_set(body: AutoScopeSetIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+def auto_exec_set(body: AutoScopeSetIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(_pick_admin_password(x_admin_password, password, (body.dict() if hasattr(body,'dict') else {})) or "")
     scope = (body.scope or "").strip().lower()
     if scope not in ("itunes","cards","api",""):
@@ -4033,23 +4024,46 @@ async def auto_exec_set(body: AutoScopeSetIn, x_admin_password: Optional[str] = 
             _set_flag(cur, flag, bool(body.enabled))
         # Start daemons
         try:
-            loop = asyncio.get_running_loop()
-            # kick the unified auto-exec daemon (it observes flags and dispatches per-scope)
-            loop.create_task(_auto_exec_daemon())
+            asyncio.create_task(_itunes_autoexec_daemon())
+            asyncio.create_task(_cards_autoexec_daemon())
         except Exception:
-            logger.exception("auto_exec.set: failed to start auto-exec daemon")
+            pass
         return {"ok": True, "scope": scope or "api", "enabled": bool(body.enabled)}
     finally:
         put_conn(conn)
 
 # ----- Pickers & processors -----
+
 def _parse_category_from_title(title: str) -> Optional[str]:
-    t = (title or "").lower()
-    # match 5,10,15,20,25,30,40,50,100 with or without $ symbol
-    m = re.search(r"(5|10|15|20|25|30|40|50|100)\s*\$|\$\s*(5|10|15|20|25|30|40|50|100)", t)
-    if m: return m.group(1) or m.group(2)
-    m = re.search(r"\b(5|10|15|20|25|30|40|50|100)\b", t)
-    return m.group(1) if m else None
+    """
+    Robust parser: normalizes Arabic digits and uses a local import of re to avoid NameError
+    even if top-level imports fail for any reason.
+    Returns one of: "5","10","15","20","25","30","40","50","100" or None.
+    """
+    try:
+        import re as _re
+    except Exception:
+        _re = None
+
+    # Normalize to lowercase and convert Arabic-Indic digits to ASCII
+    digits_map = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+    t = (title or "").lower().translate(digits_map)
+
+    # 1) '$' pattern like "15$" or "$ 25"
+    if _re:
+        m1 = _re.search(r"(5|10|15|20|25|30|40|50|100)\s*\$|\$\s*(5|10|15|20|25|30|40|50|100)", t)
+        if m1:
+            return m1.group(1) or m1.group(2)
+        # 2) bare number token
+        m2 = _re.search(r"\b(5|10|15|20|25|30|40|50|100)\b", t)
+        if m2:
+            return m2.group(1)
+
+    # 3) fallback contains-check (no regex)
+    for tok in ("100","50","40","30","25","20","15","10","5"):
+        if tok in t:
+            return tok
+    return None
 
 def _parse_telco_from_title(title: str) -> Optional[str]:
     t = (title or "").lower()
