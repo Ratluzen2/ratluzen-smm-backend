@@ -4299,3 +4299,112 @@ def _cards_auto_process_one(conn):
     except Exception:
         pass
     return out
+
+# =========================
+# Auto-Exec Daemons (scoped) + startup bootstrap
+# =========================
+import asyncio as _ae_asyncio
+
+def _ae_bg_create_task(coro):
+    try:
+        loop = _ae_asyncio.get_running_loop()
+    except RuntimeError:
+        loop = _ae_asyncio.get_event_loop()
+    try:
+        return loop.create_task(coro)
+    except Exception as _e:
+        try:
+            # Fallback: run a tiny wrapper
+            return loop.create_task(_ae_asyncio.sleep(0))
+        except Exception:
+            logger.exception("autoexec: failed to schedule task: %s", _e)
+            return None
+
+async def _itunes_autoexec_daemon(poll_interval: float = 1.5):
+    """
+    Background worker: if auto_exec_itunes flag is enabled, keep picking one iTunes order and process it.
+    """
+    logger.info("daemon[itunes]: started")
+    while True:
+        try:
+            conn = get_conn()
+            try:
+                with conn, conn.cursor() as cur:
+                    _ensure_settings_table(cur)
+                    enabled = _get_flag(cur, "auto_exec_itunes", False)
+            finally:
+                put_conn(conn)
+            if not enabled:
+                await _ae_asyncio.sleep(3.0)
+                continue
+
+            # try to process one
+            try:
+                conn = get_conn()
+                out = _itunes_auto_process_one(conn)
+            finally:
+                put_conn(conn)
+            if not out or out.get("skipped"):
+                await _ae_asyncio.sleep(poll_interval)
+            else:
+                # processed one; immediately try next (short pause)
+                await _ae_asyncio.sleep(0.2)
+        except Exception as e:
+            logger.exception("daemon[itunes]: loop error: %s", e)
+            await _ae_asyncio.sleep(2.0)
+
+async def _cards_autoexec_daemon(poll_interval: float = 1.5):
+    """
+    Background worker: if auto_exec_cards flag is enabled, keep picking one Phone Card order and process it.
+    """
+    logger.info("daemon[cards]: started")
+    while True:
+        try:
+            conn = get_conn()
+            try:
+                with conn, conn.cursor() as cur:
+                    _ensure_settings_table(cur)
+                    enabled = _get_flag(cur, "auto_exec_cards", False)
+            finally:
+                put_conn(conn)
+            if not enabled:
+                await _ae_asyncio.sleep(3.0)
+                continue
+
+            # try to process one
+            try:
+                conn = get_conn()
+                out = _cards_auto_process_one(conn)
+            finally:
+                put_conn(conn)
+            if not out or out.get("skipped"):
+                await _ae_asyncio.sleep(poll_interval)
+            else:
+                # processed one; immediately try next (short pause)
+                await _ae_asyncio.sleep(0.2)
+        except Exception as e:
+            logger.exception("daemon[cards]: loop error: %s", e)
+            await _ae_asyncio.sleep(2.0)
+
+@app.on_event("startup")
+async def _autoexec_bootstrap():
+    """
+    On startup, if any auto-exec flags are enabled, ensure daemons are running.
+    """
+    try:
+        conn = get_conn()
+        try:
+            with conn, conn.cursor() as cur:
+                _ensure_settings_table(cur)
+                itunes_on = _get_flag(cur, "auto_exec_itunes", False)
+                cards_on  = _get_flag(cur, "auto_exec_cards", False)
+        finally:
+            put_conn(conn)
+
+        if itunes_on:
+            _ae_bg_create_task(_itunes_autoexec_daemon())
+        if cards_on:
+            _ae_bg_create_task(_cards_autoexec_daemon())
+        logger.info("autoexec bootstrap: itunes=%s cards=%s", itunes_on, cards_on)
+    except Exception as e:
+        logger.exception("autoexec bootstrap failed: %s", e)
