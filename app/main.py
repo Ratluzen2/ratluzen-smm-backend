@@ -4216,16 +4216,27 @@ def _itunes_auto_process_one(conn):
                 payload = _json.loads(payload) or {}
             except Exception:
                 payload = {}
-        if isinstance(payload, dict):
-            payload["code"] = code["code"]
-            payload["card"] = code["code"]
+        # ensure payload is a dict to persist fields
+
+        if not isinstance(payload, dict):
+
+            payload = {}
+
+        # set common fields
+
+        payload["code"] = code["code"]
+
+        payload["card"] = code["code"]
+payload["category"] = rec["category"]
             payload["category"] = rec["category"]
             if _payload_is_jsonb(conn):
-                cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(payload), rec["order_id"]))
-            else:
-                cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (rec["order_id"],))
+            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(payload), rec["order_id"]))
         else:
-            cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (rec["order_id"],))
+            from json import dumps as _dumps
+            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (_dumps(payload, ensure_ascii=False), rec["order_id"]))
+        else:
+            from json import dumps as _dumps
+            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (_dumps(payload, ensure_ascii=False), rec["order_id"]))
         cur.execute("UPDATE public.itunes_codes SET used=TRUE, used_by_order_id=%s, used_at=NOW() WHERE id=%s", (rec["order_id"], code["id"]))
         out = {"order_id": rec["order_id"], "user_id": rec["user_id"], "code_id": code["id"]}
     try:
@@ -4255,17 +4266,29 @@ def _cards_auto_process_one(conn):
                 payload = _json.loads(payload) or {}
             except Exception:
                 payload = {}
-        if isinstance(payload, dict):
-            payload["code"] = code["code"]
-            payload["card"] = code["code"]
+        # ensure payload is a dict to persist fields
+
+        if not isinstance(payload, dict):
+
+            payload = {}
+
+        # set common fields
+
+        payload["code"] = code["code"]
+
+        payload["card"] = code["code"]
+payload["category"] = rec["category"]
+payload["telco"] = "telco"
             payload["telco"] = telco
             payload["category"] = rec["category"]
             if _payload_is_jsonb(conn):
-                cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(payload), rec["order_id"]))
-            else:
-                cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (rec["order_id"],))
+            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(payload), rec["order_id"]))
         else:
-            cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (rec["order_id"],))
+            from json import dumps as _dumps
+            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (_dumps(payload, ensure_ascii=False), rec["order_id"]))
+        else:
+            from json import dumps as _dumps
+            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (_dumps(payload, ensure_ascii=False), rec["order_id"]))
         cur.execute("UPDATE public.card_codes SET used=TRUE, used_by_order_id=%s, used_at=NOW() WHERE id=%s", (rec["order_id"], code["id"]))
         out = {"order_id": rec["order_id"], "user_id": rec["user_id"], "code_id": code["id"]}
     try:
