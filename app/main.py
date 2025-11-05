@@ -1892,7 +1892,6 @@ def admin_pending_ludo(x_admin_password: Optional[str] = Header(None, alias="x-a
         return out
     finally:
         put_conn(conn)
-
 @app.get("/api/admin/pending/cards")
 def admin_pending_cards(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
     _require_admin(x_admin_password or password or "")
@@ -1918,6 +1917,7 @@ def admin_pending_cards(x_admin_password: Optional[str] = Header(None, alias="x-
         for (oid, title, qty, price, status, created_at, link, uid, payload_text) in rows:
             telco = ""
             category = ""
+            payload_code = ""
             if payload_text:
                 try:
                     import json as _json
@@ -1925,11 +1925,12 @@ def admin_pending_cards(x_admin_password: Optional[str] = Header(None, alias="x-
                     if isinstance(j, dict):
                         telco = str(j.get("telco","") or "")
                         category = str(j.get("category","") or "")
+                        payload_code = str(j.get("code") or j.get("card") or "")
                 except Exception:
                     pass
             nt = _norm(title or "")
             if not telco:
-                if any(t in nt for t in ["اسياسيل","asiacell","asiacel","asiacelliq","asiacelliraq","اسياسيل","اسياسيل"]):
+                if any(t in nt for t in ["اسياسيل","asiacell","asiacel","asiacelliq","asiacelliraq"]):
                     telco = "asiacell"
                 elif any(t in nt for t in ["كورك","korek"]):
                     telco = "korek"
@@ -1945,6 +1946,10 @@ def admin_pending_cards(x_admin_password: Optional[str] = Header(None, alias="x-
             }
             if category:
                 d["category"] = category
+            # إظهار رقم الكارت داخل قائمة أسيا سيل فقط إذا كان محفوظاً في الـpayload
+            if telco == "asiacell" and payload_code:
+                d["code"] = payload_code
+                d["card"] = payload_code
             out.append(d)
         return out
     finally:
@@ -4203,40 +4208,20 @@ def _itunes_auto_process_one(conn):
     with conn, conn.cursor() as cur:
         _ensure_itunes_codes_table(cur)
         rec = _itunes_pick_one_locked(cur)
-        if not rec:
-            return None
+        if not rec: return None
         code = _itunes_pick_code_locked(cur, rec["category"])
-        if not code:
-            logger.info("itunes_auto: skipped order due to no free code (category=%s)", rec.get("category"))
-            return {"skipped": True, "reason": "no_free_code", "category": rec.get("category")}
+        \1
+    # Log skip for visibility
+    logger.info('itunes_auto: skipped order due to no free code (category=%s)', rec.get('category'))
         payload = rec.get("payload") or {}
-        if isinstance(payload, str):
-            try:
-                import json as _json
-                payload = _json.loads(payload) or {}
-            except Exception:
-                payload = {}
-        # ensure payload is a dict to persist fields
-
-        if not isinstance(payload, dict):
-
-            payload = {}
-
-        # set common fields
-
-        payload["code"] = code["code"]
-
-        payload["card"] = code["code"]
-payload["category"] = rec["category"]
+        if isinstance(payload, dict):
+            payload["code"] = code["code"]
+            payload["card"] = code["code"]
             payload["category"] = rec["category"]
-            if _payload_is_jsonb(conn):
+        if _payload_is_jsonb(conn) and isinstance(payload, dict):
             cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(payload), rec["order_id"]))
         else:
-            from json import dumps as _dumps
-            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (_dumps(payload, ensure_ascii=False), rec["order_id"]))
-        else:
-            from json import dumps as _dumps
-            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (_dumps(payload, ensure_ascii=False), rec["order_id"]))
+            cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (rec["order_id"],))
         cur.execute("UPDATE public.itunes_codes SET used=TRUE, used_by_order_id=%s, used_at=NOW() WHERE id=%s", (rec["order_id"], code["id"]))
         out = {"order_id": rec["order_id"], "user_id": rec["user_id"], "code_id": code["id"]}
     try:
@@ -4249,50 +4234,101 @@ def _cards_auto_process_one(conn):
     with conn, conn.cursor() as cur:
         _ensure_card_codes_table(cur)
         rec = _cards_pick_one_locked(cur)
-        if not rec:
-            return None
-        telco = rec.get("telco")
-        if not telco:
-            logger.info("cards_auto: skipped order due to unknown telco (title=%s)", rec.get("title", ""))
-            return {"skipped": True, "reason": "unknown_telco"}
-        code = _cards_pick_code_locked(cur, telco, rec["category"])
-        if not code:
-            logger.info("cards_auto: skipped order due to no free code (telco=%s, category=%s)", telco, rec.get("category"))
-            return {"skipped": True, "reason": "no_free_code", "telco": telco, "category": rec.get("category")}
+        if not rec: return None
+        \1
+    logger.info('cards_auto: skipped order due to unknown telco (title=%s)', rec.get('title', ''))
+        code = _cards_pick_code_locked(cur, rec["telco"], rec["category"])
+        \1
+    # Log skip for visibility
+    logger.info('itunes_auto: skipped order due to no free code (category=%s)', rec.get('category'))
         payload = rec.get("payload") or {}
-        if isinstance(payload, str):
-            try:
-                import json as _json
-                payload = _json.loads(payload) or {}
-            except Exception:
-                payload = {}
-        # ensure payload is a dict to persist fields
-
-        if not isinstance(payload, dict):
-
-            payload = {}
-
-        # set common fields
-
-        payload["code"] = code["code"]
-
-        payload["card"] = code["code"]
-payload["category"] = rec["category"]
-payload["telco"] = "telco"
-            payload["telco"] = telco
+        if isinstance(payload, dict):
+            payload["code"] = code["code"]
+            payload["card"] = code["code"]
+            payload["telco"] = rec["telco"]
             payload["category"] = rec["category"]
-            if _payload_is_jsonb(conn):
+        if _payload_is_jsonb(conn) and isinstance(payload, dict):
             cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(payload), rec["order_id"]))
         else:
-            from json import dumps as _dumps
-            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (_dumps(payload, ensure_ascii=False), rec["order_id"]))
-        else:
-            from json import dumps as _dumps
-            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (_dumps(payload, ensure_ascii=False), rec["order_id"]))
+            cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (rec["order_id"],))
         cur.execute("UPDATE public.card_codes SET used=TRUE, used_by_order_id=%s, used_at=NOW() WHERE id=%s", (rec["order_id"], code["id"]))
         out = {"order_id": rec["order_id"], "user_id": rec["user_id"], "code_id": code["id"]}
     try:
-        _notify_user(conn, out["user_id"], out["order_id"], f"تم تنفيذ طلبك رصيد {telco}", f"الفئة {rec['category']} - الكود: {code['code']}")
+        _notify_user(conn, out["user_id"], out["order_id"], "تم تنفيذ طلبك رصيد الهاتف", f"{rec['telco']} | الفئة {rec['category']} - الكود: {code['code']}")
     except Exception:
         pass
     return out
+
+# ----- Daemons -----
+_ITUNES_DAEMON_STARTED = False
+_CARDS_DAEMON_STARTED  = False
+
+async def _itunes_autoexec_daemon():
+    global _ITUNES_DAEMON_STARTED
+    if _ITUNES_DAEMON_STARTED: return
+    _ITUNES_DAEMON_STARTED = True
+    while True:
+        try:
+            conn = get_conn()
+            try:
+                with conn, conn.cursor() as cur:
+                    _ensure_settings_table(cur)
+                    enabled = _get_flag(cur, "auto_exec_itunes", False)
+            finally:
+                put_conn(conn)
+            if not enabled:
+                await asyncio.sleep(AUTOEXEC_IDLE_SLEEP)
+                continue
+            processed_any = False
+            conn = get_conn()
+            try:
+                out = _itunes_auto_process_one(conn)
+                processed_any = bool(out and not out.get("skipped"))
+            finally:
+                put_conn(conn)
+            await asyncio.sleep(0.5 if processed_any else AUTOEXEC_LOOP_SLEEP)
+        except Exception as e:
+            logging.exception("itunes auto-exec loop error: %s", e)
+            await asyncio.sleep(3)
+
+async def _cards_autoexec_daemon():
+    global _CARDS_DAEMON_STARTED
+    if _CARDS_DAEMON_STARTED: return
+    _CARDS_DAEMON_STARTED = True
+    while True:
+        try:
+            conn = get_conn()
+            try:
+                with conn, conn.cursor() as cur:
+                    _ensure_settings_table(cur)
+                    enabled = _get_flag(cur, "auto_exec_cards", False)
+            finally:
+                put_conn(conn)
+            if not enabled:
+                await asyncio.sleep(AUTOEXEC_IDLE_SLEEP)
+                continue
+            processed_any = False
+            conn = get_conn()
+            try:
+                out = _cards_auto_process_one(conn)
+                processed_any = bool(out and not out.get("skipped"))
+            finally:
+                put_conn(conn)
+            await asyncio.sleep(0.5 if processed_any else AUTOEXEC_LOOP_SLEEP)
+        except Exception as e:
+            logging.exception("cards auto-exec loop error: %s", e)
+            await asyncio.sleep(3)
+
+# Also hook them on startup to keep parity with existing daemon
+try:
+    @app.on_event("startup")
+    async def _startup_scoped_autoexec():
+        try:
+            asyncio.create_task(_itunes_autoexec_daemon())
+            asyncio.create_task(_cards_autoexec_daemon())
+        except Exception as e:
+            logging.exception("failed to start scoped autoexec daemons: %s", e)
+except Exception:
+    pass
+
+# ========= END Patch =========
