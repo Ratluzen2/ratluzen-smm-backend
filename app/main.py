@@ -1,4 +1,30 @@
+
+
+
+def ensure_auth_schema():
+    """Create user_passwords table if not exists for UID password binding."""
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.user_passwords (
+                        uid TEXT PRIMARY KEY,
+                        password_hash TEXT NOT NULL,
+                        password_cipher BYTEA NOT NULL,
+                        password_iv BYTEA NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    CREATE INDEX IF NOT EXISTS user_passwords_uid_idx ON public.user_passwords(uid);
+                """)
+    finally:
+        put_conn(conn)
+
 from __future__ import annotations
+import bcrypt
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import base64
 import asyncio
 
 import re
@@ -273,7 +299,40 @@ def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Op
 # =========================
 # Schema & Triggers
 # =========================
-def ensure_schema():
+def ensure_schema()
+ensure_auth_schema()
+# === Auth AES key (for reveal_password) ===
+USERPWD_AES_KEY_B64 = os.getenv("USERPWD_AES_KEY")
+_AUTH_AES_KEY = base64.b64decode(USERPWD_AES_KEY_B64) if USERPWD_AES_KEY_B64 else None
+
+# === Auth crypto helpers ===
+def _auth_hash_password(pw: str) -> str:
+    return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+
+def _auth_verify_password(pw: str, pw_hash: str) -> bool:
+    try:
+        return bcrypt.checkpw(pw.encode("utf-8"), pw_hash.encode("utf-8"))
+    except Exception:
+        return False
+
+def _auth_encrypt_password(uid: str, pw: str):
+    if _AUTH_AES_KEY is None:
+        raise HTTPException(status_code=500, detail="SERVER_MISCONFIGURED_AES_KEY")
+    iv = os.urandom(12)
+    aead = AESGCM(_AUTH_AES_KEY)
+    ct = aead.encrypt(iv, pw.encode("utf-8"), uid.encode("utf-8"))
+    return iv, ct
+
+def _auth_decrypt_password(uid: str, iv: bytes, ct: bytes) -> str:
+    if _AUTH_AES_KEY is None:
+        raise HTTPException(status_code=500, detail="SERVER_MISCONFIGURED_AES_KEY")
+    aead = AESGCM(_AUTH_AES_KEY)
+    pt = aead.decrypt(iv, ct, uid.encode("utf-8"))
+    return pt.decode("utf-8")
+
+
+
+:
     conn = get_conn()
     try:
         with conn:
@@ -4411,181 +4470,69 @@ async def _autoexec_bootstrap():
 
 
 
-# =========================
-# Auth (UID + password binding & login)
-# =========================
-import base64, secrets, hashlib, hmac
-from typing import List, Any, Dict
-from pydantic import BaseModel
-
-def _ensure_users_auth_columns(cur):
-    # Add auth-related columns if they don't exist
-    cur.execute("ALTER TABLE public.users ADD COLUMN IF NOT EXISTS password_hash TEXT")
-    cur.execute("ALTER TABLE public.users ADD COLUMN IF NOT EXISTS password_algo TEXT")
-    cur.execute("ALTER TABLE public.users ADD COLUMN IF NOT EXISTS password_updated_at TIMESTAMPTZ")
-    cur.execute("ALTER TABLE public.users ADD COLUMN IF NOT EXISTS auth_enabled BOOLEAN NOT NULL DEFAULT TRUE")
-
-# extend schema on import/startup
-try:
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as _c:
-            _ensure_users_auth_columns(_c)
-    finally:
-        put_conn(conn)
-except Exception as _e:
-    # don't crash import; will retry on first request
-    logging.warning("Auth columns ensure failed at import: %s", _e)
-
-# ---- simple scrypt-based password hashing (no external deps) ----
-def _hash_password(password: str) -> str:
-    if not isinstance(password, str):
-        password = str(password or "")
-    password_bytes = password.encode("utf-8")
-    salt = secrets.token_bytes(16)
-    n, r, p = 16384, 8, 1
-    dk = hashlib.scrypt(password_bytes, salt=salt, n=n, r=r, p=p, dklen=32)
-    return "scrypt$%d$%d$%d$%s$%s" % (
-        n, r, p, base64.b64encode(salt).decode(), base64.b64encode(dk).decode()
-    )
-
-def _verify_password(password: str, stored: str) -> bool:
-    try:
-        scheme, n, r, p, salt_b64, dk_b64 = stored.split("$", 5)
-        if scheme != "scrypt":
-            return False
-        n = int(n); r = int(r); p = int(p)
-        salt = base64.b64decode(salt_b64)
-        expected = base64.b64decode(dk_b64)
-        test = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=len(expected))
-        return hmac.compare_digest(test, expected)
-    except Exception:
-        return False
-
-class BindPasswordIn(BaseModel):
-    uid: str
-    password: str
-    old_password: Optional[str] = None
-
-class LoginIn(BaseModel):
-    uid: str
-    password: str
-
-def _user_profile(cur, uid: str) -> Dict[str, Any]:
-    # basic profile + recent orders + wallet txns
-    cur.execute("SELECT id, uid, balance, is_banned FROM public.users WHERE uid=%s", (uid,))
-    r = cur.fetchone()
-    if not r:
-        raise HTTPException(404, "user not found")
-    user_id, uid, balance, is_banned = int(r[0]), r[1], float(r[2] or 0), bool(r[3])
-    # recent orders
-    cur.execute(
-        """
-        SELECT id, title, quantity, price, status,
-               (EXTRACT(EPOCH FROM created_at)*1000)::BIGINT, link, type
-        FROM public.orders WHERE user_id=%s
-        ORDER BY id DESC
-        LIMIT 20
-        """,
-        (user_id,),
-    )
-    orders = [{
-        "id": int(row[0]), "title": row[1], "quantity": int(row[2] or 0),
-        "price": float(row[3] or 0), "status": row[4],
-        "created_at": int(row[5] or 0), "link": row[6], "type": row[7]
-    } for row in (cur.fetchall() or [])]
-    # wallet recent
-    cur.execute(
-        """
-        SELECT amount, reason,
-               (EXTRACT(EPOCH FROM created_at)*1000)::BIGINT
-        FROM public.wallet_txns
-        WHERE user_id=%s ORDER BY id DESC LIMIT 10
-        """,
-        (user_id,),
-    )
-    wallet = [{
-        "amount": float(r[0] or 0), "reason": r[1], "created_at": int(r[2] or 0)
-    } for r in (cur.fetchall() or [])]
-    return {"uid": uid, "balance": balance, "is_banned": is_banned, "orders_recent": orders, "wallet_recent": wallet}
-
-@app.post("/api/auth/bind")
-def bind_password(body: BindPasswordIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
-    # If password already exists, require old_password unless admin override is provided
-    uid = (body.uid or "").strip()
-    if not uid or not body.password or len(body.password) < 4:
-        raise HTTPException(422, "invalid uid or weak password")
+# === UID password routes ===
+@app.post("/api/users/bind_password")
+def bind_password(req: dict):
+    uid = _normalize_ui_key(req.get("uid"))
+    password = str(req.get("password") or "")
+    if not uid or len(password) < 4:
+        raise HTTPException(status_code=400, detail="INVALID_PAYLOAD")
+    # store hash + encrypted copy
+    pw_hash = _auth_hash_password(password)
+    iv, ct = _auth_encrypt_password(uid, password)
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            _ensure_users_auth_columns(cur)
-            cur.execute("SELECT id, password_hash FROM public.users WHERE uid=%s", (uid,))
+            cur.execute("""
+                INSERT INTO public.user_passwords(uid, password_hash, password_cipher, password_iv)
+                VALUES(%s,%s,%s,%s)
+                ON CONFLICT(uid) DO UPDATE SET
+                    password_hash=EXCLUDED.password_hash,
+                    password_cipher=EXCLUDED.password_cipher,
+                    password_iv=EXCLUDED.password_iv,
+                    updated_at=NOW()
+            """, (uid, pw_hash, psycopg2.Binary(ct), psycopg2.Binary(iv)))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/users/login")
+def login(req: dict):
+    uid = _normalize_ui_key(req.get("uid"))
+    password = str(req.get("password") or "")
+    if not uid or not password:
+        raise HTTPException(status_code=400, detail="INVALID_PAYLOAD")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT password_hash FROM public.user_passwords WHERE uid=%s", (uid,))
             row = cur.fetchone()
             if not row:
-                cur.execute("INSERT INTO public.users(uid) VALUES(%s) RETURNING id", (uid,))
-                user_id = int(cur.fetchone()[0])
-                prev_hash = None
-            else:
-                user_id = int(row[0]); prev_hash = row[1]
-            # Check admin override
-            is_admin = False
-            try:
-                _require_admin(_pick_admin_password(x_admin_password, password) or "")
-                is_admin = True
-            except Exception:
-                is_admin = False
-            if prev_hash and not is_admin:
-                if not body.old_password or not _verify_password(body.old_password, prev_hash):
-                    raise HTTPException(403, "old_password required")
-            new_hash = _hash_password(body.password)
-            cur.execute(
-                """
-                UPDATE public.users
-                SET password_hash=%s, password_algo='scrypt', password_updated_at=NOW(), auth_enabled=TRUE
-                WHERE id=%s
-                """,
-                (new_hash, user_id),
-            )
-            # return a minimal profile
-            prof = _user_profile(cur, uid)
-            return {"ok": True, "profile": prof}
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+            if not _auth_verify_password(password, row[0]):
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+        return {"ok": True, "uid": uid}
     finally:
         put_conn(conn)
 
-@app.post("/api/auth/login")
-def auth_login(body: LoginIn):
-    uid = (body.uid or "").strip()
-    if not uid or not body.password:
-        raise HTTPException(422, "invalid payload")
+@app.post("/api/users/reveal_password")
+def reveal_password(req: dict):
+    uid = _normalize_ui_key(req.get("uid"))
+    password = str(req.get("password") or "")
+    if not uid or not password:
+        raise HTTPException(status_code=400, detail="INVALID_PAYLOAD")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            cur.execute("SELECT password_hash, auth_enabled FROM public.users WHERE uid=%s", (uid,))
-            r = cur.fetchone()
-            if not r:
-                raise HTTPException(404, "user not found")
-            pw_hash, enabled = r[0], bool(r[1] if r[1] is not None else True)
-            if not enabled:
-                raise HTTPException(403, "auth disabled")
-            if not pw_hash or not _verify_password(body.password, pw_hash):
-                raise HTTPException(401, "invalid credentials")
-            prof = _user_profile(cur, uid)
-            return {"ok": True, "profile": prof}
+            cur.execute("SELECT password_hash, password_cipher, password_iv FROM public.user_passwords WHERE uid=%s", (uid,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="NO_PASSWORD_FOR_UID")
+            pw_hash, ct, iv = row[0], bytes(row[1]), bytes(row[2])
+            if not _auth_verify_password(password, pw_hash):
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+            plain = _auth_decrypt_password(uid, iv, ct)
+        return {"ok": True, "password": plain}
     finally:
         put_conn(conn)
 
-@app.get("/api/auth/enabled")
-def auth_enabled(uid: str):
-    uid = (uid or "").strip()
-    if not uid:
-        raise HTTPException(422, "uid required")
-    conn = get_conn()
-    try:
-        with conn, conn.cursor() as cur:
-            cur.execute("SELECT COALESCE(auth_enabled, TRUE) FROM public.users WHERE uid=%s", (uid,))
-            r = cur.fetchone()
-            if not r:
-                return {"uid": uid, "enabled": False}
-            return {"uid": uid, "enabled": bool(r[0])}
-    finally:
-        put_conn(conn)
