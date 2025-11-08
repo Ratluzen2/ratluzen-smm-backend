@@ -300,39 +300,6 @@ def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Op
 # Schema & Triggers
 # =========================
 def ensure_schema():
-ensure_auth_schema()
-# === Auth AES key (for reveal_password) ===
-USERPWD_AES_KEY_B64 = os.getenv("USERPWD_AES_KEY")
-_AUTH_AES_KEY = base64.b64decode(USERPWD_AES_KEY_B64) if USERPWD_AES_KEY_B64 else None
-
-# === Auth crypto helpers ===
-def _auth_hash_password(pw: str) -> str:
-    return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
-
-def _auth_verify_password(pw: str, pw_hash: str) -> bool:
-    try:
-        return bcrypt.checkpw(pw.encode("utf-8"), pw_hash.encode("utf-8"))
-    except Exception:
-        return False
-
-def _auth_encrypt_password(uid: str, pw: str):
-    if _AUTH_AES_KEY is None:
-        raise HTTPException(status_code=500, detail="SERVER_MISCONFIGURED_AES_KEY")
-    iv = os.urandom(12)
-    aead = AESGCM(_AUTH_AES_KEY)
-    ct = aead.encrypt(iv, pw.encode("utf-8"), uid.encode("utf-8"))
-    return iv, ct
-
-def _auth_decrypt_password(uid: str, iv: bytes, ct: bytes) -> str:
-    if _AUTH_AES_KEY is None:
-        raise HTTPException(status_code=500, detail="SERVER_MISCONFIGURED_AES_KEY")
-    aead = AESGCM(_AUTH_AES_KEY)
-    pt = aead.decrypt(iv, ct, uid.encode("utf-8"))
-    return pt.decode("utf-8")
-
-
-
-:
     conn = get_conn()
     try:
         with conn:
@@ -515,6 +482,40 @@ def ensure_announcements():
     finally:
         put_conn(conn)
 ensure_schema()
+ensure_auth_schema()
+
+# === Auth AES key (for reveal_password) ===
+USERPWD_AES_KEY_B64 = os.getenv("USERPWD_AES_KEY")
+_AUTH_AES_KEY = base64.b64decode(USERPWD_AES_KEY_B64) if USERPWD_AES_KEY_B64 else None
+
+# === Auth crypto helpers ===
+def _auth_hash_password(pw: str) -> str:
+    return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+
+def _auth_verify_password(pw: str, pw_hash: str) -> bool:
+    try:
+        return bcrypt.checkpw(pw.encode("utf-8"), pw_hash.encode("utf-8"))
+    except Exception:
+        return False
+
+def _auth_encrypt_password(uid: str, pw: str):
+    if _AUTH_AES_KEY is None:
+        raise HTTPException(status_code=500, detail="SERVER_MISCONFIGURED_AES_KEY")
+    iv = os.urandom(12)
+    aead = AESGCM(_AUTH_AES_KEY)
+    ct = aead.encrypt(iv, pw.encode("utf-8"), uid.encode("utf-8"))
+    return iv, ct
+
+def _auth_decrypt_password(uid: str, iv: bytes, ct: bytes) -> str:
+    if _AUTH_AES_KEY is None:
+        raise HTTPException(status_code=500, detail="SERVER_MISCONFIGURED_AES_KEY")
+    aead = AESGCM(_AUTH_AES_KEY)
+    pt = aead.decrypt(iv, ct, uid.encode("utf-8"))
+    return pt.decode("utf-8")
+
+
+
+
 
 # =========================
 # FastAPI
@@ -4535,4 +4536,3 @@ def reveal_password(req: dict):
         return {"ok": True, "password": plain}
     finally:
         put_conn(conn)
-
