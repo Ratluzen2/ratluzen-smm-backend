@@ -1,6 +1,8 @@
 
 
 
+from __future__ import annotations
+
 def ensure_auth_schema():
     """Create user_passwords table if not exists for UID password binding."""
     conn = get_conn()
@@ -21,7 +23,6 @@ def ensure_auth_schema():
     finally:
         put_conn(conn)
 
-from __future__ import annotations
 import bcrypt
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import base64
