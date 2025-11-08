@@ -299,7 +299,7 @@ def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Op
 # =========================
 # Schema & Triggers
 # =========================
-def ensure_schema()
+def ensure_schema():
 ensure_auth_schema()
 # === Auth AES key (for reveal_password) ===
 USERPWD_AES_KEY_B64 = os.getenv("USERPWD_AES_KEY")
