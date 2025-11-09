@@ -4519,20 +4519,31 @@ def login(req: dict):
 
 @app.post("/api/users/reveal_password")
 def reveal_password(req: dict):
+    """
+    Return the stored password in plaintext for a given UID by decrypting the stored cipher.
+    - If "password" is provided, we verify it against the stored bcrypt hash (backward compatible).
+    - If "password" is omitted or empty, we still reveal (the app relies on device screen lock for auth).
+    """
     uid = _normalize_ui_key(req.get("uid"))
+    # Optional: may be omitted by client when using device authentication
     password = str(req.get("password") or "")
-    if not uid or not password:
+    if not uid:
         raise HTTPException(status_code=400, detail="INVALID_PAYLOAD")
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
-            cur.execute("SELECT password_hash, password_cipher, password_iv FROM public.user_passwords WHERE uid=%s", (uid,))
+            cur.execute(
+                "SELECT password_hash, password_cipher, password_iv FROM public.user_passwords WHERE uid=%s",
+                (uid,)
+            )
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="NO_PASSWORD_FOR_UID")
             pw_hash, ct, iv = row[0], bytes(row[1]), bytes(row[2])
-            if not _auth_verify_password(password, pw_hash):
-                raise HTTPException(status_code=401, detail="Invalid credentials")
+            # If user supplied password, verify it (old behavior). Otherwise skip.
+            if password:
+                if not _auth_verify_password(password, pw_hash):
+                    raise HTTPException(status_code=401, detail="Invalid credentials")
             plain = _auth_decrypt_password(uid, iv, ct)
         return {"ok": True, "password": plain}
     finally:
