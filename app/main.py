@@ -836,25 +836,35 @@ def _push_user(conn, user_id: int, order_id: Optional[int], title: str, body: st
     except Exception as e:
         logger.exception("push_user send failed: %s", e)
 
-
 def _format_amount_for_notification(amount) -> str:
     """
-    Format amount (Decimal/float/int) for display in notifications
-    without scientific notation, e.g. 1.0E+3 -> 1000.
+    Format amount for display in notifications without scientific notation
+    and without very long decimal tails. Keeps up to 3 decimal places:
+    1 -> "1", 1.1 -> "1.1", 1.01 -> "1.01", 1.001 -> "1.001".
     """
     try:
-        # Prefer Decimal for consistent formatting
-        from decimal import Decimal as _Decimal
-        if isinstance(amount, _Decimal):
-            s = format(amount, "f")
+        from decimal import Decimal, ROUND_HALF_UP
+        if isinstance(amount, Decimal):
+            dec = amount
         else:
-            s = format(_Decimal(str(amount)), "f")
+            dec = Decimal(str(amount))
+        # Round to 3 decimal places
+        dec = dec.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+        s = format(dec, "f")
         if "." in s:
             s = s.rstrip("0").rstrip(".")
         return s
     except Exception:
         try:
-            return str(amount)
+            s = str(amount)
+            # Best-effort cleanup for float repr like 1.0100000000000003
+            if "e" in s or "E" in s:
+                try:
+                    f = float(amount)
+                    s = f"{f:.3f}".rstrip("0").rstrip(".")
+                except Exception:
+                    pass
+            return s
         except Exception:
             return "0"
 
@@ -1102,7 +1112,7 @@ async def wallet_paytabs_callback(request: Request):
                 (user_id, usd_amount, "paytabs_topup", Json({"paytabs": data, "iqd_amount": amount})),
             )
 
-        display_amount = _format_amount_for_notification(usd_amount)
+                display_amount = _format_amount_for_notification(usd_amount)
         _push_user(conn, user_id, None, "تمت إضافة رصيد", f"تم شحن رصيدك بمبلغ {display_amount} دولار.")
     finally:
         put_conn(conn)
