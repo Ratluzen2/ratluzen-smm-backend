@@ -1056,6 +1056,9 @@ async def wallet_paytabs_callback(request: Request):
     if amount <= 0:
         return {"ok": False, "reason": "invalid amount", "uid": uid}
 
+    # PayTabs amount is in {"IQD"}; convert back to wallet USD using fixed rate
+    usd_amount = Decimal(amount) / Decimal("1320.0")
+
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -1068,16 +1071,16 @@ async def wallet_paytabs_callback(request: Request):
             else:
                 user_id = row[0]
 
-            cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(amount), user_id))
+            cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (usd_amount, user_id))
             cur.execute(
                 """
                 INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
                 VALUES(%s,%s,%s,%s)
                 """,
-                (user_id, Decimal(amount), "paytabs_topup", Json({"paytabs": data})),
+                (user_id, usd_amount, "paytabs_topup", Json({"paytabs": data, "iqd_amount": amount})),
             )
 
-        _push_user(conn, user_id, None, "تمت إضافة رصيد", f"تم شحن رصيدك بمبلغ {amount}.")
+        _push_user(conn, user_id, None, "تمت إضافة رصيد", f"تم شحن رصيدك بمبلغ {usd_amount} دولار.")
     finally:
         put_conn(conn)
 
@@ -1347,7 +1350,7 @@ def _create_paytabs_payment_page(uid: str, amount: float) -> str:
         "tran_class": "ecom",
         "cart_id": cart_id,
         "cart_currency": PAYTABS_CURRENCY,
-        "cart_amount": round(float(amount), 2),
+        "cart_amount": round(float(amount) * 1320.0, 2),
         "cart_description": f"Wallet top-up for UID {uid}",
         "payment_methods": ["creditcard"],
         "callback": callback_url,
