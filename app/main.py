@@ -71,6 +71,7 @@ from psycopg2.extras import RealDictCursor, Json
 
 from fastapi import FastAPI, HTTPException, Header, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 # =========================
@@ -1011,6 +1012,92 @@ def wallet_paytabs_create(body: PayTabsCreateIn):
 
     url = _create_paytabs_payment_page(body.uid, body.usd)
     return PayTabsCreateOut(payment_url=url)
+
+
+@app.post("/api/wallet/paytabs/callback")
+async def wallet_paytabs_callback(request: Request):
+    """
+    Server-to-server callback from PayTabs.
+
+    We:
+    - read the JSON body
+    - check that the payment is authorised
+    - extract the UID from cart_id (format: WALLET-<uid>-<timestamp>)
+    - credit the user's wallet balance
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    logger.info("PayTabs callback payload: %s", data)
+
+    cart_id = (data.get("cart_id") or "").strip()
+    payment_result = data.get("payment_result") or {}
+    status = (payment_result.get("response_status") or "").upper()
+
+    uid = None
+    if cart_id.startswith("WALLET-"):
+        parts = cart_id.split("-")
+        if len(parts) >= 3:
+            uid = parts[1]
+
+    if not uid:
+        return {"ok": False, "reason": "missing uid in cart_id", "cart_id": cart_id}
+
+    if status != "A":
+        # Not Authorised (A = Authorised). We don't add balance.
+        return {"ok": False, "reason": f"payment not authorised: {status}", "uid": uid}
+
+    try:
+        amount = float(data.get("cart_amount") or 0)
+    except Exception:
+        amount = 0.0
+
+    if amount <= 0:
+        return {"ok": False, "reason": "invalid amount", "uid": uid}
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            # make sure user exists
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            row = cur.fetchone()
+            if not row:
+                cur.execute("INSERT INTO public.users(uid) VALUES(%s) RETURNING id", (uid,))
+                user_id = cur.fetchone()[0]
+            else:
+                user_id = row[0]
+
+            cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(amount), user_id))
+            cur.execute(
+                """
+                INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                VALUES(%s,%s,%s,%s)
+                """,
+                (user_id, Decimal(amount), "paytabs_topup", Json({"paytabs": data})),
+            )
+
+        _push_user(conn, user_id, None, "تمت إضافة رصيد", f"تم شحن رصيدك بمبلغ {amount}.")
+    finally:
+        put_conn(conn)
+
+    return {"ok": True, "uid": uid, "amount": amount}
+
+
+@app.api_route("/payment/result", methods=["GET", "POST"], response_class=HTMLResponse)
+async def wallet_paytabs_return(request: Request):
+    """
+    Simple landing page for PayTabs return URL.
+    The wallet balance is updated in the /api/wallet/paytabs/callback endpoint.
+    This page is only to show a friendly message to the user.
+    """
+    html = """<html><head><meta charset="utf-8"><title>نتيجة الدفع</title></head>
+    <body style="font-family: sans-serif; text-align: center; padding-top: 40px;">
+      <h2>تم استلام نتيجة الدفع</h2>
+      <p>إذا كانت عملية الدفع ناجحة، سيتم تحديث رصيدك داخل التطبيق خلال لحظات.</p>
+      <p>يمكنك الآن إغلاق هذه الصفحة والعودة إلى التطبيق.</p>
+    </body></html>"""
+    return HTMLResponse(content=html)
 
 
 # Create provider order core
