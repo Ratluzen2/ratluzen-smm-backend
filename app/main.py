@@ -88,11 +88,10 @@ OWNER_UID = os.getenv("OWNER_UID", "OWNER-0001").strip()
 PROVIDER_API_URL = os.getenv("PROVIDER_API_URL", "https://kd1s.com/api/v2")
 PROVIDER_API_KEY = os.getenv("PROVIDER_API_KEY", "25a9ceb07be0d8b2ba88e70dcbe92e06")
 
-
 PAYTABS_PROFILE_ID = (os.getenv("PAYTABS_PROFILE_ID") or "").strip()
 PAYTABS_SERVER_KEY = (os.getenv("PAYTABS_SERVER_KEY") or "").strip()
 PAYTABS_BASE_URL = (os.getenv("PAYTABS_BASE_URL") or "").strip().rstrip("/")
-PAYTABS_CURRENCY = (os.getenv("PAYTABS_CURRENCY") or "USD").strip() or "USD"
+PAYTABS_CURRENCY = (os.getenv("PAYTABS_CURRENCY") or "IQD").strip() or "IQD"
 BACKEND_PUBLIC_URL = (os.getenv("BACKEND_PUBLIC_URL") or "").strip().rstrip("/")
 
 POOL_MIN, POOL_MAX = 1, int(os.getenv("DB_POOL_MAX", "5"))
@@ -868,7 +867,6 @@ class WalletCompatIn(BaseModel):
     amount: float
     reason: Optional[str] = None
 
-
 class PayTabsCreateIn(BaseModel):
     uid: str
     usd: float
@@ -997,11 +995,10 @@ def wallet_paytabs_create(body: PayTabsCreateIn):
     """
     Create PayTabs hosted payment page for wallet top-up.
     """
-    # basic sanity
     if not body.uid or body.usd is None or body.usd <= 0:
         raise HTTPException(422, "invalid amount")
 
-    # Optionally ensure user exists
+    # ensure user exists
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
@@ -1246,6 +1243,17 @@ def _create_paytabs_payment_page(uid: str, amount: float) -> str:
     callback_url = backend_domain.rstrip("/") + "/api/wallet/paytabs/callback"
     return_url = backend_domain.rstrip("/") + "/payment/result"
 
+    customer = {
+        "name": f"Wallet user {uid}",
+        "email": f"{uid}@ratluzen-wallet.local",
+        "phone": "0000000000",
+        "street1": "N/A",
+        "city": "Baghdad",
+        "state": "BG",
+        "country": "IQ",
+        "zip": "00000",
+    }
+
     payload = {
         "profile_id": profile_id_int,
         "tran_type": "sale",
@@ -1257,6 +1265,9 @@ def _create_paytabs_payment_page(uid: str, amount: float) -> str:
         "payment_methods": ["creditcard"],
         "callback": callback_url,
         "return": return_url,
+        "hide_shipping": True,
+        "customer_details": customer,
+        "shipping_details": customer,
     }
 
     headers = {
@@ -1270,7 +1281,6 @@ def _create_paytabs_payment_page(uid: str, amount: float) -> str:
         raise HTTPException(502, f"Error connecting to PayTabs: {e}")
 
     if resp.status_code < 200 or resp.status_code >= 300:
-        # Log full error body to Heroku logs for debugging
         logging.getLogger("smm").error(
             "PayTabs API error: url=%s status=%s body=%s",
             url,
