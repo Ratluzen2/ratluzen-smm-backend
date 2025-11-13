@@ -1,5486 +1,4779 @@
-package com.zafer.smm
-import com.google.gson.annotations.SerializedName
-import androidx.compose.ui.draw.alpha
-import androidx.compose.runtime.rememberCoroutineScope
-import android.app.KeyguardManager
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
-import androidx.compose.material3.IconButton
-import android.content.ClipData
-import android.content.ClipboardManager
-import androidx.compose.material3.Card
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.Column
-import androidx.compose.runtime.mutableStateListOf
-import android.content.Context
-import android.os.Bundle
-import android.provider.Settings
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.layout.RowScope
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.TextButton
-import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.ui.window.DialogProperties
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.material3.Badge
-import androidx.compose.material3.BadgedBox
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalUriHandler
-import androidx.compose.ui.viewinterop.AndroidView
-import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.input.TextFieldValue
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.setValue
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.OutputStreamWriter
-import java.net.HttpURLConnection
-import java.net.URLEncoder
-import java.net.URL
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
-import kotlin.math.ceil
-import kotlin.random.Random
-import android.Manifest
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.Notification
-import android.app.PendingIntent
-import android.content.Intent
-import android.content.pm.PackageManager
-import android.os.Build
-import android.webkit.WebView
-import android.webkit.WebViewClient
-import androidx.core.app.ActivityCompat
-import androidx.core.app.NotificationCompat
-import androidx.core.app.NotificationManagerCompat
-import com.google.firebase.messaging.FirebaseMessagingService
-import com.google.firebase.messaging.RemoteMessage
-import com.google.firebase.messaging.FirebaseMessaging
-import com.google.android.gms.tasks.Task
-import androidx.lifecycle.lifecycleScope
-import java.util.concurrent.TimeUnit
-import androidx.work.CoroutineWorker
-import androidx.work.WorkerParameters
-import androidx.work.Constraints
-import androidx.work.NetworkType
-import androidx.work.PeriodicWorkRequestBuilder
-import androidx.work.OneTimeWorkRequestBuilder
-import androidx.work.WorkManager
-import androidx.work.ExistingPeriodicWorkPolicy
-import androidx.work.ListenableWorker
-import com.zafer.smm.ui.UpdatePromptHost
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.ui.draw.clip
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Notifications
-import androidx.compose.material.icons.filled.AccountBalanceWallet
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Divider
-import androidx.compose.material3.OutlinedTextFieldDefaults
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.offset
-import androidx.compose.ui.text.style.TextAlign
-import android.content.SharedPreferences
-import com.google.gson.Gson
-import com.google.gson.reflect.TypeToken
-import androidx.annotation.Keep
 
 
 
-
-private const val OWNER_UID_BACKEND = "OWNER-0001" // يجب أن يطابق OWNER_UID في السيرفر
-
-
-private val Dim = androidx.compose.ui.graphics.Color(0xFFADB5BD)
-/* =========================
-   Notifications (system-level)
-   ========================= */
-object AppNotifier {
-    private const val CHANNEL_ID = "zafer_main_high"
-    private const val CHANNEL_NAME = "App Alerts"
-    private const val CHANNEL_DESC = "User orders, balance updates, and general alerts"
-
-    fun ensureChannel(ctx: android.content.Context) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val ch = NotificationChannel(
-                CHANNEL_ID,
-                CHANNEL_NAME,
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
-                description = CHANNEL_DESC
-                enableVibration(true)
-                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-            }
-            val nm = ctx.getSystemService(android.content.Context.NOTIFICATION_SERVICE) as NotificationManager
-            nm.createNotificationChannel(ch)
-        }
-    }
-
-    fun requestPermissionIfNeeded(activity: androidx.activity.ComponentActivity) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ActivityCompat.checkSelfPermission(activity, "android.permission.POST_NOTIFICATIONS")
-                != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(activity, arrayOf("android.permission.POST_NOTIFICATIONS"), 9911)
-            }
-        }
-    }
-
-    fun notifyNow(ctx: android.content.Context, title: String, body: String) {
-        ensureChannel(ctx)
-        val tapIntent = Intent(ctx, MainActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-        }
-        val pi = PendingIntent.getActivity(
-            ctx, (System.currentTimeMillis()%10000).toInt(), tapIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val builder = NotificationCompat.Builder(ctx, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_notify_chat) // uses system icon to avoid resource issues
-            .setContentTitle(title)
-            .setContentText(body)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
-            .setAutoCancel(true)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setDefaults(NotificationCompat.DEFAULT_ALL)
-            .setContentIntent(pi)
-        NotificationManagerCompat.from(ctx).notify((System.currentTimeMillis()%Int.MAX_VALUE).toInt(), builder.build())
-    }
-}
-
-
-    // --- Pricing cache (prefix+amounts -> map) persisted in SharedPreferences with TTL ---
-    private object PricingCache {
-        private fun verKey(prefix: String, amounts: List<Int>) = "ver:" + key(prefix, amounts)
-        fun getVersion(ctx: Context, prefix: String, amounts: List<Int>): Long = prefs(ctx).getLong(verKey(prefix, amounts), 0L)
-        fun saveVersion(ctx: Context, prefix: String, amounts: List<Int>, ver: Long) {
-            prefs(ctx).edit().putLong(verKey(prefix, amounts), ver).apply()
-        }
-        private const val PREF = "pricing_cache_v1"
-        private const val TTL_HOURS_DEFAULT = 12L
-
-        private fun prefs(ctx: Context): SharedPreferences =
-            ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
-
-        private fun key(prefix: String, amounts: List<Int>) =
-            prefix + ":" + amounts.joinToString(",")
-
-        fun load(ctx: Context, prefix: String, amounts: List<Int>): Map<String, PublicPricingEntry> {
-            val json = prefs(ctx).getString("data:" + key(prefix, amounts), null) ?: return emptyMap()
-            return try {
-                val type = object : TypeToken<Map<String, PublicPricingEntry>>() {}.type
-                Gson().fromJson<Map<String, PublicPricingEntry>>(json, type) ?: emptyMap()
-            } catch (_: Throwable) { emptyMap() }
-        }
-
-        fun save(ctx: Context, prefix: String, amounts: List<Int>, data: Map<String, PublicPricingEntry>) {
-            val k = key(prefix, amounts)
-            prefs(ctx).edit()
-                .putString("data:" + k, Gson().toJson(data))
-                .putLong("ts:" + k, System.currentTimeMillis())
-                .apply()
-        }
-
-        fun isFresh(ctx: Context, prefix: String, amounts: List<Int>, ttlHours: Long = TTL_HOURS_DEFAULT): Boolean {
-            val ts = prefs(ctx).getLong("ts:" + key(prefix, amounts), 0L)
-            if (ts <= 0L) return false
-            val age = System.currentTimeMillis() - ts
-            return age < ttlHours * 60L * 60L * 1000L
-        }
-    }
-    
-    // --- API Services Pricing cache (per category) with server version ---
-    private object ApiPricingCache {
-        private const val PREF = "api_pricing_cache_v1"
-        private fun prefs(ctx: Context): SharedPreferences =
-            ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
-        private fun mapKey(cat: String) = "map:" + cat
-        private fun verKey(cat: String) = "ver:" + cat
-
-        fun load(ctx: Context, cat: String): Map<String, PublicPricingEntry> {
-            if (cat.isEmpty()) return emptyMap()
-            val s = prefs(ctx).getString(mapKey(cat), null) ?: return emptyMap()
-            return try {
-                val obj = org.json.JSONObject(s)
-                val out = mutableMapOf<String, PublicPricingEntry>()
-                val it = obj.keys()
-                while (it.hasNext()) {
-                    val k = it.next()
-                    val v = obj.optJSONObject(k) ?: continue
-                    out[k] = PublicPricingEntry(
-                        pricePerK = v.optDouble("price_per_k", 0.0),
-                        minQty    = v.optInt("min_qty", 0),
-                        maxQty    = v.optInt("max_qty", 0),
-                        mode      = v.optString("mode", "per_k")
-                    )
-                }
-                out
-            } catch (_: Throwable) { emptyMap() }
-        }
-
-        fun save(ctx: Context, cat: String, map: Map<String, PublicPricingEntry>) {
-            if (cat.isEmpty() || map.isEmpty()) return
-            val obj = org.json.JSONObject()
-            for ((k, v) in map) {
-                val o = org.json.JSONObject()
-                    .put("price_per_k", v.pricePerK)
-                    .put("min_qty", v.minQty)
-                    .put("max_qty", v.maxQty)
-                    .put("mode", v.mode)
-                obj.put(k, o)
-            }
-            prefs(ctx).edit().putString(mapKey(cat), obj.toString()).apply()
-            prefs(ctx).edit().putLong("ts:" + mapKey(cat), System.currentTimeMillis()).apply()
-        }
-
-        fun getVersion(ctx: Context, cat: String): Long = prefs(ctx).getLong(verKey(cat), 0L)
-        fun saveVersion(ctx: Context, cat: String, ver: Long) { prefs(ctx).edit().putLong(verKey(cat), ver).apply() }
-    }
-    // -------------------------------------------------------------------------------
-    @Composable
-private fun NoticeBody(text: String) {
-    val clip = LocalClipboardManager.current
-    val codeRegex = "(?:الكود|code|card|voucher|redeem)\\s*[:：-]?\\s*([A-Za-z0-9][A-Za-z0-9-]{5,})".toRegex(RegexOption.IGNORE_CASE)
-    val match = codeRegex.find(text)
-    if (match != null) {
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            SelectionContainer {
-                Text(text, color = Dim, fontSize = 10.sp, modifier = Modifier.weight(1f))
-            }
-            TextButton(onClick = {
-                val c = match.groupValues.getOrNull(1) ?: text
-                clip.setText(AnnotatedString(c))
-            }) { Text("نسخ") }
-        }
-    } else {
-        SelectionContainer {
-            Text(text, color = Dim, fontSize = 10.sp)
-        }
-    }
-}
-
-/* =========================
-   إعدادات الخادم
-   ========================= */
-private const val API_BASE =
-    "https://ratluzen-smm-backend-e12a704bf3c1.herokuapp.com" // عدّلها إذا تغيّر الباكند
-
-/** اتصال مباشر مع مزوّد SMM (اختياري) */
-private const val PROVIDER_DIRECT_URL = "https://kd1s.com/api/v2"
-private const val PROVIDER_DIRECT_KEY_VALUE = "25a9ceb07be0d8b2ba88e70dcbe92e06"
-
-/** مسارات الأدمن (مطابقة للباكند الموحد) */
-private object AdminEndpoints {
-    const val pendingServices = "/api/admin/pending/services"
-    const val pendingItunes   = "/api/admin/pending/itunes"
-    const val pendingPubg     = "/api/admin/pending/pubg"
-    const val pendingLudo     = "/api/admin/pending/ludo"
-    const val pendingBalances = "/api/admin/pending/balances"
-
-    // ✅ الكروت المعلّقة لأسيا سيل
-    const val pendingCards    = "/api/admin/pending/cards"
-    fun topupCardReject(id: Int) = "/api/admin/topup_cards/$id/reject"
-    fun topupCardExecute(id: Int) = "/api/admin/topup_cards/$id/execute"
-
-    const val orderApprove    = "/api/admin/orders/%d/approve"
-    const val orderDeliver    = "/api/admin/orders/%d/deliver"
-    const val orderReject     = "/api/admin/orders/%d/reject"
-
-    // قد تتوفر في باكندك، وإلا ستظهر "تعذر جلب البيانات"
-    const val walletTopup     = "/api/admin/wallet/topup"
-    const val walletDeduct    = "/api/admin/wallet/deduct"
-    const val usersCount      = "/api/admin/users/count"
-    const val usersBalances   = "/api/admin/users/balances"
-    const val providerBalance = "/api/admin/provider/balance"
-
-    // Overrides for service IDs (server-level)
-    const val svcIdsList = "/api/admin/service_ids/list"
-    const val svcIdSet   = "/api/admin/service_ids/set"
-    const val svcIdClear = "/api/admin/service_ids/clear"
-
-    // Pricing overrides
-    const val pricingList = "/api/admin/pricing/list"
-    const val pricingSet  = "/api/admin/pricing/set"
-    const val pricingClear= "/api/admin/pricing/clear"
-    const val orderSetPrice = "/api/admin/pricing/order/set"
-    const val orderClearPrice = "/api/admin/pricing/order/clear"
-    const val orderSetQty = "/api/admin/pricing/order/set_qty"
-    const val announcementCreate = "/api/admin/announcement/create"
-    const val announcementsList = "/api/public/announcements"
-    const val announcementsAdminList = "/api/admin/announcements"
-    fun announcementDelete(id: Int) = "/api/admin/announcement/$id/delete"
-    fun announcementUpdate(id: Int) = "/api/admin/announcement/$id/update"
-    // Auto-exec (admin) endpoints
-    const val autoExecStatus = "/api/admin/auto_exec/status"
-    const val autoExecToggle = "/api/admin/auto_exec/toggle"
-    const val autoExecRun    = "/api/admin/auto_exec/run"
-    // --- Code Pools (iTunes + Phone Cards)
-    const val itunesCodesList = "/api/admin/codes/itunes/list"
-    const val itunesCodesAdd  = "/api/admin/codes/itunes/add"
-    fun itunesCodeDelete(id: Int) = "/api/admin/codes/itunes/$id/delete"
-
-    fun cardCodesList(telco: String) = "/api/admin/codes/cards/$telco/list"   // telco: "atheir" | "asiacell" | "korek"
-    fun cardCodesAdd(telco: String)  = "/api/admin/codes/cards/$telco/add"
-    fun cardCodeDelete(telco: String, id: Int) = "/api/admin/codes/cards/$telco/$id/delete"
-
-    // --- Scoped Auto-Exec
-    fun autoExecStatusScoped(scope: String) = "/api/admin/auto_exec/status?scope=$scope"  // scope: "itunes" | "cards"
-    const val autoExecSet = "/api/admin/auto_exec/set"  // POST {scope, enabled}
-
-    
-}
-
-
-/* =========================
-   Admin Service ID Overrides API
-   ========================= */
-private suspend fun apiAdminListSvcOverrides(token: String): Map<String, Long> {
-    val (code, txt) = httpGet(AdminEndpoints.svcIdsList, headers = mapOf("x-admin-password" to token))
-    if (code !in 200..299 || txt == null) return emptyMap()
-    return try {
-        val result = mutableMapOf<String, Long>()
-        val trimmed = txt.trim()
-        if (trimmed.startsWith("{")) {
-            val o = JSONObject(trimmed)
-            if (o.has("list")) {
-                val arr = o.optJSONArray("list") ?: JSONArray()
-                for (i in 0 until arr.length()) {
-                    val it = arr.optJSONObject(i) ?: continue
-                    val k = it.optString("ui_key", "")
-                    val v = it.optLong("service_id", 0L)
-                    if (k.isNotBlank() && v > 0) result[k] = v
-                }
-            } else {
-                // maybe dict style
-                val it = o.keys()
-                while (it.hasNext()) {
-                    val k = it.next()
-                    val v = o.optLong(k, 0L)
-                    if (k.isNotBlank() && v > 0) result[k] = v
-                }
-            }
-        } else {
-            // not expected
-        }
-        result
-    } catch (_: Exception) { emptyMap() }
-}
-
-private suspend fun apiAdminSetSvcOverride(token: String, uiKey: String, id: Long): Boolean {
-    val body = JSONObject().put("ui_key", uiKey).put("service_id", id)
-    val (code, _) = httpPost(AdminEndpoints.svcIdSet, body, headers = mapOf("x-admin-password" to token))
-    return code in 200..299
-}
-
-private suspend fun apiAdminClearSvcOverride(token: String, uiKey: String): Boolean {
-    val body = JSONObject().put("ui_key", uiKey)
-    val (code, _) = httpPost(AdminEndpoints.svcIdClear, body, headers = mapOf("x-admin-password" to token))
-    return code in 200..299
-}
-
-/* =========================
-*/
-
-   
-
-data class PendingSvcItem(val id: Long, val title: String, val quantity: Int, val price: Double)
-
-private suspend fun apiAdminFetchPendingServices(token: String): List<PendingSvcItem> {
-    val (code, txt) = httpGet(AdminEndpoints.pendingServices, headers = mapOf("x-admin-password" to token))
-    if (code !in 200..299 || txt == null) return emptyList()
-    return try {
-        val out = mutableListOf<PendingSvcItem>()
-        val o = JSONObject(txt)
-        val arr = o.optJSONArray("list") ?: JSONArray()
-        for (i in 0 until arr.length()) {
-            val it = arr.optJSONObject(i) ?: continue
-            val id = it.optLong("id", -1)
-            val title = it.optString("title", "")
-            val qty = it.optInt("quantity", 0)
-            val price = it.optDouble("price", 0.0)
-            if (id > 0) out.add(PendingSvcItem(id, title, qty, price))
-        }
-        out
-    } catch (_: Exception) { emptyList() }
-}
-
-private suspend fun apiAdminSetOrderPrice(token: String, orderId: Long, price: Double): Boolean {
-    val body = JSONObject().put("order_id", orderId).put("price", price)
-    val (code, _) = httpPost(AdminEndpoints.orderSetPrice, body, headers = mapOf("x-admin-password" to token))
-    return code in 200..299
-}
-
-private suspend fun apiAdminSetOrderQty(token: String, orderId: Long, quantity: Int, reprice: Boolean = false): Boolean {
-    val body = JSONObject().put("order_id", orderId).put("quantity", quantity).put("reprice", reprice)
-    val (code, _) = httpPost(AdminEndpoints.orderSetQty, body, headers = mapOf("x-admin-password" to token))
-    return code in 200..299
-}
-private suspend fun apiAdminClearOrderPrice(token: String, orderId: Long): Boolean {
-    val body = JSONObject().put("order_id", orderId)
-    val (code, _) = httpPost(AdminEndpoints.orderClearPrice, body, headers = mapOf("x-admin-password" to token))
-    return code in 200..299
-}
-/* =========================
-   Admin Pricing Overrides API
-   ========================= */
-data class PricingOverride(val pricePerK: Double, val minQty: Int, val maxQty: Int, val mode: String = "per_k")
-
-private suspend fun apiAdminListPricing(token: String): Map<String, PricingOverride> {
-    val (code, txt) = httpGet(AdminEndpoints.pricingList, headers = mapOf("x-admin-password" to token))
-    if (code !in 200..299 || txt == null) return emptyMap()
-    return try {
-        val result = mutableMapOf<String, PricingOverride>()
-        val trimmed = txt.trim()
-        if (trimmed.startsWith("{")) {
-            val o = JSONObject(trimmed)
-            if (o.has("list")) {
-                val arr = o.optJSONArray("list") ?: JSONArray()
-                for (i in 0 until arr.length()) {
-                    val it = arr.optJSONObject(i) ?: continue
-                    val k = it.optString("ui_key", "")
-                    val p = it.optDouble("price_per_k", Double.NaN)
-                        val min = it.optInt("min_qty", 0)
-                        val max = it.optInt("max_qty", 0)
-                        val md = it.optString("mode", "per_k")
-                    if (k.isNotBlank() && !p.isNaN()) {
-                        result[k] = PricingOverride(p, min, max, md)
-                    }
-                }
-            }
-        }
-        result
-    } catch (_: Exception) { emptyMap() }
-}
-
-private suspend fun apiAdminSetPricing(token: String, uiKey: String, pricePerK: Double, minQty: Int, maxQty: Int, mode: String? = null): Boolean {
-    val body = JSONObject().put("ui_key", uiKey).put("price_per_k", pricePerK).put("min_qty", minQty).put("max_qty", maxQty).apply { if (mode != null) put("mode", mode) }
-    val (code, _) = httpPost(AdminEndpoints.pricingSet, body, headers = mapOf("x-admin-password" to token))
-    return code in 200..299
-}
-
-private suspend fun apiAdminClearPricing(token: String, uiKey: String): Boolean {
-    val body = JSONObject().put("ui_key", uiKey)
-    val (code, _) = httpPost(AdminEndpoints.pricingClear, body, headers = mapOf("x-admin-password" to token))
-    return code in 200..299
-}
-/* =========================
-   Public Pricing (read-only for client)
-   ========================= */
-@Keep
-data class PublicPricingEntry(
-    @SerializedName(value = "pricePerK", alternate = ["price_per_k", "flat_price"])
-    val pricePerK: Double = 0.0,
-    @SerializedName(value = "minQty", alternate = ["min_qty"])
-    val minQty: Int = 0,
-    @SerializedName(value = "maxQty", alternate = ["max_qty"])
-    val maxQty: Int = 0,
-    @SerializedName(value = "mode", alternate = ["pricing_mode"])
-    val mode: String = "per_k"
-)
-
-private suspend fun /*DISABLED_LIVE_CALL*/ apiPublicPricingBulk(keys: List<String>): Map<String, PublicPricingEntry> {
-    if (keys.isEmpty()) return emptyMap()
-    val encoded = keys.joinToString(",") { java.net.URLEncoder.encode(it, "UTF-8") }
-    val (code, txt) = httpGet("/api/public/pricing/bulk?keys=$encoded")
-    if (code !in 200..299 || txt == null) return emptyMap()
-    return try {
-        val out = mutableMapOf<String, PublicPricingEntry>()
-        val root = org.json.JSONObject(txt)
-        val map = root.optJSONObject("map") ?: org.json.JSONObject()
-        val iter = map.keys()
-        while (iter.hasNext()) {
-            val k = iter.next()
-            val obj = map.optJSONObject(k) ?: continue
-            out[k] = PublicPricingEntry(
-                pricePerK = obj.optDouble("price_per_k", 0.0),
-                minQty    = obj.optInt("min_qty", 0),
-                maxQty    = obj.optInt("max_qty", 0),
-                mode      = obj.optString("mode", "per_k")
-            )
-        }
-        out
-    } catch (_: Exception) { emptyMap() }
-}
-
-private suspend fun apiPublicPricingVersion(): Long {
-    val (code, txt) = httpGet("/api/public/pricing/version")
-    if (code !in 200..299 || txt == null) return 0L
-    return try { org.json.JSONObject(txt).optLong("version", 0L) } catch (_: Exception) { 0L }
-}
-
-@Composable
-private fun PricingEditorScreen(token: String, onBack: () -> Unit) {
-    val scope = rememberCoroutineScope()
-    var selectedCat by remember { mutableStateOf<String?>(null) }
-    var overrides by remember { mutableStateOf<Map<String, PricingOverride>>(emptyMap()) }
-    var loading by remember { mutableStateOf(true) }
-    var err by remember { mutableStateOf<String?>(null) }
-    var refreshKey by remember { mutableStateOf(0) }
-    var snack by remember { mutableStateOf<String?>(null) }
-
-    val cats = listOf("مشاهدات تيكتوك", "لايكات تيكتوك", "متابعين تيكتوك", "مشاهدات بث تيكتوك", "رفع سكور تيكتوك",
-        "مشاهدات انستغرام", "لايكات انستغرام", "متابعين انستغرام", "مشاهدات بث انستا", "خدمات التليجرام",
-        "ببجي", "لودو"
-    ,
-        "ايتونز", "أثير", "اسياسيل", "كورك"
-    )
-
-    fun servicesFor(cat: String): List<ServiceDef> {
-        fun hasAll(key: String, vararg words: String) = words.all { key.contains(it) }
-        return servicesCatalog.filter { svc ->
-            val k = svc.uiKey
-            when (cat) {
-                "مشاهدات تيكتوك"   -> hasAll(k, "مشاهدات", "تيكتوك")
-                "لايكات تيكتوك"     -> hasAll(k, "لايكات", "تيكتوك")
-                "متابعين تيكتوك"    -> hasAll(k, "متابعين", "تيكتوك")
-                "مشاهدات بث تيكتوك" -> hasAll(k, "مشاهدات", "بث", "تيكتوك")
-                "رفع سكور تيكتوك"   -> hasAll(k, "رفع", "سكور", "تيكتوك") || hasAll(k, "رفع", "سكور", "بث") || hasAll(k, "رفع", "سكور", "بث")
-                "مشاهدات انستغرام"  -> hasAll(k, "مشاهدات", "انستغرام")
-                "لايكات انستغرام"    -> hasAll(k, "لايكات", "انستغرام")
-                "متابعين انستغرام"   -> hasAll(k, "متابعين", "انستغرام")
-                "مشاهدات بث انستا"   -> hasAll(k, "مشاهدات", "بث", "انستا")
-                "خدمات التليجرام"    -> k.contains("تيليجرام") || k.contains("التليجرام") || k.contains("تلي")
-                else -> false
-            }
-        }
-    }
-
-    LaunchedEffect(refreshKey) {
-        loading = true; err = null
-        try { overrides = apiAdminListPricing(token) } catch (t: Throwable) { err = t.message }
-        loading = false
-    }
-
-    val ctx = LocalContext.current
-    val Dim = Color(0xFFADB5BD)
-
-    Column(Modifier.fillMaxSize().background(Bg).padding(12.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = null, tint = OnBg) }
-            Spacer(Modifier.width(6.dp))
-            Text("تغيير الأسعار والكميات", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = OnBg)
-        }
-        
-if (loading) { CircularProgressIndicator(color = Accent); return@Column }
-// removed misplaced dialog invocation
-// removed misplaced dialog invocation
-// removed misplaced dialog invocation
-
-        snack?.let { s -> Snackbar(Modifier.fillMaxWidth()) { Text(s) }; LaunchedEffect(s) { kotlinx.coroutines.delay(2000); snack = null } }
-        err?.let { e -> Text("تعذر جلب البيانات: $e", color = Bad); return@Column }
-
-        if (selectedCat == null) {
-            cats.chunked(2).forEach { row ->
-                Row(Modifier.fillMaxWidth()) {
-                    row.forEach { c ->
-                        Card(
-                            modifier = Modifier.weight(1f).padding(4.dp).clickable { selectedCat = c },
-                            colors = CardDefaults.cardColors(containerColor = Surface1, contentColor = OnBg)
-                        ) { Text(c, Modifier.padding(16.dp), fontWeight = FontWeight.SemiBold) }
-                    }
-                    if (row.size == 1) Spacer(Modifier.weight(1f))
-                }
-            }
-        } else {
-            val list = servicesFor(selectedCat!!)
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = { selectedCat = null }) { Icon(Icons.Filled.ArrowBack, contentDescription = null, tint = OnBg) }
-                Spacer(Modifier.width(6.dp))
-                Text(selectedCat!!, fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = OnBg)
-
-/* PUBG/Ludo Orders Editor */
-if (selectedCat in listOf("ببجي", "لودو", "ايتونز", "أثير", "اسياسيل", "كورك")) {
-    // عرض باقات ببجي/لودو وباقات مبالغ (ايتونز/أثير/اسياسيل/كورك) وتعديل السعر/الكمية
-    data class PkgSpec(val key: String, val title: String, val defQty: Int, val defPrice: Double)
-    val scope = rememberCoroutineScope()
-
-    val pkgs: List<PkgSpec> = when (selectedCat) {
-        "ببجي" -> listOf(
-            PkgSpec("pkg.pubg.60",   "60 شدة",    60,    2.0),
-            PkgSpec("pkg.pubg.325",  "325 شدة",   325,   9.0),
-            PkgSpec("pkg.pubg.660",  "660 شدة",   660,   15.0),
-            PkgSpec("pkg.pubg.1800", "1800 شدة",  1800,  40.0),
-            PkgSpec("pkg.pubg.3850", "3850 شدة",  3850,  55.0),
-            PkgSpec("pkg.pubg.8100", "8100 شدة",  8100,  100.0),
-            PkgSpec("pkg.pubg.16200","16200 شدة", 16200, 185.0)
-        )
-        "لودو" -> listOf(
-            // Diamonds
-            PkgSpec("pkg.ludo.diamonds.810",     "810 الماسة",       810,     5.0),
-            PkgSpec("pkg.ludo.diamonds.2280",    "2280 الماسة",      2280,    10.0),
-            PkgSpec("pkg.ludo.diamonds.5080",    "5080 الماسة",      5080,    15.0),
-            PkgSpec("pkg.ludo.diamonds.12750",    "12750 الماسة",      12750,    35.0),
-            PkgSpec("pkg.ludo.diamonds.27200",   "27200 الماسة",     27200,   85.0),
-            PkgSpec("pkg.ludo.diamonds.54900",   "54900 الماسة",     54900,   165.0),
-            PkgSpec("pkg.ludo.diamonds.164800",  "164800 الماسة",    164800,  475.0),
-            PkgSpec("pkg.ludo.diamonds.275400",  "275400 الماسة",    275400,  800.0),
-            // Gold
-            PkgSpec("pkg.ludo.gold.66680",       "66680 ذهب",        66680,   5.0),
-            PkgSpec("pkg.ludo.gold.219500",      "219500 ذهب",       219500,  10.0),
-            PkgSpec("pkg.ludo.gold.1443000",     "1443000 ذهب",      1443000, 20.0),
-            PkgSpec("pkg.ludo.gold.3627000",     "3627000 ذهب",      3627000, 35.0),
-            PkgSpec("pkg.ludo.gold.9830000",     "9830000 ذهب",      9830000, 85.0),
-            PkgSpec("pkg.ludo.gold.24835000",    "24835000 ذهب",     24835000,165.0),
-            PkgSpec("pkg.ludo.gold.74550000",    "74550000 ذهب",     74550000,475.0),
-            PkgSpec("pkg.ludo.gold.124550000",   "124550000 ذهب",    124550000,800.0)
-        )
-        "ايتونز" -> COMMON_AMOUNTS.map { usd ->
-            PkgSpec("topup.itunes.$usd", "${usd}$ ايتونز", usd, usd.toDouble())
-        }
-        "أثير" -> COMMON_AMOUNTS.map { usd ->
-            PkgSpec("topup.atheer.$usd", "${usd}$ اثير", usd, usd.toDouble())
-        }
-        "اسياسيل" -> COMMON_AMOUNTS.map { usd ->
-            PkgSpec("topup.asiacell.$usd", "${usd}$ اسياسيل", usd, usd.toDouble())
-        }
-        "كورك" -> COMMON_AMOUNTS.map { usd ->
-            PkgSpec("topup.korek.$usd", "${usd}$ كورك", usd, usd.toDouble())
-        }
-        else -> emptyList()
-    }
-
-    LazyColumn(Modifier.fillMaxSize().padding(16.dp)) {
-        items(pkgs) { p ->
-            val ov = overrides[p.key]
-            val curPrice = ov?.pricePerK ?: p.defPrice
-            val curQty   = if (ov != null && ov.minQty > 0) ov.minQty else p.defQty
-
-            var open by remember { mutableStateOf(false) }
-            Card(
-                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                colors = CardDefaults.cardColors(containerColor = Surface1, contentColor = OnBg)
-            ) {
-                Column(Modifier.padding(16.dp)) {
-                    Text(p.title, fontWeight = FontWeight.SemiBold, color = OnBg)
-                    Spacer(Modifier.height(4.dp))
-                    Text("الكمية الحالية: $curQty  •  السعر الحالي: ${"%.2f".format(curPrice)}", color = Dim, fontSize = 10.sp)
-                    Spacer(Modifier.height(8.dp))
-                    Row {
-                        Button(onClick = { open = true }, colors = ButtonDefaults.buttonColors(containerColor = Accent)) {
-                            Text("تعديل", color = Color.White)
-                        }
-                        Spacer(Modifier.width(8.dp))
-                        if (ov != null) {
-                            OutlinedButton(onClick = {
-                                scope.launch {
-                                    val ok = apiAdminClearPricing(token, p.key)
-                                    if (ok) { snack = "تم حذف التعديل"; refreshKey++ } else snack = "فشل الحذف"
-                                }
-                            }) { Text("حذف التعديل") }
-                        }
-                    }
-                }
-            }
-
-            if (open) {
-                var priceInput by remember { mutableStateOf(curPrice.toString()) }
-                var qtyInput by remember { mutableStateOf(curQty.toString()) }
-                AlertDialog(
-                    onDismissRequest = { open = false },
-                    confirmButton = {
-                        TextButton(onClick = {
-                            val newPrice = priceInput.toDoubleOrNull()
-                            val newQty   = qtyInput.toIntOrNull()
-                            if (newPrice != null && newQty != null) {
-                                scope.launch {
-                                    val ok = apiAdminSetPricing(token, p.key, newPrice, newQty, newQty, "package")
-                                    if (ok) { snack = "تم الحفظ"; open = false; refreshKey++ } else snack = "فشل الحفظ"
-                                }
-                            } else snack = "تحقق من القيم."
-                        }) { Text("حفظ") }
-                    },
-                    dismissButton = { TextButton(onClick = { open = false }) { Text("إلغاء") } },
-                    title = { Text("تعديل ${p.title}", color = OnBg) },
-                    text = {
-            Column {
-                // شرح مبسّط للمستخدم
-                Text("اربط كلمة مرور لحسابك الحالي المرتبط بالـ UID. ستستخدم هذه الكلمة لاحقًا لتسجيل الدخول على أي جهاز آخر. احتفظ بها سريًا.", color = OnBg)
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(value = priceInput, onValueChange = { priceInput = it }, label = { Text("السعر") })
-                            Spacer(Modifier.height(8.dp))
-                            OutlinedTextField(value = qtyInput, onValueChange = { qtyInput = it }, label = { Text("الكمية") })
-                        }
-                    }
-                )
-            }
-        }
-    }
-}
-
-            }
-            Spacer(Modifier.height(10.dp))
-
-            LazyColumn {
-                items(list) { svc ->
-                    var showEdit by remember { mutableStateOf(false) }
-                    val key = svc.uiKey
-                    val ov  = overrides[key]
-                    val has = ov != null
-                    Card(
-                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                        colors = CardDefaults.cardColors(containerColor = Surface1, contentColor = OnBg)
-                    ) {
-                        Column(Modifier.padding(16.dp)) {
-                            Text(key, fontWeight = FontWeight.SemiBold, color = OnBg)
-                            Spacer(Modifier.height(4.dp))
-                            val tip = if (has) " (معدل)" else " (افتراضي)"
-                            Text("السعر/ألف: ${ov?.pricePerK ?: svc.pricePerK}  •  الحد الأدنى: ${ov?.minQty ?: svc.min}  •  الحد الأقصى: ${ov?.maxQty ?: svc.max}$tip", color = Dim, fontSize = 10.sp)
-                            Spacer(Modifier.height(8.dp))
-                            Row {
-                                TextButton(onClick = { showEdit = true }) { Text("تعديل") }
-                                Spacer(Modifier.width(6.dp))
-                                if (has) {
-                                    TextButton(onClick = {
-                                        scope.launch {
-                                            val ok = apiAdminClearPricing(token, key)
-                                            if (ok) { snack = "تم حذف التعديل"; refreshKey++ } else snack = "فشل الحذف"
-                                        }
-                                    }) { Text("حذف التعديل") }
-                                }
-                            }
-                        }
-                    }
-
-                    if (showEdit) {
-                        var price by remember { mutableStateOf(TextFieldValue((ov?.pricePerK ?: svc.pricePerK).toString())) }
-                        var min by remember { mutableStateOf(TextFieldValue((ov?.minQty ?: svc.min).toString())) }
-                        var max by remember { mutableStateOf(TextFieldValue((ov?.maxQty ?: svc.max).toString())) }
-                        AlertDialog(
-                            onDismissRequest = { showEdit = false },
-                            confirmButton = {
-                                TextButton(onClick = {
-                                    scope.launch {
-                                        val p = price.text.toDoubleOrNull() ?: 0.0
-                                        val mn = min.text.toIntOrNull() ?: 0
-                                        val mx = max.text.toIntOrNull() ?: mn
-                                        val ok = apiAdminSetPricing(token, key, p, mn, mx, mode = "flat")
-                                        if (ok) { snack = "تم الحفظ"; showEdit = false; refreshKey++ } else snack = "فشل الحفظ"
-                                    }
-                                }) { Text("حفظ") }
-                            },
-                            dismissButton = { TextButton(onClick = { showEdit = false }) { Text("إلغاء") } },
-                            title = { Text("تعديل: $key") },
-                            text = {
-                                Column {
-                                    OutlinedTextField(value = price, onValueChange = { price = it }, label = { Text("السعر المباشر") }, singleLine = true)
-                                    Spacer(Modifier.height(6.dp))
-                                    OutlinedTextField(value = min, onValueChange = { min = it }, label = { Text("الحد الأدنى") }, singleLine = true)
-                                    Spacer(Modifier.height(6.dp))
-                                    OutlinedTextField(value = max, onValueChange = { max = it }, label = { Text("الحد الأقصى") }, singleLine = true)
-                                }
-                            }
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun GlobalPricingCard(
-    title: String,
-    key: String,                 // "cat.pubg" أو "cat.ludo"
-    token: String,
-    overrides: Map<String, PricingOverride>,
-    onSaved: () -> Unit,
-    onSnack: (String) -> Unit
-) {
-    val scope = rememberCoroutineScope()
-    var open by remember { mutableStateOf(false) }
-    val ov = overrides[key]
-
-    Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(4.dp)
-                .clickable { open = true },
-        colors = CardDefaults.cardColors(containerColor = Surface1, contentColor = OnBg)
-    ) {
-        Text(title, Modifier.padding(16.dp), fontWeight = FontWeight.SemiBold)
-    }
-
-    if (open) {
-        var price by remember { mutableStateOf(TextFieldValue((ov?.pricePerK ?: 0.0).toString())) }
-        AlertDialog(
-            onDismissRequest = { open = false },
-            confirmButton = {
-                TextButton(onClick = {
-                    scope.launch {
-                        val p = price.text.toDoubleOrNull() ?: 0.0
-                        val ok = apiAdminSetPricing(token, key, p, 0, 0, mode = "flat")
-                        if (ok) { onSnack("تم الحفظ"); open = false; onSaved() } else onSnack("فشل الحفظ")
-                    }
-                }) { Text("حفظ") }
-            },
-            dismissButton = {
-                Row {
-                    TextButton(onClick = { open = false }) { Text("إلغاء") }
-                    if (ov != null) {
-                        TextButton(onClick = {
-                            scope.launch {
-                                val ok = apiAdminClearPricing(token, key)
-                                if (ok) { onSnack("تم حذف التعديل"); open = false; onSaved() } else onSnack("فشل الحذف")
-                            }
-                        }) { Text("حذف التعديل") }
-                    }
-                }
-            },
-            title = { Text(title) },
-            text = {
-                Column {
-                    OutlinedTextField(
-                        value = price,
-                        onValueChange = { v -> price = v },
-                        label = { Text("السعر المباشر") },
-                        singleLine = true
-                    )
-                }
-            }
-        )
-    }
-}
-/* =========================
-   Theme
-   ========================= */
-private val Bg       = Color(0xFF0F1113)
-private val Surface1 = Color(0xFF161B20)
-private val OnBg     = Color(0xFFF2F4F7)
-private val Accent   = Color(0xFFB388FF)
-private val Good     = Color(0xFF4CAF50)
-private val Bad      = Color(0xFFE53935)
-
-@Composable
-fun AppTheme(content: @Composable () -> Unit) {
-    MaterialTheme(
-        colorScheme = darkColorScheme(
-            background = Bg,
-            surface = Surface1,
-            primary = Accent,
-            onBackground = OnBg,
-            onSurface = OnBg
-        ),
-        content = content
-    )
-}
-
-/* =========================
-   نماذج/حالات
-   ========================= */
-enum class Tab { HOME, SERVICES, WALLET, ORDERS, SUPPORT }
-
-data class AppNotice(
-    val title: String,
-    val body: String,
-    val ts: Long = System.currentTimeMillis(),
-    val orderId: String? = null,
-    val serviceName: String? = null,
-    val amount: String? = null,
-    val code: String? = null,
-    val status: String? = null,
-    val forOwner: Boolean = false
-)
-data class ServiceDef(
-    val uiKey: String,
-    val serviceId: Long,
-    val min: Int,
-    val max: Int,
-    val pricePerK: Double,
-    val category: String
-)
-enum class OrderStatus { Pending, Processing, Done, Rejected, Refunded }
-data class OrderItem(
-    val id: String,
-    val title: String,
-    val quantity: Int,
-    val price: Double,
-    val payload: String,
-    val status: OrderStatus,
-    val createdAt: Long,
-    val uid: String = ""            // ✅ إن توفّر من الباكند
-    , val accountId: String = ""
-)
-/* ✅ نموذج خاص بكروت أسيا سيل (لواجهة المالك) */
-data class PendingCard(
-    val id: Int,
-    val uid: String,
-    val card: String,
-    val createdAt: Long
-)
-
-private val servicesCatalog = listOf(
-    ServiceDef("متابعين تيكتوك",   16256,   100, 1_000_000, 3.5, "المتابعين"),
-    ServiceDef("متابعين انستغرام", 16267,   100, 1_000_000, 3.0, "المتابعين"),
-    ServiceDef("لايكات تيكتوك",    12320,   100, 1_000_000, 1.0, "الايكات"),
-    ServiceDef("لايكات انستغرام",  1066500, 100, 1_000_000, 1.0, "الايكات"),
-    ServiceDef("مشاهدات تيكتوك",    9448,     100, 1_000_000, 0.1, "المشاهدات"),
-    ServiceDef("مشاهدات انستغرام",  64686464, 100, 1_000_000, 0.1, "المشاهدات"),
-    ServiceDef("مشاهدات بث تيكتوك", 14442, 100, 1_000_000, 2.0, "مشاهدات البث المباشر"),
-    ServiceDef("مشاهدات بث انستا",   646464,100, 1_000_000, 2.0, "مشاهدات البث المباشر"),
-    ServiceDef("رفع سكور البث",     14662, 100, 1_000_000, 2.0, "رفع سكور تيكتوك"),
-    ServiceDef("اعضاء قنوات تلي",   955656, 100, 1_000_000, 3.0, "خدمات التليجرام"),
-    ServiceDef("اعضاء كروبات تلي",  644656, 100, 1_000_000, 3.0, "خدمات التليجرام"),
-)
-private val serviceCategories = listOf(
-    "قسم المتابعين",
-    "قسم الايكات",
-    "قسم المشاهدات",
-    "قسم مشاهدات البث المباشر",
-    "قسم رفع سكور تيكتوك",
-    "قسم خدمات التليجرام",
-    "قسم شراء رصيد ايتونز",
-    "قسم شراء رصيد هاتف",
-    "قسم شحن شدات ببجي",
-    "قسم خدمات الودو"
-)
-
-/* =========================
-   Activity
-   ========================= */
-class MainActivity : ComponentActivity() {
-    override fun onCreate(savedInstanceState: Bundle?) {
-
-super.onCreate(savedInstanceState)
-        
-        AppNotifier.ensureChannel(this)
-        AppNotifier.requestPermissionIfNeeded(this)
-        OrderDoneCheckWorker.schedule(this)
-        // === FCM token — خطوة 1 (تشغيلياً من داخل الملف الرئيسي) ===
-        // يحصّل توكن FCM ويطبعه في اللوغ ويرسله لسيرفرك لربطه مع UID المستخدم
-        try {
-    FirebaseMessaging.getInstance().token.addOnCompleteListener { task: com.google.android.gms.tasks.Task<String> ->
-        if (task.isSuccessful) {
-            val token = task.result
-            android.util.Log.i("FCM", "Device FCM token: $token")
-            val uid = loadOrCreateUid(this@MainActivity)
-            lifecycleScope.launch {
-                try {
-                    val ok = apiUpdateFcmToken(uid, token)
-                    android.util.Log.i("FCM", "token sent to backend: $ok")
-                    if (loadOwnerMode(this@MainActivity)) {
-                        try {
-                            val okOwner = apiUpdateFcmToken(OWNER_UID_BACKEND, token)
-                            android.util.Log.i("FCM", "owner token sent: $okOwner")
-                        } catch (e: Exception) {
-                            android.util.Log.w("FCM", "owner token failed: " + (e.message ?: ""))
-                        }
-                    }
-                } catch (e: Exception) {
-                    android.util.Log.w("FCM", "send token failed: " + (e.message ?: ""))
-                }
-            }
-        } else {
-            android.util.Log.w("FCM", "Failed to get FCM token", task.exception)
-        }
-    }
-} catch (e: Exception) {
-    android.util.Log.e("FCM", "Exception while getting token", e)
-}
-
-        com.zafer.smm.crash.CrashKitV2.init(application)
-setContent { AppTheme { UpdatePromptHost(); AppRoot() } }
-        prefetchPricingOnLaunch(this)
-    }
-}
-
-/* =========================
-   Root
-   ========================= */
-
-@Composable
-fun AppRoot() {
-    val ctx = LocalContext.current
-    val scope = rememberCoroutineScope()
-    // Prefetch moved to onCreate (non-Compose)
-
-    var uid by remember { mutableStateOf(loadOrCreateUid(ctx)) }
-    var ownerMode by remember { mutableStateOf(loadOwnerMode(ctx)) }
-    var ownerToken by remember { mutableStateOf(loadOwnerToken(ctx)) }
-
-    var online by remember { mutableStateOf<Boolean?>(null) }
-    var toast by remember { mutableStateOf<String?>(null) }
-    var showSettings by remember { mutableStateOf(false) }
-
-    var notices by remember { mutableStateOf(loadNotices(ctx)) }
-    var noticeTick by remember { mutableStateOf(0) }
-    var showNoticeCenter by remember { mutableStateOf(false) }
-
-    var lastSeenUser by remember { mutableStateOf(loadLastSeen(ctx, false)) }
-    var lastSeenOwner by remember { mutableStateOf(loadLastSeen(ctx, true)) }
-
-    val unreadUser = notices.count { !it.forOwner && it.ts > lastSeenUser }
-    val unreadOwner = notices.count { it.forOwner && it.ts > lastSeenOwner }
-    var topBalance by remember { mutableStateOf<Double?>(null) }
-    LaunchedEffect(Unit) { try { topBalance = apiGetBalance(uid) } catch (_: Exception) { } }
-var currentTab by remember { mutableStateOf(Tab.HOME) }
-
-    LaunchedEffect(noticeTick) { try { topBalance = apiGetBalance(uid) } catch (_: Exception) { } }
-
-    // فحص الصحة + تسجيل UID
-    LaunchedEffect(Unit) {
-        scope.launch { tryUpsertUid(uid) }
-        while (true) {
-            online = pingHealth()
-            delay(15_000)
-        }
-    }
-// تحديث فوري عند الدخول ولدى تغيّر التبويب
-    LaunchedEffect(Unit) {
-        try { topBalance = apiGetBalance(uid) } catch (_: Exception) { }
-    }
-    LaunchedEffect(currentTab) {
-        try { topBalance = apiGetBalance(uid) } catch (_: Exception) { }
-    }
-
-
-// ✅ جلب الإشعارات من الخادم ودمجها، وتحديث العداد تلقائيًا
-// ✅ جلب إشعارات المالك من الخادم عندما يكون وضع المالك مُفعّلاً
-LaunchedEffect(loadOwnerMode(ctx)) {
-    while (loadOwnerMode(ctx)) {
-        try {
-            val remoteOwner = apiFetchNotificationsByUid(OWNER_UID_BACKEND) ?: emptyList()
-            val ownerMarked = remoteOwner.map { it.copy(forOwner = true) }
-            val before = notices.size
-            val mergedOwner = mergeNotices(notices.filter { it.forOwner }, ownerMarked)
-            val mergedAll = notices.filter { !it.forOwner } + mergedOwner
-            if (mergedAll.size != before) {
-                notices = mergedAll
-                saveNotices(ctx, notices)
-                noticeTick++
-            }
-        } catch (_: Exception) {
-            // ignore, retry
-        }
-        kotlinx.coroutines.delay(10_000)
-    }
-}
-
-// ✅ جلب إشعارات المستخدم من الخادم ودمجها في الجرس (تمامًا مثل المالك)
-LaunchedEffect(uid) {
-    while (true) {
-        try {
-            val remoteUser = apiFetchNotificationsByUid(uid) ?: emptyList()
-            val userOnly = remoteUser.map { it.copy(forOwner = false) }
-            val before = notices.size
-            val mergedUser = mergeNotices(notices.filter { !it.forOwner }, userOnly)
-            val mergedAll = mergedUser + notices.filter { it.forOwner }
-            if (mergedAll.size != before) {
-                notices = mergedAll
-                saveNotices(ctx, notices)
-                noticeTick++
-            }
-        } catch (_: Exception) {
-            // ignore, retry
-        }
-        kotlinx.coroutines.delay(10_000)
-    }
-}
-
-
-
-
-
-
-    // ✅ مراقبة تغيّر حالة الطلبات إلى Done أثناء فتح التطبيق (تنبيه فوري داخل النظام)
-    LaunchedEffect(uid) {
-        // نحفظ أول مسح حتى لا نرسل إشعارات قديمة
-        var initialized = false
-        var lastMap = loadOrderStatusMap(ctx)
-        while (true) {
-            try {
-                val current = (apiGetMyOrders(uid) ?: emptyList())
-                val newMap = lastMap.toMutableMap()
-                if (initialized) {
-                    current.forEach { o ->
-                        val prev = lastMap[o.id]
-                        val cur = o.status.name
-                        if (cur == "Done" && prev != "Done") {
-                            // أرسل إشعار نظام + خزّنه في مركز الإشعارات
-                            AppNotifier.notifyNow(ctx, "تم اكتمال الطلب", "تم تنفيذ ${o.title} بنجاح.")
-                            val nn = AppNotice("اكتمال الطلب", "تم تنفيذ ${o.title} بنجاح.", forOwner = false)
-                            notices = notices + nn
-                            saveNotices(ctx, notices)
-                        }
-                        newMap[o.id] = cur
-                    }
-                    saveOrderStatusMap(ctx, newMap)
-                } else {
-                    // أول مرة: فقط نبني الخريطة بدون تنبيهات
-                    current.forEach { o -> newMap[o.id] = o.status.name }
-                    saveOrderStatusMap(ctx, newMap)
-                    initialized = true
-                }
-                lastMap = newMap
-            } catch (_: Exception) { /* ignore */ }
-            delay(10_000)
-        }
-    }
-    // Auto hide toast بعد 2 ثواني
-    LaunchedEffect(toast) {
-        if (toast != null) {
-            delay(2000)
-            toast = null
-        }
-    }
-Column(
-    modifier = Modifier
-        .fillMaxSize()
-        .background(Bg)
-) {
-    FixedTopBar(
-        online = online,
-        unread = if (ownerMode) unreadOwner else unreadUser,
-        balance = topBalance,
-        onOpenNotices = { showNoticeCenter = true },
-        onOpenSettings = { showSettings = true },
-        onOpenWallet = { currentTab = Tab.WALLET }
-    )
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-    ) {
-
-        when (currentTab) {
-            Tab.HOME -> {
-                if (ownerMode) {
-                    OwnerPanel(
-                        token = ownerToken,
-                        onNeedLogin = { showSettings = true },
-                        onToast = { toast = it }
-                    )
-                } else {
-                    HomeScreen()
-                }
-            }
-            Tab.SERVICES -> ServicesScreen(
-                uid = uid,
-                onAddNotice = {
-                    notices = notices + it
-                    saveNotices(ctx, notices)
-                },
-                onToast = { toast = it }
-            )
-            Tab.WALLET -> WalletScreen(
-                uid = uid,
-                noticeTick = noticeTick,
-                onAddNotice = {
-                    notices = notices + it
-                    saveNotices(ctx, notices)
-                },
-                onToast = { toast = it }
-            )
-            Tab.ORDERS -> OrdersScreen(uid = uid)
-            Tab.SUPPORT -> SupportScreen()
-        }
-
-        BottomNavBar(
-            current = currentTab,
-            onChange = { currentTab = it },
-            modifier = Modifier.align(Alignment.BottomCenter)
-        )
-
-        toast?.let { msg ->
-            Box(Modifier.fillMaxSize()) {
-                Surface(
-                    color = Surface1, tonalElevation = 6.dp,
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(bottom = 90.dp)
-                ) {
-                    Text(msg, Modifier.padding(horizontal = 16.dp, vertical = 10.dp), color = OnBg)
-                }
-            }
-        }
-    
-    }
-}
-
-
-// removed duplicate scope
-    if (showSettings) {
-        SettingsDialog(
-            uid = uid,
-            ownerMode = ownerMode,
-            onUserLogin = { newUid ->
-                saveUid(ctx, newUid)
-                uid = newUid
-                ownerMode = false
-                scope.launch { try { topBalance = apiGetBalance(newUid) } catch (_: Exception) {} }
-                            },
-            onOwnerLogin = { token ->
-                ownerToken = token
-                ownerMode = true
-                saveOwnerMode(ctx, true)
-                saveOwnerToken(ctx, token)
-            },
-            onOwnerLogout = {
-                ownerToken = null
-                ownerMode = false
-                saveOwnerMode(ctx, false)
-                saveOwnerToken(ctx, null)
-            },
-            onDismiss = { showSettings = false }
-        )
-    }
-
-    if (showNoticeCenter) {
-        NoticeCenterDialog(
-            notices = if (ownerMode) notices.filter { it.forOwner } else notices.filter { !it.forOwner },
-            onClear = {
-                notices = if (ownerMode) notices.filter { !it.forOwner } else notices.filter { it.forOwner }
-                saveNotices(ctx, notices)
-            },
-            onDismiss = {
-                if (ownerMode) {
-                    lastSeenOwner = System.currentTimeMillis()
-                    saveLastSeen(ctx, true, lastSeenOwner)
-                } else {
-                    lastSeenUser = System.currentTimeMillis()
-                    saveLastSeen(ctx, false, lastSeenUser)
-                }
-                showNoticeCenter = false
-            }
-        )
-    }
-}
-
-/* =========================
-   شاشات عامة
-   ========================= */
-
-@Composable private fun HomeScreen() {
-    Box(Modifier.fillMaxSize().background(Bg)) {
-        HomeAnnouncementsList()
-    }
-}
-
-
-@Composable private fun SupportScreen() {
-    val uri = LocalUriHandler.current
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Text("الدعم", color = OnBg, fontSize = 22.sp, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(12.dp))
-        Text("للتواصل أو الاستفسار اختر إحدى الطرق التالية:", color = OnBg)
-        Spacer(Modifier.height(12.dp))
-        ContactCard(
-            title = "واتساب", subtitle = "+964 776 341 0970",
-            actionText = "افتح واتساب", onClick = { uri.openUri("https://wa.me/9647763410970") }, icon = Icons.Filled.Call
-        )
-        Spacer(Modifier.height(10.dp))
-        ContactCard(
-            title = "تيليجرام", subtitle = "@z396r",
-            actionText = "افتح تيليجرام", onClick = { uri.openUri("https://t.me/z396r") }, icon = Icons.Filled.Send
-        )
-    }
-}
-@Composable private fun ContactCard(
-    title: String, subtitle: String, actionText: String,
-    onClick: () -> Unit, icon: androidx.compose.ui.graphics.vector.ImageVector
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth().clickable { onClick() },
-        colors = CardDefaults.cardColors(
-            containerColor = Surface1,
-            contentColor = OnBg
-        )
-    ) {
-        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(icon, null, tint = Accent, modifier = Modifier.size(28.dp))
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text(title, fontWeight = FontWeight.SemiBold, color = OnBg)
-                Text(subtitle, color = Dim, fontSize = 13.sp)
-            }
-            TextButton(onClick = onClick) { Text(actionText) }
-        }
-    }
-}
-
-
-
-
-// =========================
-// Announcements (App-wide)
-// =========================
-data class Announcement(val id: Int? = null, val title: String?, val body: String, val createdAt: Long)
-
-
-private suspend fun apiAdminCreateAnnouncement(token: String, title: String?, body: String): Boolean {
-    val obj = org.json.JSONObject().put("body", body)
-    if (!title.isNullOrBlank()) obj.put("title", title)
-    val (code, _) = httpPost(AdminEndpoints.announcementCreate, obj, headers = mapOf("x-admin-password" to token))
-    return code in 200..299
-}
-
-private suspend fun apiAdminUpdateAnnouncement(token: String, id: Int, title: String?, body: String): Boolean {
-    val obj = org.json.JSONObject().put("body", body)
-    if (!title.isNullOrBlank()) obj.put("title", title)
-    val (code, _) = httpPost(AdminEndpoints.announcementUpdate(id), obj, headers = mapOf("x-admin-password" to token))
-    return code in 200..299
-}
-private suspend fun apiAdminDeleteAnnouncement(token: String, id: Int): Boolean {
-    val (code, _) = httpPost(AdminEndpoints.announcementDelete(id), org.json.JSONObject(), headers = mapOf("x-admin-password" to token))
-    return code in 200..299
-}
-
-
-
-private suspend fun apiFetchAnnouncements(limit: Int = 50): List<Announcement> {
-    val (code, txt) = httpGet(AdminEndpoints.announcementsList + "?limit=" + limit)
-    if (code !in 200..299 || txt == null) return emptyList()
-    return try {
-        val arr = org.json.JSONArray(txt.trim())
-        val out = mutableListOf<Announcement>()
-
-        for (i in 0 until arr.length()) {
-            val o = arr.getJSONObject(i)
-            out.add(
-                Announcement(
-                    title = if (o.has("title")) o.optString("title", null) else null,
-                    body = o.optString("body",""),
-                    createdAt = o.optLong("created_at", 0L)
-                )
-            )
-        }
-        out
-    } catch (_: Exception) { emptyList() }
-}
-
-private suspend fun apiFetchAdminAnnouncements(token: String, limit: Int = 200): List<Announcement> {
-    val (code, txt) = httpGet(AdminEndpoints.announcementsAdminList + "?limit=" + limit, headers = mapOf("x-admin-password" to token))
-    if (code !in 200..299 || txt == null) return emptyList()
-    return try {
-        val arr = org.json.JSONArray(txt.trim())
-        val out = mutableListOf<Announcement>()
-        for (i in 0 until arr.length()) {
-            val o = arr.getJSONObject(i)
-            val idValue = if (o.has("id")) {
-                val tmp = o.optInt("id", -1)
-                if (tmp > 0) tmp else null
-            } else null
-            out.add(
-                Announcement(
-                    id = idValue,
-                    title = if (o.has("title")) o.optString("title", null) else null,
-                    body = o.optString("body",""),
-                    createdAt = o.optLong("created_at", 0L)
-                )
-            )
-        }
-        out
-    } catch (_: Exception) { emptyList() }
-}
-
-
-
-
-@Composable
-private fun HomeAnnouncementsList() {
-    var list by remember { mutableStateOf<List<Announcement>>(emptyList()) }
-    var loading by remember { mutableStateOf(true) }
-    var err by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(Unit) {
-        loading = true; err = null
-        try {
-            list = apiFetchAnnouncements(50)
-        } catch (e: Exception) {
-            err = "تعذر جلب الإعلانات"
-        } finally {
-            loading = false
-        }
-    }
-    when {
-        loading -> Box(Modifier.fillMaxWidth().padding(16.dp)) { CircularProgressIndicator(Modifier.align(Alignment.Center)) }
-        err != null -> Text(err!!, color = Bad, modifier = Modifier.padding(16.dp))
-        list.isEmpty() -> Text("لا توجد إعلانات حالياً", color = Dim, modifier = Modifier.padding(16.dp))
-        else -> {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize().background(Bg),
-                contentPadding = PaddingValues(vertical = 8.dp)
-            ) {
-                items(list.size) { idx ->
-                    val ann = list[idx]
-                    Card(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 6.dp),
-                        shape = RoundedCornerShape(16.dp)
-                    ) {
-                        Column(Modifier.padding(16.dp)) {
-                            Text(ann.title ?: "إعلان مهم 📢", fontSize = 18.sp, color = OnBg, fontWeight = FontWeight.Bold)
-                            Spacer(Modifier.height(8.dp))
-                            Text(ann.body, fontSize = 16.sp, color = OnBg)
-                            Spacer(Modifier.height(8.dp))
-                            val ts = if (ann.createdAt > 0) ann.createdAt else System.currentTimeMillis()
-                            val formatted = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
-                                .format(java.util.Date(ts))
-                            Text(formatted, fontSize = 10.sp, color = Dim)
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-
-@Composable
-private fun AdminAnnouncementScreen(token: String, onBack: () -> Unit, onSent: () -> Unit = {}) {
-    val scope = rememberCoroutineScope()
-    var title by remember { mutableStateOf("") }
-    var body by remember { mutableStateOf("") }
-    var sending by remember { mutableStateOf(false) }
-    var error by remember { mutableStateOf<String?>(null) }
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            Text("إعلان التطبيق", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = OnBg, modifier = Modifier.weight(1f))
-            TextButton(onClick = onBack) { Text("رجوع") }
-        }
-        Spacer(Modifier.height(12.dp))
-        OutlinedTextField(
-            value = title, onValueChange = { title = it }, singleLine = true,
-            label = { Text("العنوان (اختياري)") }, modifier = Modifier.fillMaxWidth()
-        )
-        Spacer(Modifier.height(8.dp))
-        OutlinedTextField(
-            value = body, onValueChange = { body = it },
-            label = { Text("نص الإعلان") }, minLines = 5, modifier = Modifier.fillMaxWidth()
-        )
-        if (error != null) { Spacer(Modifier.height(6.dp)); Text(error!!, color = Bad, fontSize = 10.sp) }
-        Spacer(Modifier.height(12.dp))
-        Button(
-            onClick = {
-                if (body.isBlank()) { error = "النص مطلوب"; return@Button }
-                scope.launch {
-                    sending = true; error = null
-                    val ok = apiAdminCreateAnnouncement(token, title.ifBlank { null }, body)
-                    sending = false
-                    if (ok) { onSent(); onBack() } else { error = "فشل إرسال الإعلان" }
-                }
-            },
-            enabled = !sending
-        ) { Text(if (sending) "جاري الإرسال..." else "إرسال") }
-    }
-}
-
-
-/* =========================
-   الشريط العلوي يمين — (عمودي)
-   ========================= */
-
-
-/* =========================
-   تبويب الخدمات + الطلب اليدوي
-   ========================= */
-@Composable private fun ServicesScreen(
-    uid: String,
-    onAddNotice: (AppNotice) -> Unit,
-    onToast: (String) -> Unit
-) {
-    val scope = rememberCoroutineScope()
-    var selectedCategory by remember { mutableStateOf<String?>(null) }
-    var selectedService by remember { mutableStateOf<ServiceDef?>(null) }
-
-    if (selectedCategory == null) {
-        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp).padding(bottom = 100.dp)) {
-            Text("الخدمات", color = OnBg, fontSize = 22.sp, fontWeight = FontWeight.Bold)
-            Spacer(Modifier.height(10.dp))
-            serviceCategories.forEach { cat ->
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 8.dp)
-                        .clickable { selectedCategory = cat },
-                    colors = CardDefaults.cardColors(
-                        containerColor = Surface1,
-                        contentColor = OnBg
-                    )
-                ) {
-                    Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Filled.ChevronLeft, null, tint = Accent)
-                        Spacer(Modifier.width(8.dp))
-                        Text(cat, fontWeight = FontWeight.SemiBold, color = OnBg)
-                    }
-                }
-            }
-        }
+from __future__ import annotations
+
+def ensure_auth_schema():
+    """Create user_passwords table if not exists for UID password binding."""
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.user_passwords (
+                        uid TEXT PRIMARY KEY,
+                        password_hash TEXT NOT NULL,
+                        password_cipher BYTEA NOT NULL,
+                        password_iv BYTEA NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    CREATE INDEX IF NOT EXISTS user_passwords_uid_idx ON public.user_passwords(uid);
+                """)
+    finally:
+        put_conn(conn)
+
+import bcrypt
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import base64
+import asyncio
+
+import re
+from typing import Optional
+from fastapi import Header, HTTPException
+
+# ---- UI key normalization to tolerate Arabic variants/spaces ----
+def _normalize_ui_key(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    try:
+        import unicodedata
+        t = unicodedata.normalize("NFKC", str(s)).strip().lower()
+    except Exception:
+        t = str(s).strip().lower()
+    repl = {"أ":"ا","إ":"ا","آ":"ا","ى":"ي","ئ":"ي","ؤ":"و","ة":"ه","ـ":""}
+    out = []
+    for ch in t:
+        out.append(repl.get(ch, ch))
+    t = "".join(out)
+    for ch in [" ", "\u200f","\u200e","\u202a","\u202b","\u202c","\u202d","\u202e","\t","\n","\r","-","_",".",","]:
+        t = t.replace(ch, "")
+    return t
+
+
+# === Safety: prevent negative balances on deduct ===
+def _can_deduct(balance: float, amount: float) -> bool:
+    try:
+        return float(balance) - float(amount) >= 0.0
+    except Exception:
+        return False
+import os
+import json
+import time
+import logging
+from decimal import Decimal
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+import psycopg2
+from psycopg2 import pool
+from psycopg2.extras import RealDictCursor, Json
+
+from fastapi import FastAPI, HTTPException, Header, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
+
+# =========================
+# Settings
+# =========================
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DATABASE_URL_NEON")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL env var is required")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+FCM_SERVER_KEY = os.getenv("FCM_SERVER_KEY", "").strip()
+GOOGLE_APPLICATION_CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
+FCM_PROJECT_ID = os.getenv("FCM_PROJECT_ID", "").strip()  # optional override
+OWNER_UID = os.getenv("OWNER_UID", "OWNER-0001").strip()
+
+PROVIDER_API_URL = os.getenv("PROVIDER_API_URL", "https://kd1s.com/api/v2")
+PROVIDER_API_KEY = os.getenv("PROVIDER_API_KEY", "25a9ceb07be0d8b2ba88e70dcbe92e06")
+
+PAYTABS_PROFILE_ID = (os.getenv("PAYTABS_PROFILE_ID") or "").strip()
+PAYTABS_SERVER_KEY = (os.getenv("PAYTABS_SERVER_KEY") or "").strip()
+PAYTABS_BASE_URL = (os.getenv("PAYTABS_BASE_URL") or "").strip().rstrip("/")
+PAYTABS_CURRENCY = (os.getenv("PAYTABS_CURRENCY") or "IQD").strip() or "IQD"
+BACKEND_PUBLIC_URL = (os.getenv("BACKEND_PUBLIC_URL") or "").strip().rstrip("/")
+
+POOL_MIN, POOL_MAX = 1, int(os.getenv("DB_POOL_MAX", "5"))
+dbpool: pool.SimpleConnectionPool = pool.SimpleConnectionPool(POOL_MIN, POOL_MAX, dsn=DATABASE_URL)
+
+def get_conn() -> psycopg2.extensions.connection:
+    """Get a healthy connection from the pool (auto-reopen if closed)."""
+    conn = dbpool.getconn()
+    try:
+        if getattr(conn, "closed", 0):
+            raise Exception("connection closed")
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+    except Exception:
+        try:
+            # Remove the bad connection from pool and close it
+            dbpool.putconn(conn, close=True)
+        except Exception:
+            pass
+        # Get a fresh connection
+        conn = dbpool.getconn()
+    return conn
+
+def put_conn(conn: psycopg2.extensions.connection) -> None:
+    try:
+        if conn is not None:
+            dbpool.putconn(conn, close=False)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def _prune_bad_fcm_token(bad_token: str):
+    """
+    Remove invalid/blocked FCM token from user_devices and users.fcm_token (if matches).
+    Safe to call from anywhere; opens its own DB connection.
+    """
+    if not bad_token:
         return
-    }
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            try:
+                cur.execute("DELETE FROM public.user_devices WHERE fcm_token=%s", (bad_token,))
+            except Exception:
+                pass
+            try:
+                cur.execute("UPDATE public.users SET fcm_token=NULL WHERE fcm_token=%s", (bad_token,))
+            except Exception:
+                pass
+    except Exception as e:
+        logger.exception("prune_bad_fcm_token failed: %s", e)
+    finally:
+        put_conn(conn)
+# =========================
+# Logging
+# =========================
+logger = logging.getLogger("smm")
+logging.basicConfig(level=logging.INFO)
 
-    val inCat = when (selectedCategory) {
-        "قسم المتابعين"            -> servicesCatalog.filter { it.category == "المتابعين" }
-        "قسم الايكات"              -> servicesCatalog.filter { it.category == "الايكات" }
-        "قسم المشاهدات"            -> servicesCatalog.filter { it.category == "المشاهدات" }
-        "قسم مشاهدات البث المباشر" -> servicesCatalog.filter { it.category == "مشاهدات البث المباشر" }
-        "قسم رفع سكور تيكتوك"     -> servicesCatalog.filter { it.category == "رفع سكور تيكتوك" }
-        "قسم خدمات التليجرام"      -> servicesCatalog.filter { it.category == "خدمات التليجرام" }
-        else -> emptyList()
-    }
 
-    // Overlay live pricing on top of catalog using produceState (no try/catch around composables)
-// Overlay live pricing on top of catalog with cache + version (same behavior as manual sections)
-    val apiCtx = LocalContext.current
-    val keys = remember(inCat, selectedCategory) { inCat.map { it.uiKey } }
-    var apiEffectiveMap by remember(selectedCategory) { mutableStateOf<Map<String, PublicPricingEntry>>(emptyMap()) }
+# =========================
+# FCM helpers (V1 preferred; Legacy fallback)
+# =========================
+def _fcm_get_access_token_v1(sa_info: dict) -> Optional[str]:
+    """
+    Returns OAuth2 access token using google-auth if available; otherwise falls back to manual JWT if PyJWT is installed.
+    """
+    # Try google-auth first
+    try:
+        from google.oauth2 import service_account
+        from google.auth.transport.requests import Request as GoogleRequest
+        creds = service_account.Credentials.from_service_account_info(sa_info, scopes=[
+            "https://www.googleapis.com/auth/firebase.messaging"
+        ])
+        creds.refresh(GoogleRequest())
+        return creds.token
+    except Exception as e:
+        logger.info("google-auth not available or failed: %s", e)
 
-    LaunchedEffect(selectedCategory) {
-        val cat = selectedCategory ?: ""
-        val cached = ApiPricingCache.load(apiCtx, cat)
-        if (cached.isNotEmpty()) apiEffectiveMap = cached
-
-        val srvVer = try { apiPublicPricingVersion() } catch (_: Throwable) { 0L }
-        val localVer = ApiPricingCache.getVersion(apiCtx, cat)
-        val needRefresh = (srvVer > 0L && srvVer != localVer) || apiEffectiveMap.isEmpty()
-
-        if (needRefresh) {
-            val fresh = try { /*DISABLED_LIVE_CALL*/ apiPublicPricingBulk(keys) } catch (_: Throwable) { emptyMap() }
-            if (fresh.isNotEmpty()) {
-                apiEffectiveMap = fresh
-                ApiPricingCache.save(apiCtx, cat, fresh)
-                if (srvVer > 0L) ApiPricingCache.saveVersion(apiCtx, cat, srvVer)
-            }
+    # Try manual JWT with PyJWT
+    try:
+        import jwt, time as _time
+        now = int(_time.time())
+        payload = {
+            "iss": sa_info["client_email"],
+            "scope": "https://www.googleapis.com/auth/firebase.messaging",
+            "aud": sa_info.get("token_uri", "https://oauth2.googleapis.com/token"),
+            "iat": now,
+            "exp": now + 3600,
         }
-    }
+        signed_jwt = jwt.encode(payload, sa_info["private_key"], algorithm="RS256")
+        resp = requests.post(sa_info.get("token_uri", "https://oauth2.googleapis.com/token"),
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": signed_jwt,
+            }, timeout=10)
+        if resp.status_code in (200, 201):
+            return resp.json().get("access_token")
+        else:
+            logger.warning("JWT token fetch failed: %s %s", resp.status_code, resp.text[:200])
+    except Exception as e:
+        logger.info("pyjwt flow not available or failed: %s", e)
+    return None
 
-    val listToShow = remember(inCat, apiEffectiveMap) {
-        inCat.map { s ->
-            val ov = apiEffectiveMap[s.uiKey]
-            if (ov != null) s.copy(min = ov.minQty, max = ov.maxQty, pricePerK = ov.pricePerK) else s
-        }
-    }
-    if (listToShow.isNotEmpty()) {
-        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp).padding(bottom = 100.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = { selectedCategory = null }) {
-                    Icon(Icons.Filled.ArrowBack, contentDescription = null, tint = OnBg)
-                }
-                Spacer(Modifier.width(6.dp))
-                Text(selectedCategory!!, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = OnBg)
-            }
-            Spacer(Modifier.height(10.dp))
-
-            listToShow.forEach { svc ->
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 8.dp)
-                        .clickable { selectedService = svc },
-                    colors = CardDefaults.cardColors(
-                        containerColor = Surface1,
-                        contentColor = OnBg
-                    )
-                ) {
-                    Column(Modifier.padding(16.dp)) {
-                        Text(svc.uiKey, fontWeight = FontWeight.SemiBold, color = OnBg)
-                        Text("الكمية: ${svc.min} - ${svc.max}", color = Dim, fontSize = 10.sp)
-                        Text("السعر لكل 1000: ${svc.pricePerK}\$", color = Dim, fontSize = 10.sp)
-                    }
-                }
-            }
-        }
-    } else {
-        ManualSectionsScreen(
-            title = selectedCategory!!,
-            uid = uid,
-            onBack = { selectedCategory = null },
-            onToast = onToast,
-            onAddNotice = onAddNotice
-        )
-    }
-
-    selectedService?.let { svc ->
-        ServiceOrderDialog(
-            uid = uid, service = svc,
-            onDismiss = { selectedService = null },
-            onOrdered = { ok, msg ->
-                onToast(msg)
-                if (ok) {
-                    onAddNotice(AppNotice("طلب جديد (${svc.uiKey})", "تم استلام طلبك وسيتم تنفيذه قريبًا.", forOwner = false))
-                    onAddNotice(AppNotice("طلب خدمات معلّق", "طلب ${svc.uiKey} من UID=$uid بانتظار المعالجة/التنفيذ", forOwner = true))
-                }
-            }
-        )
-    }
-}
-
-@Composable private fun ServiceOrderDialog(
-    uid: String, service: ServiceDef,
-    onDismiss: () -> Unit,
-    onOrdered: (Boolean, String) -> Unit
-) {
-    val scope = rememberCoroutineScope()
-    var link by remember { mutableStateOf("") }
-    var qtyText by remember { mutableStateOf(service.min.toString()) }
-    val qty = qtyText.toIntOrNull() ?: 0
-    val price = ceil((qty / 1000.0) * service.pricePerK * 100) / 100.0
-
-    var loading by remember { mutableStateOf(false) }
-    var userBalance by remember { mutableStateOf<Double?>(null) }
-
-    LaunchedEffect(Unit) { userBalance = apiGetBalance(uid) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {
-            TextButton(enabled = !loading, onClick = {
-                if (link.isBlank()) { onOrdered(false, "الرجاء إدخال الرابط"); return@TextButton }
-                if (qty < service.min || qty > service.max) { onOrdered(false, "الكمية يجب أن تكون بين ${service.min} و ${service.max}"); return@TextButton }
-                val bal = userBalance ?: 0.0
-                if (bal < price) { onOrdered(false, "رصيدك غير كافٍ. السعر: $price\$ | رصيدك: ${"%.2f".format(bal)}\$"); return@TextButton }
-
-                loading = true
-                val svcName = service.uiKey
-                scope.launch {
-                    val ok = apiCreateProviderOrder(
-                        uid = uid,
-                        serviceId = service.serviceId,
-                        serviceName = svcName,
-                        link = link,
-                        quantity = qty,
-                        price = price
-                    )
-                    loading = false
-                    if (ok) onOrdered(true, "تم إرسال الطلب بنجاح.")
-                    else onOrdered(false, "فشل إرسال الطلب.")
-                    onDismiss()
-                }
-            }) { Text(if (loading) "يرسل" else "شراء") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("إلغاء") } },
-        title = { Text(service.uiKey) },
-        text = {
-            Column {
-                Text("الكمية بين ${service.min} و ${service.max}", color = Dim, fontSize = 10.sp)
-                Spacer(Modifier.height(6.dp))
-                OutlinedTextField(
-                    value = qtyText,
-                    onValueChange = { s -> if (s.all { it.isDigit() }) qtyText = s },
-                    label = { Text("الكمية") },
-                    singleLine = true,
-                    colors = OutlinedTextFieldDefaults.colors(
-                        cursorColor = Accent,
-                        focusedBorderColor = Accent, unfocusedBorderColor = Dim,
-                        focusedLabelColor = OnBg, unfocusedLabelColor = Dim
-                    )
-                )
-                Spacer(Modifier.height(6.dp))
-                OutlinedTextField(
-                    value = link, onValueChange = { link = it },
-                    label = { Text("الرابط (أرسل الرابط وليس اليوزر)") },
-                    singleLine = true,
-                    colors = OutlinedTextFieldDefaults.colors(
-                        cursorColor = Accent,
-                        focusedBorderColor = Accent, unfocusedBorderColor = Dim,
-                        focusedLabelColor = OnBg, unfocusedLabelColor = Dim
-                    )
-                )
-                // === Notes for Instagram & Telegram services ===
-                if (service.uiKey.contains("انستغرام")) {
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "يرجى إطفاء زر 'تم' (تم التقييد) داخل حسابك الانستغرام قبل إرسال رابط الخدمة لضمان إكمال طلبك!",
-                        color = Dim, fontSize = 10.sp
-                    )
-                }
-                if (service.uiKey.contains("تلي") || service.uiKey.contains("تيليجرام") || service.uiKey.contains("التليجرام")) {
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "الرجاء إرسال رابط دعوة انضمام وليس رابط القناة ام المجموعة أو اسم المستخدم (مثل: https://t.me/+xxxx).\n"
-                        + "خطوات إنشاء رابط الدعوة الخاص:\n"
-                        + "1. ادخل إلى القناة او المجموعة\n"
-                        + "2. اختر خيار المشتركون.\n"
-                        + "3. اضغط على الدعوة عبر رابط خاص.\n"
-                        + "4. أنشئ رابط دعوة جديد.",
-                        color = Dim, fontSize = 10.sp
-                    )
-                }
-    
-                Spacer(Modifier.height(8.dp))
-                Text("السعر التقريبي: $price\$", fontWeight = FontWeight.SemiBold, color = OnBg)
-                Spacer(Modifier.height(4.dp))
-                Text("رصيدك الحالي: ${userBalance?.let { "%.2f".format(it) } ?: ""}\$", color = Dim, fontSize = 10.sp)
-            }
-        }
-    )
-}
-
-/* =========================
-   Amount Picker (iTunes & Phone Cards)
-   ========================= */
-data class AmountOption(val label: String, val usd: Int)
-
-private fun priceForItunes(usd: Int): Double {
-    return usd.toDouble()
-}
-private fun priceForAtheerOrAsiacell(usd: Int): Double {
-    return usd.toDouble()
-}
-private fun priceForKorek(usd: Int): Double {
-    return usd.toDouble()
-}
-
-@Composable
-private fun AmountGrid(
-    title: String,
-    subtitle: String,
-    labelSuffix: String = "",
-    amounts: List<Int>,
-    keyPrefix: String? = null,
-    priceOf: (Int) -> Double,
-    onSelect: (usd: Int, price: Double) -> Unit,
-    onBack: () -> Unit
-) {
-    
-    
-    // --- Dynamic pricing for topups with local cache + version ---
-    val ctx = LocalContext.current
-    val effectiveMap: Map<String, PublicPricingEntry> = if (keyPrefix != null) {
-        val keys = remember(amounts, keyPrefix) { amounts.map { keyPrefix + it } }
-        var cached by remember(keys) { mutableStateOf<Map<String, PublicPricingEntry>>(emptyMap()) }
-        var map by remember(keys) { mutableStateOf<Map<String, PublicPricingEntry>>(emptyMap()) }
-
-        LaunchedEffect(keys) {
-            // load from cache immediately
-            cached = PricingCache.load(ctx, keyPrefix!!, amounts)
-            if (cached.isNotEmpty()) map = cached
-
-            val srvVer = try { apiPublicPricingVersion() } catch (_: Throwable) { 0L }
-            val localVer = PricingCache.getVersion(ctx, keyPrefix!!, amounts)
-            val needRefresh = (srvVer > 0L && srvVer != localVer) || map.isEmpty()
-
-            if (needRefresh) {
-                val fresh = try { /*DISABLED_LIVE_CALL*/ apiPublicPricingBulk(keys) } catch (_: Throwable) { emptyMap() }
-                if (fresh.isNotEmpty()) {
-                    map = fresh
-                    PricingCache.save(ctx, keyPrefix!!, amounts, fresh)
-                    if (srvVer > 0L) PricingCache.saveVersion(ctx, keyPrefix!!, amounts, srvVer)
+def _fcm_send_v1(fcm_token: str, title: str, body: str, order_id: Optional[int], sa_info: dict, project_id: Optional[str] = None):
+    """
+    Send using FCM HTTP v1. On invalid/blocked tokens, prune them from DB.
+    """
+    try:
+        access_token = _fcm_get_access_token_v1(sa_info)
+        if not access_token:
+            logger.warning("FCM v1: could not obtain access token")
+            return False
+        pid = project_id or sa_info.get("project_id")
+        if not pid:
+            logger.warning("FCM v1: missing project_id")
+            return False
+        url = f"https://fcm.googleapis.com/v1/projects/{pid}/messages:send"
+        message = {
+            "message": {
+                "token": fcm_token,
+                "notification": {"title": title, "body": body},
+                "data": {
+                    "title": title,
+                    "body": body,
+                    "order_id": str(order_id or ""),
                 }
             }
         }
-        map
-    } else emptyMap()
+        resp = requests.post(url, headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }, json=message, timeout=10)
 
-    fun effectiveFor(usd: Int): Pair<Int, Double> {
-        val entry = if (keyPrefix != null) effectiveMap[keyPrefix + usd] else null
-        val effUsd = if (entry != null && entry.minQty > 0) entry.minQty else usd
-        val effPrice = if (entry != null && entry.pricePerK > 0.0) entry.pricePerK else priceOf(effUsd)
-        return Pair(effUsd, effPrice)
-    }
-    // ---------------------------------------------------------------------------
-    
-Column(
-        Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp)
-            .padding(bottom = 100.dp)
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = null, tint = OnBg) }
-            Spacer(Modifier.width(6.dp))
-            Column {
-                Text(title, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = OnBg)
-                if (subtitle.isNotBlank()) Text(subtitle, color = Dim, fontSize = 10.sp)
-            }
+        if resp.status_code in (200, 201):
+            return True
+
+        # Try to detect unregistered/invalid tokens and prune
+        try:
+            ej = resp.json().get("error", {})
+        except Exception:
+            ej = {}
+        status = str(ej.get("status") or "").upper()
+        message_txt = str(ej.get("message") or "")
+        if resp.status_code in (400, 404) or status in ("INVALID_ARGUMENT", "NOT_FOUND"):
+            if ("Requested entity was not found" in message_txt) or ("Invalid registration token" in message_txt) or ("UNREGISTERED" in message_txt.upper()):
+                _prune_bad_fcm_token(fcm_token)
+        logger.warning("FCM v1 send failed (%s): %s", resp.status_code, resp.text[:300])
+        return False
+    except Exception as ex:
+        logger.exception("FCM v1 send exception: %s", ex)
+        return False
+
+def _fcm_send_legacy(fcm_token: str, title: str, body: str, order_id: Optional[int], server_key: str):
+    """
+    Send using Legacy HTTP API. If response indicates an invalid/blocked token, prune it.
+    """
+    try:
+        headers = {
+            "Authorization": f"key={server_key}",
+            "Content-Type": "application/json"
         }
-        Spacer(Modifier.height(10.dp))
-
-        amounts.chunked(2).forEach { pair ->
-            Row(Modifier.fillMaxWidth()) {
-                pair.forEach { usd ->
-                    val (effUsd, price) = effectiveFor(usd)
-                    Card(
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(4.dp)
-                            .clickable { onSelect(effUsd, price) },
-                        colors = CardDefaults.cardColors(containerColor = Surface1)
-                    ) {
-                        Column(Modifier.padding(16.dp)) {
-                            val label = if (labelSuffix.isBlank()) "$${effUsd}" else "$${effUsd} $labelSuffix"
-                            Text(label, fontWeight = FontWeight.Bold, fontSize = 18.sp, color = OnBg)
-                            Spacer(Modifier.height(4.dp))
-                            run {
-                                val priceTxt = if (price % 1.0 == 0.0) price.toInt().toString() else "%.2f".format(price)
-                                Text("السعر: \$${priceTxt}", color = Dim, fontSize = 10.sp)
-                            }
-                        }
-                    }
-                }
-                if (pair.size == 1) Spacer(Modifier.weight(1f).padding(4.dp))
-            }
+        payload = {
+            "to": fcm_token,
+            "priority": "high",
+            "notification": {"title": title, "body": body},
+            "data": {"title": title, "body": body, "order_id": str(order_id or "")}
         }
-    }
-}
+        resp = requests.post("https://fcm.googleapis.com/fcm/send", headers=headers, json=payload, timeout=10)
+        if resp.status_code not in (200, 201):
+            logger.warning("FCM legacy send failed (%s): %s", resp.status_code, resp.text[:300])
+            return False
+        # Parse per-result errors
+        try:
+            obj = resp.json()
+        except Exception:
+            obj = {}
+        try:
+            results = obj.get("results") or []
+            if results and isinstance(results, list):
+                err = results[0].get("error")
+                if err in ("NotRegistered", "InvalidRegistration", "MismatchSenderId"):
+                    _prune_bad_fcm_token(fcm_token)
+                    return False
+        except Exception:
+            pass
+        return True
+    except Exception as ex:
+        logger.exception("FCM legacy send exception: %s", ex)
+        return False
 
-@Composable
-private fun ConfirmAmountDialog(
-    sectionTitle: String,
-    usd: Int,
-    price: Double,
-    onConfirm: () -> Unit,
-    onDismiss: () -> Unit
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = { TextButton(onClick = onConfirm) { Text("تأكيد الشراء") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("إلغاء") } },
-        title = { Text(sectionTitle, color = OnBg) },
-        text = {
-            Column {
-                Text("القيمة المختارة: ${usd}$", color = OnBg, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(6.dp))
-                Text(String.format(java.util.Locale.getDefault(), "السعر المستحق: %.2f$", price), color = Dim)
-                Spacer(Modifier.height(8.dp))
-                Text("سيتم إرسال الطلب للمراجعة من قِبل المالك وسيصلك إشعار عند التنفيذ.", color = Dim, fontSize = 10.sp)
-            }
-        }
-    )
+def _fcm_send_push(fcm_token: Optional[str], title: str, body: str, order_id: Optional[int]):
+    """
+    Wrapper that prefers v1; prunes invalid tokens automatically.
+    """
+    if not fcm_token:
+        return False
+    sa_json = (GOOGLE_APPLICATION_CREDENTIALS_JSON or "").strip()
+    if sa_json:
+        try:
+            info = json.loads(sa_json)
+            return _fcm_send_v1(fcm_token, title, body, order_id, info, project_id=(FCM_PROJECT_ID or None))
+        except Exception as e:
+            logger.info("Invalid GOOGLE_APPLICATION_CREDENTIALS_JSON: %s", e)
+    if FCM_SERVER_KEY:
+        return _fcm_send_legacy(fcm_token, title, body, order_id, FCM_SERVER_KEY)
+    logger.warning("FCM not configured: missing credentials")
+    return False
 
-}
+# =========================
+# Schema & Triggers
+# =========================
+def ensure_schema():
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # global advisory lock to avoid race on first boot
+                cur.execute("SELECT pg_advisory_lock(987654321)")
+                try:
+                    cur.execute("CREATE SCHEMA IF NOT EXISTS public;")
+
+                    # users
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.users(
+                            id         SERIAL PRIMARY KEY,
+                            uid        TEXT UNIQUE NOT NULL,
+                            balance    NUMERIC(18,4) NOT NULL DEFAULT 0,
+                            is_banned  BOOLEAN NOT NULL DEFAULT FALSE,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            fcm_token  TEXT
+                        );
+                    """)
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_uid ON public.users(uid);")
+
+                    # user_devices (multi-device FCM tokens)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.user_devices(
+                            id BIGSERIAL PRIMARY KEY,
+                            uid TEXT NOT NULL,
+                            fcm_token TEXT NOT NULL UNIQUE,
+                            platform TEXT DEFAULT 'android',
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        );
+                    """)
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_devices_uid ON public.user_devices(uid);")
+
+                    # wallet_txns
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.wallet_txns(
+                            id         SERIAL PRIMARY KEY,
+                            user_id    INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                            amount     NUMERIC(18,4) NOT NULL,
+                            reason     TEXT,
+                            meta       JSONB,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        );
+                    """)
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_wallet_txns_user ON public.wallet_txns(user_id);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_wallet_txns_created ON public.wallet_txns(created_at);")
+
+                    # orders
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.orders(
+                            id                 SERIAL PRIMARY KEY,
+                            user_id            INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                            title              TEXT NOT NULL,
+                            service_id         BIGINT,
+                            link               TEXT,
+                            quantity           INTEGER NOT NULL DEFAULT 0,
+                            price              NUMERIC(18,4) NOT NULL DEFAULT 0,
+                            status             TEXT NOT NULL DEFAULT 'Pending',
+                            provider_order_id  TEXT,
+                            payload            JSONB DEFAULT '{}'::jsonb,
+                            created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            type               TEXT
+                        );
+                    """)
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON public.orders(user_id);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON public.orders(status);")
+                    cur.execute("ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS type TEXT;")
+                    cur.execute("UPDATE public.orders SET type='provider' WHERE type IS NULL;")
+                    cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET DEFAULT 'provider';")
+                    cur.execute("ALTER TABLE public.orders ALTER COLUMN type SET NOT NULL;")
+                    cur.execute("UPDATE public.orders SET payload='{}'::jsonb WHERE payload IS NULL;")
+
+                    # service overrides tables
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.service_id_overrides(
+                            ui_key TEXT PRIMARY KEY,
+                            service_id BIGINT NOT NULL,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                    """)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.service_pricing_overrides(
+                            ui_key TEXT PRIMARY KEY,
+                            price_per_k NUMERIC(18,6) NOT NULL,
+                            min_qty INTEGER NOT NULL,
+                            max_qty INTEGER NOT NULL,
+                            mode TEXT NOT NULL DEFAULT 'per_k',
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                    """)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.order_pricing_overrides(
+                            order_id BIGINT PRIMARY KEY,
+                            price NUMERIC(18,6) NOT NULL,
+                            mode TEXT NOT NULL DEFAULT 'flat',
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                    """)
+
+                    # user_notifications
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.user_notifications(
+                            id BIGSERIAL PRIMARY KEY,
+                            user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                            order_id INTEGER NULL REFERENCES public.orders(id) ON DELETE SET NULL,
+                            title TEXT NOT NULL,
+                            body  TEXT NOT NULL,
+                            status TEXT NOT NULL DEFAULT 'unread',
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            read_at    TIMESTAMPTZ NULL
+                        );
+                    """)
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_user_created ON public.user_notifications(user_id, created_at DESC);")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_notifications_status ON public.user_notifications(status);")
+
+                    # trigger: notify on wallet_txns insert (skip asiacell_topup or meta.no_notify)
+                    # announcements (for app-wide news)
+                    cur.execute("""
+                        CREATE OR REPLACE FUNCTION public.wallet_txns_notify()
+                        RETURNS trigger AS $$
+                        DECLARE
+                            t TEXT := 'تم تعديل رصيدك';
+                            b TEXT;
+                        BEGIN
+                            IF NEW.reason = 'asiacell_topup' THEN
+                                RETURN NEW;
+                            END IF;
+                            IF NEW.meta IS NOT NULL AND (NEW.meta ? 'no_notify') AND (NEW.meta->>'no_notify')::boolean IS TRUE THEN
+                                RETURN NEW;
+                            END IF;
+                            b := 'تم تحديث رصيدك. الرصيد الحالي: ' || (SELECT balance FROM public.users WHERE id=NEW.user_id) || ' دينار.';
+                            PERFORM pg_notify('wallet_change', json_build_object(
+                                'user_id', NEW.user_id,
+                                'title', t,
+                                'body',  b
+                            )::text);
+                            RETURN NEW;
+                        END;
+                        $$ LANGUAGE plpgsql;
+                    """)
+                    cur.execute("""
+                        DO $$
+                        BEGIN
+                            IF NOT EXISTS (
+                                SELECT 1 FROM pg_trigger WHERE tgname = 'wallet_txns_notify_ai'
+                            ) THEN
+                                CREATE TRIGGER wallet_txns_notify_ai
+                                AFTER INSERT ON public.wallet_txns
+                                FOR EACH ROW
+                                EXECUTE FUNCTION public.wallet_txns_notify();
+                            END IF;
+                        END $$;
+                    """)
+                finally:
+                    cur.execute("SELECT pg_advisory_unlock(987654321)")
+    finally:
+        put_conn(conn)
 
 
 
-// قائمة مبالغ افتراضية مشتركة لاستخدامها في ايتونز/رصيد الهاتف
-private val COMMON_AMOUNTS = listOf(5,10,15,20,25,30,40,50,100)
-/* الأقسام اليدوية (ايتونز/هاتف/ببجي/لودو) */
+def ensure_announcements():
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public.announcements(
+                        id         BIGSERIAL PRIMARY KEY,
+                        title      TEXT NULL,
+                        body       TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NULL
+                    );
+                """)
+                try:
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_announcements_created ON public.announcements(created_at DESC)")
+                except Exception:
+                    pass
+    finally:
+        put_conn(conn)
+ensure_schema()
+ensure_auth_schema()
 
-/* =========================
-   Package Picker (PUBG / Ludo)
-   ========================= */
-data class PackageOption(val label: String, val priceUsd: Double)
+# === Auth AES key (for reveal_password) ===
+USERPWD_AES_KEY_B64 = os.getenv("USERPWD_AES_KEY")
+_AUTH_AES_KEY = base64.b64decode(USERPWD_AES_KEY_B64) if USERPWD_AES_KEY_B64 else None
 
-val pubgPackages = listOf(
-    PackageOption("60 شدة", 2.0),
-    PackageOption("325 شدة", 9.0),
-    PackageOption("660 شدة", 15.0),
-    PackageOption("1800 شدة", 40.0),
-    PackageOption("3850 شدة", 55.0),
-    PackageOption("8100 شدة", 100.0),
-    PackageOption("16200 شدة", 185.0)
-)
-val ludoDiamondsPackages = listOf(
-    PackageOption("810 الماسة", 5.0),
-    PackageOption("2280 الماسة", 10.0),
-    PackageOption("5080 الماسة", 20.0),
-    PackageOption("12750 الماسة", 35.0),
-    PackageOption("27200 الماسة", 85.0),
-    PackageOption("54900 الماسة", 165.0),
-    PackageOption("164800 الماسة", 475.0),
-    PackageOption("275400 الماسة", 800.0)
-)
-val ludoGoldPackages = listOf(
-    PackageOption("66680 ذهب", 5.0),
-    PackageOption("219500 ذهب", 10.0),
-    PackageOption("1443000 ذهب", 20.0),
-    PackageOption("3627000 ذهب", 35.0),
-    PackageOption("9830000 ذهب", 85.0),
-    PackageOption("24835000 ذهب", 165.0),
-    PackageOption("74550000 ذهب", 475.0),
-    PackageOption("124550000 ذهب", 800.0)
-)
+# === Auth crypto helpers ===
+def _auth_hash_password(pw: str) -> str:
+    return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
 
-/* ===== App launch prefetch for pricing (version-based, non-Compose) ===== */
-private fun prefetchPricingOnLaunch(ctx: android.content.Context) {
-    // Run in background; avoid blocking UI
-    kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-        val srvVer = try { apiPublicPricingVersion() } catch (_: Throwable) { 0L }
-        if (srvVer <= 0L) return@launch
+def _auth_verify_password(pw: str, pw_hash: str) -> bool:
+    try:
+        return bcrypt.checkpw(pw.encode("utf-8"), pw_hash.encode("utf-8"))
+    except Exception:
+        return False
 
-        // --- Topup providers ---
-        val topupPrefixes = listOf("topup.itunes.", "topup.atheer.", "topup.asiacell.", "topup.zain.", "topup.korek.")
-        for (prefix in topupPrefixes) {
-            val amounts = COMMON_AMOUNTS
-            val localVer = PricingCache.getVersion(ctx, prefix, amounts)
-            if (localVer != srvVer) {
-                val keys = amounts.map { prefix + it }
-                val fresh = try { /*DISABLED_LIVE_CALL*/ apiPublicPricingBulk(keys) } catch (_: Throwable) { emptyMap() }
-                if (fresh.isNotEmpty()) {
-                    PricingCache.save(ctx, prefix, amounts, fresh)
-                    PricingCache.saveVersion(ctx, prefix, amounts, srvVer)
-                }
-            }
-        }
+def _auth_encrypt_password(uid: str, pw: str):
+    if _AUTH_AES_KEY is None:
+        raise HTTPException(status_code=500, detail="SERVER_MISCONFIGURED_AES_KEY")
+    iv = os.urandom(12)
+    aead = AESGCM(_AUTH_AES_KEY)
+    ct = aead.encrypt(iv, pw.encode("utf-8"), uid.encode("utf-8"))
+    return iv, ct
 
-        // --- PUBG ---
-        run {
-            val amounts = pubgPackages.mapNotNull { extractDigits(it.label).toIntOrNull() }
-            val prefix = "pkg.pubg."
-            val localVer = PricingCache.getVersion(ctx, prefix, amounts)
-            if (localVer != srvVer) {
-                val keys = amounts.map { prefix + it }
-                val fresh = try { /*DISABLED_LIVE_CALL*/ apiPublicPricingBulk(keys) } catch (_: Throwable) { emptyMap() }
-                if (fresh.isNotEmpty()) {
-                    PricingCache.save(ctx, prefix, amounts, fresh)
-                    PricingCache.saveVersion(ctx, prefix, amounts, srvVer)
-                }
-            }
-        }
+def _auth_decrypt_password(uid: str, iv: bytes, ct: bytes) -> str:
+    if _AUTH_AES_KEY is None:
+        raise HTTPException(status_code=500, detail="SERVER_MISCONFIGURED_AES_KEY")
+    aead = AESGCM(_AUTH_AES_KEY)
+    pt = aead.decrypt(iv, ct, uid.encode("utf-8"))
+    return pt.decode("utf-8")
 
-        // --- Ludo (Diamonds & Gold) ---
-        run {
-            val diaAmounts = ludoDiamondsPackages.mapNotNull { extractDigits(it.label).toIntOrNull() }
-            val goldAmounts = ludoGoldPackages.mapNotNull { extractDigits(it.label).toIntOrNull() }
-            val diaPrefix = "pkg.ludo.diamonds."
-            val goldPrefix = "pkg.ludo.gold."
 
-            val localDia = PricingCache.getVersion(ctx, diaPrefix, diaAmounts)
-            if (localDia != srvVer) {
-                val keys = diaAmounts.map { diaPrefix + it }
-                val fresh = try { /*DISABLED_LIVE_CALL*/ apiPublicPricingBulk(keys) } catch (_: Throwable) { emptyMap() }
-                if (fresh.isNotEmpty()) {
-                    PricingCache.save(ctx, diaPrefix, diaAmounts, fresh)
-                    PricingCache.saveVersion(ctx, diaPrefix, diaAmounts, srvVer)
-                }
-            }
 
-            val localGold = PricingCache.getVersion(ctx, goldPrefix, goldAmounts)
-            if (localGold != srvVer) {
-                val keys = goldAmounts.map { goldPrefix + it }
-                val fresh = try { /*DISABLED_LIVE_CALL*/ apiPublicPricingBulk(keys) } catch (_: Throwable) { emptyMap() }
-                if (fresh.isNotEmpty()) {
-                    PricingCache.save(ctx, goldPrefix, goldAmounts, fresh)
-                    PricingCache.saveVersion(ctx, goldPrefix, goldAmounts, srvVer)
-                }
-            }
-        }
-    }
-}
-/* ===== End prefetch ===== */
-/* ===== Helpers for PUBG/Ludo package overrides ===== */
-private fun extractDigits(s: String): String = s.filter { it.isDigit() }
 
-@Composable
-private fun packagesWithOverrides(
-    base: List<PackageOption>,
-    keyPrefix: String,
-    unit: String
-): List<PackageOption> {
-    val ctx = LocalContext.current
-    // Cache-only: read overrides from PricingCache that were prefetched by the screen-level effect.
-    val amounts = remember(base) { base.mapNotNull { opt -> opt.label.filter { it.isDigit() }.toIntOrNull() } }
-    val map = remember(keyPrefix, amounts) { PricingCache.load(ctx, keyPrefix, amounts) }
-    return remember(base, map) {
-        base.map { opt ->
-            val qtyStr = opt.label.filter { it.isDigit() }
-            val k = if (qtyStr.isEmpty()) "" else "$keyPrefix$qtyStr"
-            val ov = map[k]
-            val newQty = ov?.minQty?.takeIf { it > 0 } ?: qtyStr.toIntOrNull() ?: 0
-            val newPrice = ov?.pricePerK ?: opt.priceUsd.toDouble()
-            val newLabel = if (newQty > 0) "$newQty $unit" else opt.label
-            PackageOption(newLabel, newPrice)
-        }
-    }
-}
 
-@Composable
-fun PackageGrid(
-    title: String,
-    subtitle: String,
-    packages: List<PackageOption>,
-    onSelect: (PackageOption) -> Unit,
-    onBack: () -> Unit
-) {
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp).padding(bottom = 100.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = null, tint = OnBg) }
-            Spacer(Modifier.width(6.dp))
-            Column {
-                Text(title, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = OnBg)
-                if (subtitle.isNotBlank()) Text(subtitle, color = Dim, fontSize = 10.sp)
-            }
-        }
-        Spacer(Modifier.height(12.dp))
-
-        val rows = packages.chunked(2)
-        rows.forEach { pair ->
-            Row(Modifier.fillMaxWidth()) {
-                pair.forEach { opt ->
-                    Card(
-                        modifier = Modifier.weight(1f)
-                            .padding(4.dp)
-                            .clickable { onSelect(opt) },
-                        colors = CardDefaults.cardColors(containerColor = Surface1)
-                    ) {
-                        Column(Modifier.padding(12.dp)) {
-                            Text(opt.label, fontWeight = FontWeight.SemiBold, color = OnBg)
-                            Spacer(Modifier.height(4.dp))
-                            run {
-                            val p = opt.priceUsd
-                            val priceTxt = if (p % 1.0 == 0.0) p.toInt().toString() else "%.2f".format(p)
-                            Text("السعر: $${priceTxt}", color = Dim, fontSize = 10.sp)
-                        }
-                        }
-                    }
-                }
-                if (pair.size == 1) Spacer(Modifier.weight(1f))
-            }
-        }
-    }
-}
-
-@Composable
-fun ConfirmPackageDialog(
-    sectionTitle: String,
-    label: String,
-    priceUsd: Int,
-    onConfirm: () -> Unit,
-    onDismiss: () -> Unit
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = { TextButton(onClick = onConfirm) { Text("تأكيد الشراء") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("إلغاء") } },
-        title = { Text(sectionTitle, color = OnBg) },
-        text = {
-            Column {
-                Text("الباقة المختارة: $label", color = OnBg, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(6.dp))
-                Text(String.format(java.util.Locale.getDefault(), "السعر المستحق: %.2f$", priceUsd), color = Dim)
-                Spacer(Modifier.height(8.dp))
-                Text("سيتم إرسال الطلب للمراجعة من قِبل المالك وسيصلك إشعار عند التنفيذ.", color = Dim, fontSize = 10.sp)
-            }
-        }
-    )
-}
-
-@Composable
-fun ConfirmPackageIdDialog(
-    sectionTitle: String,
-    label: String,
-    priceUsd: Double,
-    onConfirm: (accountId: String) -> Unit,
-    onDismiss: () -> Unit
-) {
-    var accountId by remember { mutableStateOf("") }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {
-            TextButton(
-                enabled = accountId.trim().isNotEmpty(),
-                onClick = { onConfirm(accountId.trim()) }
-            ) { Text("تأكيد الشراء") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("إلغاء") } },
-        title = { Text(sectionTitle, color = OnBg) },
-        text = {
-            Column {
-                Text("الباقة المختارة: $label", color = OnBg, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(6.dp))
-                Text(String.format(java.util.Locale.getDefault(), "السعر المستحق: %.2f$", priceUsd), color = Dim)
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = accountId,
-                    onValueChange = { accountId = it },
-                    singleLine = true,
-                    label = { Text("معرّف اللاعب / Game ID") }
-                )
-                Spacer(Modifier.height(6.dp))
-                Text("أدخل رقم الحساب بدقة. الطلب لن يُرسل بدون هذا الحقل.", color = Dim, fontSize = 10.sp)
-            }
-        }
-    )
-}
-
-@Composable private fun ManualSectionsScreen(
-    title: String,
-    uid: String,
-    onBack: () -> Unit,
-    onToast: (String) -> Unit,
-    onAddNotice: (AppNotice) -> Unit
-) {
-    val scope = rememberCoroutineScope()
-    var selectedManualFlow by remember { mutableStateOf<String?>(null) }
-    var pendingUsd by remember { mutableStateOf<Int?>(null) }
-    var pendingPrice by remember { mutableStateOf<Double?>(null) }
-    var pendingPkgLabel by remember { mutableStateOf<String?>(null) }
-    var pendingPkgPrice by remember { mutableStateOf<Double?>(null) }
-
-    val items = when (title) {
-        "قسم شراء رصيد ايتونز" -> listOf("شراء رصيد ايتونز")
-        "قسم شراء رصيد هاتف"  -> listOf("شراء رصيد اثير", "شراء رصيد اسياسيل", "شراء رصيد كورك")
-        "قسم شحن شدات ببجي"    -> listOf("شحن شدات ببجي")
-        "قسم خدمات الودو"       -> listOf("شراء الماسات لودو", "شراء ذهب لودو")
-        else -> emptyList()
-    }
-    if (selectedManualFlow == null) {
-
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp).padding(bottom = 100.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = null, tint = OnBg) }
-            Spacer(Modifier.width(6.dp))
-            Text(title, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = OnBg)
-        }
-        Spacer(Modifier.height(10.dp))
-
-        items.forEach { name ->
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 8.dp)
-                    .clickable {
-                        selectedManualFlow = name
-                    },
-                colors = CardDefaults.cardColors(
-                    containerColor = Surface1,
-                    contentColor = OnBg
-                )
-            ) {
-                Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Filled.ChevronLeft, null, tint = Accent)
-                    Spacer(Modifier.width(8.dp))
-                    Text(name, fontWeight = FontWeight.SemiBold, color = OnBg)
-                }
-            }
-        }
-    }
-
-    // ----- Manual flows UI -----
-    }
-
-    // ---- Manual flows moved outside the null-check ----
-        when (selectedManualFlow) {
-            "شراء رصيد ايتونز" -> {
-                AmountGrid(
-                    title = "شراء رصيد ايتونز",
-                    subtitle = "اختر المبلغ",
-                    labelSuffix = "ايتونز",
-                    keyPrefix = "topup.itunes.",
-
-                    amounts = COMMON_AMOUNTS,
-                    priceOf = { usd -> usd.toDouble() },
-                    onSelect = { usd, price ->
-                        pendingUsd = usd
-                        pendingPrice = price
-                    },
-                    onBack = { selectedManualFlow = null; pendingUsd = null; pendingPrice = null }
-                )
-            }
-            "شراء رصيد اثير" -> {
-                AmountGrid(
-                    title = "شراء رصيد اثير",
-                    subtitle = "اختر المبلغ",
-                    labelSuffix = "اثير",
-                    keyPrefix = "topup.atheer.",
-
-                    amounts = COMMON_AMOUNTS,
-                    priceOf = { usd -> usd.toDouble() },
-                    onSelect = { usd, price ->
-                        pendingUsd = usd
-                        pendingPrice = price
-                    },
-                    onBack = { selectedManualFlow = null; pendingUsd = null; pendingPrice = null }
-                )
-            }
-            "شراء رصيد اسياسيل" -> {
-                AmountGrid(
-                    title = "شراء رصيد اسياسيل",
-                    subtitle = "اختر المبلغ",
-                    labelSuffix = "اسياسيل",
-                    keyPrefix = "topup.asiacell.",
-
-                    amounts = COMMON_AMOUNTS,
-                    priceOf = { usd -> usd.toDouble() },
-                    onSelect = { usd, price ->
-                        pendingUsd = usd
-                        pendingPrice = price
-                    },
-                    onBack = { selectedManualFlow = null; pendingUsd = null; pendingPrice = null }
-                )
-            }
-            "شراء رصيد كورك" -> {
-                AmountGrid(
-                    title = "شراء رصيد كورك",
-                    subtitle = "اختر المبلغ",
-                    labelSuffix = "كورك",
-                    keyPrefix = "topup.korek.",
-
-                    amounts = COMMON_AMOUNTS,
-                    priceOf = { usd -> usd.toDouble() },
-                    onSelect = { usd, price ->
-                        pendingUsd = usd
-                        pendingPrice = price
-                    },
-                    onBack = { selectedManualFlow = null; pendingUsd = null; pendingPrice = null }
-                )
-            }
-            "شحن شدات ببجي" -> {
-                // One-time version check & cache refresh for PUBG (on screen entry)
-                run {
-                    val ctx = LocalContext.current
-                    LaunchedEffect("pubg_once") {
-                        val srvVer = try { apiPublicPricingVersion() } catch (_: Throwable) { 0L }
-                        if (srvVer > 0L) {
-                            val prefix = "pkg.pubg."
-                            val amounts = pubgPackages.mapNotNull { extractDigits(it.label).toIntOrNull() }
-                            val localVer = PricingCache.getVersion(ctx, prefix, amounts)
-                            if (localVer != srvVer) {
-                                val keys = amounts.map { prefix + it }
-                                val fresh = try { /*DISABLED_LIVE_CALL*/ apiPublicPricingBulk(keys) } catch (_: Throwable) { emptyMap() }
-                                if (fresh.isNotEmpty()) {
-                                    PricingCache.save(ctx, prefix, amounts, fresh)
-                                    PricingCache.saveVersion(ctx, prefix, amounts, srvVer)
-                                }
-                            }
-                        }
-                    }
-                }
-                PackageGrid(
-                    title = "شحن شدات ببجي",
-                    subtitle = "اختر الباقة",
-                    packages = packagesWithOverrides(pubgPackages, "pkg.pubg.", "شدة"),
-                    onSelect = { opt ->
-                        pendingPkgLabel = opt.label
-                        pendingPkgPrice = opt.priceUsd
-                    },
-                    onBack = { selectedManualFlow = null; pendingUsd = null; pendingPrice = null }
-                )
-            }
-            "شراء الماسات لودو" -> {
-                // One-time version check & cache refresh for Ludo Diamonds (on screen entry)
-                run {
-                    val ctx = LocalContext.current
-                    LaunchedEffect("ludo_dia_once") {
-                        val srvVer = try { apiPublicPricingVersion() } catch (_: Throwable) { 0L }
-                        if (srvVer > 0L) {
-                            val prefix = "pkg.ludo.diamonds."
-                            val amounts = ludoDiamondsPackages.mapNotNull { extractDigits(it.label).toIntOrNull() }
-                            val localVer = PricingCache.getVersion(ctx, prefix, amounts)
-                            if (localVer != srvVer) {
-                                val keys = amounts.map { prefix + it }
-                                val fresh = try { /*DISABLED_LIVE_CALL*/ apiPublicPricingBulk(keys) } catch (_: Throwable) { emptyMap() }
-                                if (fresh.isNotEmpty()) {
-                                    PricingCache.save(ctx, prefix, amounts, fresh)
-                                    PricingCache.saveVersion(ctx, prefix, amounts, srvVer)
-                                }
-                            }
-                        }
-                    }
-                }
-                PackageGrid(
-                    title = "شراء الماسات لودو",
-                    subtitle = "اختر الباقة",
-                    packages = packagesWithOverrides(ludoDiamondsPackages, "pkg.ludo.diamonds.", "الماسة"),
-                    onSelect = { opt ->
-                        pendingPkgLabel = opt.label
-                        pendingPkgPrice = opt.priceUsd
-                    },
-                    onBack = { selectedManualFlow = null; pendingUsd = null; pendingPrice = null }
-                )
-            }
-            "شراء ذهب لودو" -> {
-                // One-time version check & cache refresh for Ludo Gold (on screen entry)
-                run {
-                    val ctx = LocalContext.current
-                    LaunchedEffect("ludo_gold_once") {
-                        val srvVer = try { apiPublicPricingVersion() } catch (_: Throwable) { 0L }
-                        if (srvVer > 0L) {
-                            val prefix = "pkg.ludo.gold."
-                            val amounts = ludoGoldPackages.mapNotNull { extractDigits(it.label).toIntOrNull() }
-                            val localVer = PricingCache.getVersion(ctx, prefix, amounts)
-                            if (localVer != srvVer) {
-                                val keys = amounts.map { prefix + it }
-                                val fresh = try { /*DISABLED_LIVE_CALL*/ apiPublicPricingBulk(keys) } catch (_: Throwable) { emptyMap() }
-                                if (fresh.isNotEmpty()) {
-                                    PricingCache.save(ctx, prefix, amounts, fresh)
-                                    PricingCache.saveVersion(ctx, prefix, amounts, srvVer)
-                                }
-                            }
-                        }
-                    }
-                }
-                PackageGrid(
-                    title = "شراء ذهب لودو",
-                    subtitle = "اختر الباقة",
-                    packages = packagesWithOverrides(ludoGoldPackages, "pkg.ludo.gold.", "ذهب"),
-                    onSelect = { opt ->
-                        pendingPkgLabel = opt.label
-                        pendingPkgPrice = opt.priceUsd
-                    },
-                    onBack = { selectedManualFlow = null; pendingUsd = null; pendingPrice = null }
-                )
-            }
-
-        }
-
-    
-    if (selectedManualFlow in listOf("شحن شدات ببجي","شراء الماسات لودو","شراء ذهب لودو") &&
-        pendingPkgLabel != null && pendingPkgPrice != null) {
-    ConfirmPackageIdDialog(
-        sectionTitle = selectedManualFlow!!,
-        label = pendingPkgLabel!!,
-        priceUsd = pendingPkgPrice!!,
-        onConfirm = { accountId ->
-            val flow = selectedManualFlow
-            val priceInt = pendingPkgPrice
-            scope.launch {
-                if (flow != null && priceInt != null) {
-                    val bal = apiGetBalance(uid) ?: 0.0
-                    if (bal < priceInt) {
-                        onToast("رصيدك غير كافٍ. السعر: ${'$'}$priceInt | رصيدك: ${"%.2f".format(bal)}${'$'}")
-                    } else {
-                        val product = when (flow) {
-                            "شحن شدات ببجي" -> "pubg_uc"
-                            "شراء الماسات لودو" -> "ludo_diamonds"
-                            "شراء ذهب لودو" -> "ludo_gold"
-                            else -> "manual"
-                        }
-                        val (ok, txt) = apiCreateManualPaidOrder(uid, product, priceInt.toDouble(), accountId)
-                        if (ok) {
-                            onToast("تم استلام طلبك (${pendingPkgLabel}).")
-                            onAddNotice(AppNotice("طلب معلّق", "تم إرسال طلب ${pendingPkgLabel} للمراجعة.", forOwner = false))
-                            onAddNotice(AppNotice("طلب جديد", "طلب ${pendingPkgLabel} من UID=${uid} (Player: ${accountId}) يحتاج مراجعة.", forOwner = true))
-                        } else {
-                            val msg = (txt ?: "").lowercase()
-                            if (msg.contains("insufficient")) {
-                                onToast("رصيدك غير كافٍ لإتمام العملية.")
-                            } else {
-                                onToast("تعذر إرسال الطلب. حاول لاحقًا.")
-                            }
-                        }
-                    }
-                }
-                pendingPkgLabel = null
-                pendingPkgPrice = null
-                selectedManualFlow = null
-            }
-        },
-        onDismiss = {
-            pendingPkgLabel = null
-            pendingPkgPrice = null
-        }
-    )
-}
-if (selectedManualFlow != null && pendingUsd != null && pendingPrice != null) {
-        ConfirmAmountDialog(
-            sectionTitle = selectedManualFlow!!,
-            usd = pendingUsd!!,
-            price = pendingPrice!!,
-            onConfirm = {
-                val flow = selectedManualFlow
-                val amount = pendingUsd
-                scope.launch {
-                    if (flow != null && amount != null) {
-                        val product = when (flow) {
-                            "شراء رصيد ايتونز" -> "itunes"
-                            "شراء رصيد اثير" -> "atheer"
-                            "شراء رصيد اسياسيل" -> "asiacell"
-                            "شراء رصيد كورك" -> "korek"
-                            else -> "manual"
-                        }
-                        val (ok, txt) = apiCreateManualPaidOrder(uid, product, amount)
-                        if (ok) {
-                            val label = "$flow ${amount}$"
-                            onToast("تم استلام طلبك ($label).")
-                            onAddNotice(AppNotice("طلب معلّق", "تم إرسال طلب $label للمراجعة.", forOwner = false))
-                            onAddNotice(AppNotice("طلب جديد", "طلب $label من UID=$uid يحتاج مراجعة.", forOwner = true))
-                        } else {
-                            val msg = (txt ?: "").lowercase()
-                            if (msg.contains("insufficient")) {
-                                onToast("رصيدك غير كافٍ لإتمام العملية.")
-                            } else {
-                                onToast("تعذر إرسال الطلب. حاول لاحقًا.")
-                            }
-                        }
-                    }
-                    pendingUsd = null
-                    pendingPrice = null
-                    selectedManualFlow = null
-                }
-            },
-            onDismiss = {
-                pendingUsd = null
-                pendingPrice = null
-            }
-        )
-    }
-
-}
-@Composable private fun WalletScreen(
-    uid: String,
-    noticeTick: Int = 0,
-    onAddNotice: (AppNotice) -> Unit,
-    onToast: (String) -> Unit
-) {
-    val scope = rememberCoroutineScope()
-    var balance by remember { mutableStateOf<Double?>(null) }
-    var askAsiacell by remember { mutableStateOf(false) }
-    var cardNumber by remember { mutableStateOf("") }
-    var sending by remember { mutableStateOf(false) }
-    val ctx = LocalContext.current
-    var banPopup by remember { mutableStateOf<String?>(null) }
-    var showPayTabs by remember { mutableStateOf(false) }
-    var payTabsAmount by remember { mutableStateOf("") }
-    var payTabsSending by remember { mutableStateOf(false) }
-    var payTabsUrl by remember { mutableStateOf<String?>(null) }
-
-    LaunchedEffect(Unit) { balance = apiGetBalance(uid) }
-    LaunchedEffect(noticeTick) { balance = apiGetBalance(uid) }
-
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Text("رصيدي", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = OnBg)
-        Spacer(Modifier.height(8.dp))
-        Text(
-            "الرصيد الحالي: ${balance?.let { "%.2f".format(it) } ?: ""}$",
-            fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = OnBg
-        )
-        Spacer(Modifier.height(16.dp))
-        Text("طرق الشحن:", fontWeight = FontWeight.SemiBold, color = OnBg)
-        Spacer(Modifier.height(8.dp))
-
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 8.dp)
-                .clickable {
-                    val until = loadAsiacellBanUntil(ctx)
-                    if (until > 0L && until > System.currentTimeMillis()) {
-                        val mins = asiacellBanRemainingMinutes(ctx)
-                        banPopup = "تم حضرك موقتا بسبب انتهاك سياسة التطبيق.\\nسينتهي الحظر بعد ${mins} دقيقة."
-                    } else {
-                        askAsiacell = true
-                    }
-                },
-            colors = CardDefaults.cardColors(containerColor = Surface1, contentColor = OnBg)
-        ) {
-            Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Filled.SimCard, null, tint = Accent)
-                Spacer(Modifier.width(8.dp))
-                Text("شحن عبر أسيا سيل (كارت)", fontWeight = FontWeight.SemiBold, color = OnBg)
-            }
-        }
-
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 8.dp)
-                .clickable { showPayTabs = true },
-            colors = CardDefaults.cardColors(containerColor = Surface1, contentColor = OnBg)
-        ) {
-            Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Filled.CreditCard, null, tint = Accent)
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    "شحن عبر بطاقة ماستر / فيزا (PayTabs)",
-                    fontWeight = FontWeight.SemiBold,
-                    color = OnBg
-                )
-            }
-        }
-    }
-
-    if (showPayTabs) {
-        AlertDialog(
-            onDismissRequest = { if (!payTabsSending) showPayTabs = false },
-            confirmButton = {
-                TextButton(enabled = !payTabsSending, onClick = {
-                    val amount = payTabsAmount.replace(',', '.').toDoubleOrNull()
-                    if (amount == null) {
-                        onToast("الرجاء إدخال مبلغ صحيح بالدولار.")
-                        return@TextButton
-                    }
-                    if (amount < 1.0) {
-                        onToast("أقل مبلغ للشحن هو 1 دولار.")
-                        return@TextButton
-                    }
-                    payTabsSending = true
-                    scope.launch {
-                        val url = apiCreatePayTabsPayment(uid, amount)
-                        payTabsSending = false
-                        if (url != null) {
-                            onAddNotice(
-                                AppNotice(
-                                    "شحن رصيد",
-                                    "تم إنشاء رابط دفع PayTabs بمبلغ ${amount}$",
-                                    forOwner = false
-                                )
-                            )
-                            payTabsUrl = url
-                            showPayTabs = false
-                            payTabsAmount = ""
-                        } else {
-                            onToast("فشل إنشاء رابط الدفع، حاول مرة أخرى.")
-                        }
-                    }
-                }) {
-                    Text(if (payTabsSending) "ينشئ الرابط" else "متابعة")
-                }
-            },
-            dismissButton = {
-                TextButton(enabled = !payTabsSending, onClick = { showPayTabs = false }) {
-                    Text("إلغاء")
-                }
-            },
-            title = { Text("شحن عبر بطاقة ماستر / فيزا", color = OnBg) },
-            text = {
-                Column {
-                    Text("أدخل مبلغ الشحن بالدولار (USD)", color = OnBg)
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = payTabsAmount,
-                        onValueChange = { payTabsAmount = it },
-                        label = { Text("المبلغ بالدولار") }
-                    )
-                }
-            }
-        )
-    }
-
-    
-    if (payTabsUrl != null) {
-        AlertDialog(
-            onDismissRequest = { payTabsUrl = null },
-            confirmButton = {
-                TextButton(onClick = { payTabsUrl = null }) {
-                    Text("إغلاق")
-                }
-            },
-            properties = DialogProperties(usePlatformDefaultWidth = false),
-            title = { Text("إتمام الدفع", color = OnBg) },
-            text = {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .fillMaxHeight(0.9f)
-                ) {
-                    AndroidView(
-                        modifier = Modifier.fillMaxSize(),
-                        factory = { context ->
-                            WebView(context).apply {
-                                settings.javaScriptEnabled = true
-                                settings.domStorageEnabled = true
-                                webViewClient = object : WebViewClient() {
-                                    override fun onPageFinished(view: WebView?, url: String?) {
-                                        super.onPageFinished(view, url)
-                                        val js = """
-                                            (function() {
-                                                try {
-                                                    // ابحث عن عنصر يحتوي على نص "وضع تجريبي"
-                                                    var nodes = document.querySelectorAll('div, span');
-                                                    var testNode = null;
-                                                    for (var i = 0; i < nodes.length; i++) {
-                                                        if (nodes[i].innerText && nodes[i].innerText.indexOf('وضع تجريبي') !== -1) {
-                                                            testNode = nodes[i];
-                                                            break;
-                                                        }
-                                                    }
-                                                    if (testNode && testNode.parentElement && testNode.parentElement.previousElementSibling) {
-                                                        // إخفاء القسم العلوي (الهيدر الأزرق) الذي يسبق الكارت الأبيض
-                                                        testNode.parentElement.previousElementSibling.style.display = 'none';
-                                                    }
-                                                } catch (e) {
-                                                    console.log('ratluzen header hide error', e);
-                                                }
-                                            })();
-                                        """.trimIndent()
-
-                                        view?.evaluateJavascript(js, null)
-                                    }
-                                }
-                                loadUrl(payTabsUrl!!)
-                            }
-                        },
-                        update = { view ->
-                            if (payTabsUrl != null && view.url != payTabsUrl) {
-                                view.loadUrl(payTabsUrl!!)
-                            }
-                        }
-                    )
-                }
-            }
-        )
-    }
-
-    if (askAsiacell) {
-        AlertDialog(
-            onDismissRequest = { if (!sending) askAsiacell = false },
-            confirmButton = {
-                val scope2 = rememberCoroutineScope()
-                TextButton(enabled = !sending, onClick = {
-                    val digits = cardNumber.filter { it.isDigit() }
-                    if (digits.length <= 10) return@TextButton
-
-                    val (allowed, _) = asiacellPreCheckAndRecord(ctx, digits)
-                    if (!allowed) {
-                        askAsiacell = false
-                        sending = false
-                        val mins = asiacellBanRemainingMinutes(ctx)
-                        banPopup = "تم حضرك موقتا بسبب انتهاك سياسة التطبيق.\\nسينتهي الحظر بعد ${mins} دقيقة."
-                        onToast("تم حضرك موقتا بسبب انتهاك سياسة التطبيق")
-                        return@TextButton
-                    }
-
-                    sending = true
-                    scope2.launch {
-                        val ok = apiSubmitAsiacellCard(uid, digits)
-                        if (ok) { balance = apiGetBalance(uid) }
-                        sending = false
-                        if (ok) {
-                            onAddNotice(AppNotice("تم استلام كارتك", "تم إرسال كارت أسيا سيل إلى المالك للمراجعة.", forOwner = false))
-                            onAddNotice(AppNotice("كارت أسيا سيل جديد", "UID=$uid | كارت: $digits", forOwner = true))
-                            onToast("تم إرسال الكارت بنجاح")
-                            cardNumber = ""
-                            askAsiacell = false
-                        } else {
-                            onAddNotice(AppNotice("فشل إرسال الكارت", "تحقق من الاتصال وحاول مجددًا.", forOwner = false))
-                            onToast("فشل إرسال الكارت")
-                        }
-                    }
-                }) { Text(if (sending) "يرسل" else "إرسال") }
-            },
-            dismissButton = { TextButton(enabled = !sending, onClick = { askAsiacell = false }) { Text("إلغاء") } },
-            title = { Text("شحن عبر أسيا سيل", color = OnBg) },
-            text = {
-                Column {
-                    Text("أدخل رقم الكارت (فوق 10 أرقام):", color = Dim, fontSize = 10.sp)
-                    Spacer(Modifier.height(6.dp))
-                    OutlinedTextField(
-                        value = cardNumber,
-                        onValueChange = { s -> if (s.all { it.isDigit() }) cardNumber = s },
-                        singleLine = true,
-                        label = { Text("رقم الكارت") },
-                        colors = OutlinedTextFieldDefaults.colors(
-                            cursorColor = Accent,
-                            focusedBorderColor = Accent, unfocusedBorderColor = Dim,
-                            focusedLabelColor = OnBg, unfocusedLabelColor = Dim
-                        )
-                    )
-                }
-            }
-        )
-    }
-
-    banPopup?.let { msg ->
-        AlertDialog(
-            onDismissRequest = { banPopup = null },
-            confirmButton = { TextButton(onClick = { banPopup = null }) { Text("حسنًا") } },
-            title = { Text("تنبيه", color = OnBg) },
-            text = { Text(msg, color = OnBg) }
-        )
-    }
-}
-/* =========================
-   تبويب طلباتي
-   ========================= */
-@Composable private fun OrdersScreen(uid: String) {
-    var orders by remember { mutableStateOf<List<OrderItem>?>(null) }
-    var loading by remember { mutableStateOf(true) }
-    var err by remember { mutableStateOf<String?>(null) }
-
-    LaunchedEffect(uid) {
-        loading = true
-        err = null
-        orders = apiGetMyOrders(uid).also { loading = false }
-        if (orders == null) err = "تعذر جلب الطلبات"
-    }
-
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Text("طلباتي", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = OnBg)
-        Spacer(Modifier.height(10.dp))
-
-        when {
-            loading -> Text("يتم التحميل", color = Dim)
-            err != null -> Text(err!!, color = Bad)
-            orders.isNullOrEmpty() -> Text("لا توجد طلبات حتى الآن.", color = Dim)
-            else -> LazyColumn {
-                items(orders!!) { o ->
-                    Card(
-                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                        colors = CardDefaults.cardColors(containerColor = Surface1, contentColor = OnBg)
-                    ) {
-                        Column(Modifier.padding(16.dp)) {
-                            Text(o.title, fontWeight = FontWeight.SemiBold, color = OnBg)
-                            Text("الكمية: ${o.quantity} | السعر: ${"%.2f".format(o.price)}$", color = Dim, fontSize = 10.sp)
-                            Text("المعرف: ${o.id}", color = Dim, fontSize = 10.sp)
-                            Text("الحالة: ${o.status}", color = when (o.status) {
-                                OrderStatus.Done -> Good
-                                OrderStatus.Rejected -> Bad
-                                OrderStatus.Refunded -> Accent
-                                else -> OnBg
-                            }, fontSize = 10.sp)
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/* =========================
-   فلاتر لتصنيف الطلبات
-   ========================= */
-
-private fun isIraqTelcoCardPurchase(title: String): Boolean {
-    val t = title.lowercase()
-    // must be one of the 3 Iraqi telcos
-    val telco = t.contains("اثير") || t.contains("asiacell") || t.contains("أسيا") || t.contains("اسياسيل") || t.contains("korek") || t.contains("كورك")
-    // words that indicate physical/virtual CARD purchase (not direct top-up)
-    val hasCardWord = t.contains("شراء") || t.contains("كارت") || t.contains("بطاقة") || t.contains("voucher") || t.contains("كود") || t.contains("رمز")
-    // negative list: anything that implies DIRECT TOP-UP / via Asiacell
-    val isTopup = t.contains("شحن") || t.contains("topup") || t.contains("top-up") || t.contains("recharge") || t.contains("شحن عبر") || t.contains("شحن اسيا") || t.contains("direct")
-    // explicitly exclude iTunes
-    val notItunes = !t.contains("itunes") && !t.contains("ايتونز")
-    // accept only if telco + card purchase semantics, and strictly NOT a top-up wording
-    return telco && hasCardWord && !isTopup && notItunes
-}
-
-private fun isPhoneTopupTitle(title: String): Boolean {
-    val t = title.lowercase()
-    return t.contains("شراء رصيد") || t.contains("رصيد هاتف")
-            || t.contains("اثير") || t.contains("اسياسيل") || t.contains("أسيا") || t.contains("asiacell")
-            || t.contains("كورك")
-}
-/* ✅ تشديد تعريف “طلب API” حتى لا تظهر الطلبات اليدوية (ومنها أسيا سيل) داخل قسم الخدمات */
-private fun isApiOrder(o: OrderItem): Boolean {
-    val tl = o.title.lowercase()
-    val notManualPhone = !isPhoneTopupTitle(o.title)
-    val notItunes = !tl.contains("ايتونز") && !tl.contains("itunes")
-    val notPubg = !tl.contains("ببجي") && !tl.contains("pubg")
-    val notLudo = !tl.contains("لودو") && !tl.contains("ludo")
-    val notCard = !tl.contains("كارت") && !tl.contains("card")
-    // طلب API يجب أن يكون له quantity > 0 (خدمات المزود) ولا ينتمي لأي قسم يدوي:
-    return (o.quantity > 0) && notManualPhone && notItunes && notPubg && notLudo && notCard
-}
-
-/* =========================
-   لوحة تحكم المالك
-   ========================= */
-@Composable private fun OwnerPanel(
-    token: String?,
-    onNeedLogin: () -> Unit,
-    onToast: (String) -> Unit
-) {
-    var current by remember { mutableStateOf<String?>(null) }
-
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            Text("لوحة تحكم المالك", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = OnBg, modifier = Modifier.weight(1f))
-            // [Removed] أيقونة الجرس الصغيرة داخل شاشة المالك بناءً على طلبك
-}
-        Spacer(Modifier.height(12.dp))
-
-        fun needToken(): Boolean {
-            if (token.isNullOrBlank()) {
-                onToast("سجل دخول المالك أولًا من الإعدادات.")
-                onNeedLogin()
-                return true
-            }
-            return false
-        }
-
-        if (current == null) {
-            val buttons = listOf(
-                "طلبات خدمات API المعلقة" to "pending_services",
-                "طلبات الايتونز المعلقة"   to "pending_itunes",
-                "طلبات ببجي المعلقة"          to "pending_pubg",
-                "طلبات لودو المعلقة"       to "pending_ludo",
-                "طلبات شراء الكارتات"    to "pending_phone",   // ✅ جديد
-                "طلبات شحن أسيا سيل"     to "pending_cards",
-                "إضافة الرصيد"             to "topup",
-                "خصم الرصيد"               to "deduct",
-                "عدد المستخدمين"           to "users_count",
-                "أرصدة المستخدمين"         to "users_balances",
-                "فحص رصيد API"             to "provider_balance",
-                            "تغيير رقم خدمات API" to "edit_svc_ids",
-                "تغيير الأسعار والكميات" to "edit_pricing",
-                "إعلان التطبيق"           to "announce",
-)
-            buttons.chunked(2).forEach { row ->
-                Row(Modifier.fillMaxWidth()) {
-                    row.forEach { (title, key) ->
-                        ElevatedButton(
-                            onClick = { if (!needToken()) current = key },
-                            modifier = Modifier.weight(1f)
-                                .padding(4.dp),
-                            colors = ButtonDefaults.elevatedButtonColors(
-                                containerColor = Accent.copy(alpha = 0.18f),
-                                contentColor = OnBg
-                            )
-                        ) { Text(title, fontSize = 10.sp) }
-                    }
-                    if (row.size == 1) Spacer(Modifier.weight(1f))
-                }
-            }
-        } else {
-            when (current) {
-                "announce" -> AdminAnnouncementsHub(token = token!!, onBack = { current = null })
-                "edit_svc_ids" -> ServiceIdEditorScreen(
-                    token = token!!,
-                    onBack = { current = null }
-                )
-
-"edit_pricing" -> PricingEditorScreen(
-    token = token!!,
-    onBack = { current = null }
+# =========================
+# FastAPI
+# =========================
+app = FastAPI(title="SMM Backend", version="1.9.3")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"]
 )
 
-                "pending_services" -> AdminPendingGenericList(
-                    title = "طلبات خدمات API المعلقة",
-                    token = token!!,
-                    fetchUrl = AdminEndpoints.pendingServices,
-                    itemFilter = { true },                  // ✅ فقط طلبات API
-                    approveWithCode = false,
-                    onBack = { current = null }
+# ===== Helpers =====
+
+def _tokens_for_uid(cur, uid: str):
+    """Return list of FCM tokens for a uid from user_devices or fallback to users.fcm_token"""
+    try:
+        cur.execute("SELECT fcm_token FROM public.user_devices WHERE uid=%s", (uid,))
+        rows = cur.fetchall()
+        toks = [r[0] for r in rows if r and r[0]]
+        if toks:
+            return toks
+    except Exception:
+        pass
+    cur.execute("SELECT fcm_token FROM public.users WHERE uid=%s", (uid,))
+    r = cur.fetchone()
+    return [r[0]] if r and r[0] else []
+
+def _require_admin(passwd: str):
+    if passwd != ADMIN_PASSWORD:
+        raise HTTPException(401, "bad admin password")
+
+def _payload_is_jsonb(conn) -> bool:
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_typeof(payload)::text FROM public.orders LIMIT 1")
+            row = cur.fetchone()
+            return bool(row and isinstance(row[0], str) and row[0].lower() == "jsonb")
+    except Exception:
+        return False
+
+async def _read_json_object(request: Request) -> Dict[str, Any]:
+    try:
+        data = await request.json()
+    except Exception:
+        raw = (await request.body()).decode("utf-8", errors="ignore").strip()
+        data = json.loads(raw) if raw else {}
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise HTTPException(400, "Body must be a JSON object")
+    return data
+
+
+def _notify_user(_conn_ignored, user_id: int, order_id: Optional[int], title: str, body: str):
+    """
+    SAFE: open a fresh DB connection (no recursive re-entry).
+    Inserts DB notification + pushes FCM to all user's devices.
+    """
+    c = get_conn()
+    try:
+        uid = None
+        tokens: List[str] = []
+        try:
+            with c, c.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at) "
+                    "VALUES (%s,%s,%s,%s,'unread', NOW())",
+                    (user_id, order_id, title, body)
                 )
-                "pending_itunes" -> PendingItunesWithTools(
-                    token = token!!,
-                    onBack = { current = null }
+                cur.execute("SELECT uid FROM public.users WHERE id=%s", (user_id,))
+                row = cur.fetchone()
+                uid = row[0] if row else None
+                if uid:
+                    tokens = _tokens_for_uid(cur, uid)
+        except Exception as e:
+            logger.exception("notify user failed (DB): %s", e)
+
+        for t in tokens:
+            try:
+                _fcm_send_push(t, title, body, order_id)
+            except Exception as e:
+                logger.exception("notify user push error: %s", e)
+    finally:
+        put_conn(c)
+
+def _ensure_user(cur, uid: str) -> int:
+    cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+    r = cur.fetchone()
+    if r:
+        return int(r[0])
+    cur.execute("INSERT INTO public.users(uid) VALUES(%s) RETURNING id", (uid,))
+    return int(cur.fetchone()[0])
+
+def _ensure_owner_user_id(cur) -> int:
+    cur.execute("SELECT id FROM public.users WHERE uid=%s", (OWNER_UID,))
+    r = cur.fetchone()
+    if r and r[0]:
+        return int(r[0])
+    cur.execute("INSERT INTO public.users(uid) VALUES(%s) RETURNING id", (OWNER_UID,))
+    return int(cur.fetchone()[0])
+
+def _notify_owner_new_order(_conn_ignored, order_id: int):
+    """
+    SAFE: open fresh connection, insert notification for OWNER, push FCM to owner devices.
+    """
+    n_title = "طلب جديد"
+    n_body  = f"طلب جديد رقم {order_id}"
+    c = get_conn()
+    try:
+        tokens: List[str] = []
+        try:
+            with c, c.cursor() as cur:
+                # enrich body with order title + user uid if available
+                try:
+                    cur.execute("""
+                        SELECT o.title, u.uid
+                        FROM public.orders o
+                        LEFT JOIN public.users u ON u.id = o.user_id
+                        WHERE o.id=%s
+                    """, (order_id,))
+                    row = cur.fetchone()
+                    if row:
+                        otitle = row[0] or ""
+                        u_uid = row[1] or ""
+                        n_body = f"طلب جديد رقم {order_id}: {otitle}" + (f" | UID: {u_uid}" if u_uid else "")
+                except Exception:
+                    pass
+
+                owner_id = _ensure_owner_user_id(cur)
+                cur.execute(
+                    "INSERT INTO public.user_notifications(user_id, order_id, title, body, status, created_at) "
+                    "VALUES (%s,%s,%s,%s,'unread', NOW())",
+                    (owner_id, order_id, n_title, n_body)
                 )
-                // original params moved out to avoid signature mismatch:
-                // fetchUrl = AdminEndpoints.pendingItunes,
-                // itemFilter = { true },
-                // approveWithCode = true,
-                // codeFieldLabel = "كود الايتونز",
-//                     title = "طلبات ببجي المعلقة",
-                "pending_pubg" -> AdminPendingGenericList(
-//                 "pending_pubg" -> AdminPendingGenericList(
-                    title = "طلبات ببجي المعلقة",
-                    token = token!!,
-                    fetchUrl = AdminEndpoints.pendingPubg,
-                    itemFilter = { true },
-                    approveWithCode = false,
-                    onBack = { current = null }
-                )
-                "pending_ludo" -> AdminPendingGenericList(
-                    title = "طلبات لودو المعلقة",
-                    token = token!!,
-                    fetchUrl = AdminEndpoints.pendingLudo,
-                    itemFilter = { true },
-                    approveWithCode = false,
-                    onBack = { current = null }
-                )
-                "pending_phone" -> PendingPhoneCardsWithTools(
-                    token = token!!,
-                    onBack = { current = null }
-                )
-//                     approveWithCode = true,                                      // ✅ يطلب رقم الكارت
-//                     codeFieldLabel = "كود الكارت",
-//                     onBack = { current = null }
-//                 )
-                // ✅ شاشة الكروت المعلّقة الخاصة — UID + كارت + تنفيذ/رفض + وقت
-                "pending_cards" -> AdminPendingCardsScreen(
-                    token = token!!,
-                    onBack = { current = null }
-                )
-                // إجراءات رصيد
-                "topup" -> TopupDeductScreen(
-                    title = "إضافة الرصيد",
-                    token = token!!,
-                    endpoint = AdminEndpoints.walletTopup,
-                    onBack = { current = null }
-                )
-                "deduct" -> TopupDeductScreen(
-                    title = "خصم الرصيد",
-                    token = token!!,
-                    endpoint = AdminEndpoints.walletDeduct,
-                    onBack = { current = null }
-                )
-                "users_count" -> UsersCountScreen(
-                    token = token!!,
-                    onBack = { current = null }
-                )
-                "users_balances" -> UsersBalancesScreen(
-                    token = token!!,
-                    onBack = { current = null }
-                )
-                "provider_balance" -> ProviderBalanceScreen(
-                    token = token!!,
-                    onBack = { current = null }
-                )
-            }
-        }
-    }
-}
-
-/** قائمة عامة للمعلّقات مع مُرشِّح OrderItem + خيار “تنفيذ بكود” */
-
-/* =========================
-   Pending Wrappers with Tools
-   ========================= */
-
-@Composable private fun PendingItunesWithTools(
-    token: String,
-    onBack: () -> Unit
-) {
-    var reloadKey by remember { mutableStateOf(0) }
-    var showAdd by remember { mutableStateOf(false) }
-    var showView by remember { mutableStateOf(false) }
-    var autoEnabled by remember { mutableStateOf(false) }
-    var loadingAuto by remember { mutableStateOf(true) }
-    val scope = rememberCoroutineScope()
-
-    LaunchedEffect(Unit, reloadKey) {
-        loadingAuto = true
-        autoEnabled = adminAutoExecGetScoped(token, "itunes")
-        loadingAuto = false
-    }
-
-    Column(Modifier.fillMaxSize()) {
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(16.dp)) {
-            IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, null, tint = OnBg) }
-            Spacer(Modifier.width(6.dp))
-            Text("طلبات iTunes المعلقة", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = OnBg)
-        }
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
-                Text("التنفيذ التلقائي", color = OnBg)
-                Spacer(Modifier.width(6.dp))
-                Switch(
-                    checked = autoEnabled,
-                    enabled = !loadingAuto,
-                    onCheckedChange = { en ->
-                        scope.launch {
-                            loadingAuto = true
-                            val ok = adminAutoExecSetScoped(token, "itunes", en)
-                            if (ok) autoEnabled = en
-                            loadingAuto = false
-                        }
-                    },
-                    colors = SwitchDefaults.colors(
-                        checkedTrackColor = Accent.copy(alpha = 0.45f),
-                        checkedThumbColor = Accent
-                    )
-                )
-            }
-            OutlinedButton(onClick = { showAdd = true }) { Text("إضافة أكواد") }
-            OutlinedButton(onClick = { showView = true }) { Text("عرض الأكواد") }
-        }
-
-        Spacer(Modifier.height(8.dp))
-        Divider(color = Surface1)
-        // القائمة المعتادة تحت الأزرار
-        AdminPendingGenericList(
-            title = "",
-            token = token,
-            fetchUrl = AdminEndpoints.pendingItunes,
-            itemFilter = { true },
-            approveWithCode = true,
-            codeFieldLabel = "كود الايتونز",
-            onBack = onBack
-        )
-    }
-
-    if (showAdd) {
-        CodesAddDialog(
-            title = "إضافة أكواد iTunes",
-            telcoTabs = false,
-            serviceName = "itunes",
-            onSubmit = { telco, category, codes ->
-                scope.launch {
-                    val ok = apiAdminAddItunesCodes(token, category ?: "", codes)
-                    showAdd = false
-                }
-            },
-            onDismiss = { showAdd = false }
-        )
-    }
-    if (showView) {
-        CodesListDialogItunes(
-            token = token,
-            onDismiss = { showView = false }
-        )
-    }
-}
-
-@Composable private fun PendingPhoneCardsWithTools(
-    token: String,
-    onBack: () -> Unit
-) {
-    var showAdd by remember { mutableStateOf(false) }
-    var showView by remember { mutableStateOf(false) }
-    var autoEnabled by remember { mutableStateOf(false) }
-    var loadingAuto by remember { mutableStateOf(true) }
-    val scope = rememberCoroutineScope()
-
-    LaunchedEffect(Unit) {
-        loadingAuto = true
-        autoEnabled = adminAutoExecGetScoped(token, "cards")
-        loadingAuto = false
-    }
-
-    Column(Modifier.fillMaxSize()) {
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(16.dp)) {
-            IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, null, tint = OnBg) }
-            Spacer(Modifier.width(6.dp))
-            Text("طلبات شراء الكارتات", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = OnBg)
-        }
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
-                Text("التنفيذ التلقائي", color = OnBg)
-                Spacer(Modifier.width(6.dp))
-                Switch(
-                    checked = autoEnabled,
-                    enabled = !loadingAuto,
-                    onCheckedChange = { en ->
-                        scope.launch {
-                            loadingAuto = true
-                            val ok = adminAutoExecSetScoped(token, "cards", en)
-                            if (ok) autoEnabled = en
-                            loadingAuto = false
-                        }
-                    },
-                    colors = SwitchDefaults.colors(
-                        checkedTrackColor = Accent.copy(alpha = 0.45f),
-                        checkedThumbColor = Accent
-                    )
-                )
-            }
-            OutlinedButton(onClick = { showAdd = true }) { Text("إضافة أكواد") }
-            OutlinedButton(onClick = { showView = true }) { Text("عرض الأكواد") }
-        }
-
-        Spacer(Modifier.height(8.dp))
-        Divider(color = Surface1)
-
-        AdminPendingGenericList(
-            title = "",
-            token = token,
-            fetchUrl = AdminEndpoints.pendingBalances,
-            itemFilter = { item -> isIraqTelcoCardPurchase(item.title) },
-            approveWithCode = true,
-            codeFieldLabel = "كود الكارت",
-            onBack = onBack
-        )
-    }
-
-    if (showAdd) {
-        CodesAddDialog(
-            title = "إضافة أكواد رصيد الهاتف",
-            telcoTabs = true,
-            onSubmit = { telco, category, codes ->
-                val tel = telco ?: "asiacell"
-                scope.launch {
-                    val ok = apiAdminAddCardCodes(token, tel, category ?: "", codes)
-                    showAdd = false
-                }
-            },
-            onDismiss = { showAdd = false }
-        )
-    }
-    if (showView) {
-        CodesListDialogCards(
-            token = token,
-            onDismiss = { showView = false }
-        )
-    }
-}
-
-/* ===== Dialogs ===== */
-
-@Composable private fun CodesAddDialog(
-    title: String,
-    telcoTabs: Boolean,
-    categories: List<String> = listOf("5","10","15","20","25","30","40","50","100"),
-    serviceName: String? = null, // e.g. "itunes" for iTunes
-    onSubmit: (telco: String?, category: String?, codes: List<String>) -> Unit,
-    onDismiss: () -> Unit
-) {
-    var selectedTab by remember { mutableStateOf(0) } // 0: asiacell, 1: atheir, 2: korek when telcoTabs
-    var selectedCategoryIdx by remember { mutableStateOf(0) }
-    var text by remember { mutableStateOf(TextFieldValue("")) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {
-            TextButton(onClick = {
-                val clean = text.text.split('\n').map { it.trim() }.filter { it.isNotEmpty() }
-                val telco = if (telcoTabs) listOf("atheir","asiacell","korek")[selectedTab] else null
-                val category = categories.getOrNull(selectedCategoryIdx)
-                onSubmit(telco, category, clean)
-            }) { Text("حفظ") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("إلغاء") } },
-        title = { Text(title, color = OnBg) },
-        text = {
-            Column {
-                if (telcoTabs) {
-                    TabRow(selectedTabIndex = selectedTab, containerColor = Surface1, contentColor = OnBg) {
-                        listOf("أثير","أسيا سيل","كورك").forEachIndexed { i, label ->
-                            Tab(selected = selectedTab==i, onClick = { selectedTab = i }, text = { Text(label) })
-                        }
-                    }
-                    Spacer(Modifier.height(8.dp))
-                }
-                // Category selector
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("الفئة", color = OnBg)
-                    Spacer(Modifier.width(12.dp))
-                    var expanded by remember { mutableStateOf(false) }
-                    Box {
-                        OutlinedButton(onClick = { expanded = true }) {
-                            Text(categories.getOrNull(selectedCategoryIdx) ?: categories.firstOrNull() ?: "")
-                        }
-                        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                            categories.forEachIndexed { i, c ->
-                                DropdownMenuItem(text = { Text(c) }, onClick = { selectedCategoryIdx = i; expanded = false })
-                            }
-                        }
-                    }
-                }
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = text,
-                    onValueChange = { text = it },
-                    modifier = Modifier.fillMaxWidth().height(160.dp),
-                    textStyle = LocalTextStyle.current.copy(color = OnBg),
-                    label = { Text("ألصق الأكواد (كل سطر كود)") }
-                )
-            }
-        }
-    )
-}
-
-@Composable private fun CodesListDialogItunes(
-    token: String,
-    onDismiss: () -> Unit
-) {
-    var list by remember { mutableStateOf<List<StoredCode>>(emptyList()) }
-    var loading by remember { mutableStateOf(true) }
-    val scope = rememberCoroutineScope()
-    LaunchedEffect(Unit) {
-        loading = true
-        list = apiAdminListItunesCodes(token).filter { !it.used }
-        loading = false
-    }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = { TextButton(onClick = onDismiss) { Text("إغلاق") } },
-        title = { Text("أكواد iTunes غير المستخدمة", color = OnBg) },
-        text = {
-            if (loading) {
-                CircularProgressIndicator()
-            } else {
-                LazyColumn(Modifier.height(300.dp)) {
-                    items(list) { c ->
-                        Row(Modifier.fillMaxWidth().padding(vertical=6.dp), verticalAlignment = Alignment.CenterVertically) {
-                            SelectionContainer { Text("[الخدمة: ${c.service ?: (c.telco ?: "—")}] [الفئة: ${c.category ?: "-"}]  ${c.code}", color = OnBg) }
-                            Spacer(Modifier.weight(1f))
-                            TextButton(onClick = {
-                                scope.launch {
-                                    if (apiAdminDeleteItunesCode(token, c.id)) {
-                                        list = list.filter { it.id != c.id }
-                                    }
-                                }
-                            }) { Text("حذف") }
-                        }
-                    }
-                }
-            }
-        }
-    )
-}
-
-@Composable private fun CodesListDialogCards(
-    token: String,
-    onDismiss: () -> Unit
-) {
-    var selectedTab by remember { mutableStateOf(0) }
-    var map by remember { mutableStateOf<Map<String,List<StoredCode>>>(emptyMap()) }
-    var loading by remember { mutableStateOf(true) }
-    val scope = rememberCoroutineScope()
-
-    fun telByIdx(i:Int) = listOf("atheir","asiacell","korek")[i]
-    fun label(i:Int) = listOf("أثير","أسيا سيل","كورك")[i]
-
-    LaunchedEffect(Unit) {
-        loading = true
-        val a = apiAdminListCardCodes(token, "atheir").filter { !it.used }
-        val b = apiAdminListCardCodes(token, "asiacell").filter { !it.used }
-        val c = apiAdminListCardCodes(token, "korek").filter { !it.used }
-        map = mapOf("atheir" to a, "asiacell" to b, "korek" to c)
-        loading = false
-    }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = { TextButton(onClick = onDismiss) { Text("إغلاق") } },
-        title = { Text("أكواد رصيد الهاتف غير المستخدمة", color = OnBg) },
-        text = {
-            Column {
-                TabRow(selectedTabIndex = selectedTab, containerColor = Surface1, contentColor = OnBg) {
-                    (0..2).forEach { i -> Tab(selected = selectedTab==i, onClick = { selectedTab = i }, text = { Text(label(i)) }) }
-                }
-                Spacer(Modifier.height(8.dp))
-                if (loading) {
-                    CircularProgressIndicator()
-                } else {
-                    val list = map[telByIdx(selectedTab)] ?: emptyList()
-                    LazyColumn(Modifier.height(280.dp)) {
-                        items(list) { c ->
-                            Row(Modifier.fillMaxWidth().padding(vertical=6.dp), verticalAlignment = Alignment.CenterVertically) {
-                                SelectionContainer { Text("[الخدمة: ${c.service ?: (c.telco ?: "—")}] [الفئة: ${c.category ?: "-"}]  ${c.code}", color = OnBg) }
-                                Spacer(Modifier.weight(1f))
-                                TextButton(onClick = {
-                                    scope.launch {
-                                        if (apiAdminDeleteCardCode(token, telByIdx(selectedTab), c.id)) {
-                                            map = map.toMutableMap().also { m ->
-                                                m[telByIdx(selectedTab)] = list.filter { it.id != c.id }
-                                            }
-                                        }
-                                    }
-                                }) { Text("حذف") }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    )
-}
-
-/* =========================
-   /Pending Wrappers with Tools
-   ========================= */
-@Composable private fun AdminPendingGenericList(
-    title: String,
-    token: String,
-    fetchUrl: String,
-    itemFilter: ((OrderItem) -> Boolean)?,
-    approveWithCode: Boolean,
-    codeFieldLabel: String = "الرمز/الكود",
-    onBack: () -> Unit
-) {
-    val scope = rememberCoroutineScope()
-    var list by remember { mutableStateOf<List<OrderItem>?>(null) }
-    var loading by remember { mutableStateOf(true) }
-    var err by remember { mutableStateOf<String?>(null) }
-    var reloadKey by remember { mutableStateOf(0) }
-    var snack by remember { mutableStateOf<String?>(null) }
-
-    // Auto-exec toggle state (only used for pendingServices list)
-    var autoEnabled by remember { mutableStateOf(false) }
-    var autoBusy by remember { mutableStateOf(false) }
-    
-    var approveFor by remember { mutableStateOf<OrderItem?>(null) }
-    var codeText by remember { mutableStateOf("") }
-
-    
-    LaunchedEffect(Unit) {
-        if (fetchUrl == AdminEndpoints.pendingServices) {
-            runCatching { autoEnabled = adminAutoExecStatus(token) }
-        }
-    }
-    
-    LaunchedEffect(autoEnabled) {
-        if (fetchUrl == AdminEndpoints.pendingServices && autoEnabled) {
-            while (autoEnabled) {
-                runCatching { adminAutoExecRun(token, limit = 3, onlyWhenEnabled = true) }
-                kotlinx.coroutines.delay(8000)
-            }
-        }
-    }
-    LaunchedEffect(reloadKey) {
-        loading = true; err = null
-        val (code, txt) = httpGet(fetchUrl, headers = mapOf("x-admin-password" to token))
-        if (code in 200..299 && txt != null) {
-            try {
-                val parsed = mutableListOf<OrderItem>()
-                val trimmed = txt.trim()
-                val arr: JSONArray = if (trimmed.startsWith("[")) {
-                    JSONArray(trimmed)
-                } else {
-                    val obj = JSONObject(trimmed)
-                    when {
-                        obj.has("list") -> obj.optJSONArray("list") ?: JSONArray()
-                        obj.has("data") -> obj.optJSONArray("data") ?: JSONArray()
-                        else -> JSONArray()
-                    }
-                }
-                for (i in 0 until arr.length()) {
-                    val o = arr.getJSONObject(i)
-                    val item = OrderItem(
-                        id = o.optString("id", o.optInt("id", 0).toString()),
-                        title = o.optString("title",""),
-                        quantity = o.optInt("quantity", 0),
-                        price = o.optDouble("price", 0.0),
-                        payload = o.optString("link",""),
-                        status = OrderStatus.Pending,
-                        createdAt = o.optLong("created_at", 0L),
-                        uid = o.optString("uid",""),
-                        accountId = o.optString("account_id","")
-                    )
-if (itemFilter == null || itemFilter.invoke(item)) {
-                        parsed += item
-                    }
-                }
-                list = parsed
-            } catch (_: Exception) {
-                list = null
-                err = "تعذر جلب البيانات"
-            }
-        } else {
-            list = null
-            err = "تعذر جلب البيانات"
-        }
-        loading = false
-    }
-
-    suspend fun doApprovePlain(id: String): Boolean =
-        apiAdminPOST(String.format(AdminEndpoints.orderApprove, id.toInt()), token)
-
-    suspend fun doDeliverPlain(id: String): Boolean =
-        apiAdminPOST(String.format(AdminEndpoints.orderDeliver, id.toInt()), token)
-
-    suspend fun doReject(id: String): Boolean =
-        apiAdminPOST(String.format(AdminEndpoints.orderReject, id.toInt()), token, JSONObject().put("reason","Rejected by owner"))
-
-    suspend fun doDeliverWithCode(id: String, code: String): Boolean =
-        apiAdminPOST(
-            String.format(AdminEndpoints.orderDeliver, id.toInt()),
-            token,
-            JSONObject().put("code", code)            // ✅ يمرّر الكود للباكند
-        )
-
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = null, tint = OnBg) }
-            Spacer(Modifier.width(6.dp))
-            Text(title, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = OnBg)
-        }
-        Spacer(Modifier.height(10.dp))
-        if (fetchUrl == AdminEndpoints.pendingServices) {
-            Spacer(Modifier.height(8.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("تنفيذ تلقائي", fontSize = 16.sp, color = OnBg)
-                Switch(
-                    checked = autoEnabled,
-                    onCheckedChange = { on ->
-                        autoEnabled = on
-                        if (!autoBusy) {
-                            autoBusy = true
-                            scope.launch {
-                                runCatching { adminAutoExecToggle(token, on) }
-                                autoBusy = false
-                            }
-                        }
-                    },
-                    enabled = !autoBusy
-                )
-            }
-        }
-
-
-        when {
-            loading -> Text("يتم التحميل", color = Dim)
-            err != null -> Text(err!!, color = Bad)
-            list.isNullOrEmpty() -> Text("لا يوجد شيء معلق.", color = Dim)
-            else -> LazyColumn {
-                items(list!!) { o ->
-                    val dt = if (o.createdAt > 0) {
-                        SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault()).format(Date(o.createdAt))
-                    } else ""
-                    Card(
-                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                        colors = CardDefaults.cardColors(containerColor = Surface1, contentColor = OnBg)
-                    ) {
-                        Column(Modifier.padding(16.dp)) {
-                            Text(o.title, fontWeight = FontWeight.SemiBold, color = OnBg)
-                            if (o.uid.isNotBlank()) Text("UID: ${o.uid}", color = Dim, fontSize = 10.sp)
-                            if (o.payload.isNotBlank()) {
-                                Spacer(Modifier.height(4.dp))
-                                Text("تفاصيل: ${o.payload}", color = Dim, fontSize = 10.sp)
-                            }
-                            if (dt.isNotEmpty()) {
-                                Spacer(Modifier.height(4.dp))
-                                Text("الوقت: $dt", color = Dim, fontSize = 10.sp)
-                            }
-                            if (o.accountId.isNotBlank()) {
-                                Spacer(Modifier.height(4.dp))
-                                val clip = LocalClipboardManager.current
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text("Player ID: ", color = OnBg)
-                                    Text(
-                                        o.accountId,
-                                        color = Accent,
-                                        modifier = Modifier
-                                            .clickable { clip.setText(AnnotatedString(o.accountId)) }
-                                            .padding(4.dp)
-                                    )
-                                }
-                            }
-
-Spacer(Modifier.height(8.dp))
-Row {
-
-                                TextButton(onClick = {
-                                    if (approveWithCode) {
-                                        approveFor = o
-                                    } else {
-                                        scope.launch {
-                                            val ok = doApprovePlain(o.id)
-                                            snack = if (ok) "تم التنفيذ" else "فشل التنفيذ"
-                                            if (ok) reloadKey++
-                                        }
-                                    }
-                                }) { Text("تنفيذ") }
-                                TextButton(onClick = {
-                                    scope.launch {
-                                        val ok = doReject(o.id)
-                                        snack = if (ok) "تم الرفض" else "فشل التنفيذ"
-                                        if (ok) reloadKey++
-                                    }
-                                }) { Text("رفض") }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        snack?.let {
-            Spacer(Modifier.height(10.dp))
-            Text(it, color = OnBg)
-            LaunchedEffect(it) { delay(2000); snack = null }
-        }
-    }
-
-    if (approveFor != null && approveWithCode) {
-        AlertDialog(
-            onDismissRequest = { approveFor = null; codeText = "" },
-            confirmButton = {
-                val scope2 = rememberCoroutineScope()
-                TextButton(onClick = {
-                    val code = codeText.trim()
-                    if (code.isEmpty()) return@TextButton
-                    scope2.launch {
-                        val ok = doDeliverWithCode(approveFor!!.id, code)
-                        if (ok) {
-                            // نجاح — يفترض أن الباكند سيضيف إشعارًا للمستخدم
-                        }
-                        approveFor = null
-                        codeText = ""
-                        snack = if (ok) "تم الإرسال" else "فشل الإرسال"
-                        if (ok) reloadKey++
-                    }
-                }) { Text("إرسال") }
-            },
-            dismissButton = { TextButton(onClick = { approveFor = null; codeText = "" }) { Text("إلغاء") } },
-            title = { Text("إدخال $codeFieldLabel", color = OnBg) },
-            text = {
-                Column {
-                    OutlinedTextField(
-                        value = codeText,
-                        onValueChange = { codeText = it },
-                        singleLine = true,
-                        label = { Text(codeFieldLabel) }
-                    )
-                }
-            }
-        )
-    }
-}
-
-@Composable
-private fun ServiceIdEditorScreen(token: String, onBack: () -> Unit) {
-    val scope = rememberCoroutineScope()
-    var selectedCat by remember { mutableStateOf<String?>(null) }
-    var overrides by remember { mutableStateOf<Map<String, Long>>(emptyMap()) }
-    var loading by remember { mutableStateOf(true) }
-    var err by remember { mutableStateOf<String?>(null) }
-    var refreshKey by remember { mutableStateOf(0) }
-    var snack by remember { mutableStateOf<String?>(null) }
-
-    val cats = listOf(
-        "مشاهدات تيكتوك", "لايكات تيكتوك", "متابعين تيكتوك", "مشاهدات بث تيكتوك", "رفع سكور تيكتوك",
-        "مشاهدات انستغرام", "لايكات انستغرام", "متابعين انستغرام", "مشاهدات بث انستا",
-        "خدمات التليجرام"
-    )
-
-    fun servicesFor(cat: String): List<ServiceDef> {
-        fun hasAll(key: String, vararg words: String) = words.all { key.contains(it) }
-        return servicesCatalog.filter { svc ->
-            val k = svc.uiKey
-            when (cat) {
-                "مشاهدات تيكتوك"   -> hasAll(k, "مشاهدات", "تيكتوك")
-                "لايكات تيكتوك"     -> hasAll(k, "لايكات", "تيكتوك")
-                "متابعين تيكتوك"    -> hasAll(k, "متابعين", "تيكتوك")
-                "مشاهدات بث تيكتوك" -> hasAll(k, "مشاهدات", "بث", "تيكتوك")
-                "رفع سكور تيكتوك"   -> k.contains("رفع سكور")
-                "مشاهدات انستغرام"  -> hasAll(k, "مشاهدات", "انستغرام")
-                "لايكات انستغرام"    -> hasAll(k, "لايكات", "انستغرام")
-                "متابعين انستغرام"   -> hasAll(k, "متابعين", "انستغرام")
-                "مشاهدات بث انستا"   -> hasAll(k, "مشاهدات", "بث", "انستا")
-                "خدمات التليجرام"    -> k.contains("تلي")
-                else -> false
-            }
-        }.map { svc ->
-            val cur = overrides[svc.uiKey] ?: svc.serviceId
-            svc.copy(serviceId = cur)
-        }
-    }
-
-    LaunchedEffect(refreshKey) {
-        loading = true; err = null
-        val data = apiAdminListSvcOverrides(token)
-        overrides = data
-        loading = false
-    }
-
-    snack?.let {
-        LaunchedEffect(it) {
-            delay(2000); snack = null
-        }
-        Snackbar(modifier = Modifier.padding(8.dp)) { Text(it) }
-    }
-
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) {
-                Icon(Icons.Filled.ArrowBack, contentDescription = null, tint = OnBg)
-            }
-            Spacer(Modifier.width(6.dp))
-            Text("تغيير رقم خدمات API", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = OnBg)
-        }
-        Spacer(Modifier.height(10.dp))
-
-        if (loading) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
-            return@Column
-        }
-        err?.let { e ->
-            Text("تعذر جلب البيانات: $e", color = Bad)
-            return@Column
-        }
-
-        if (selectedCat == null) {
-            cats.chunked(2).forEach { row ->
-                Row(Modifier.fillMaxWidth()) {
-                    row.forEach { c ->
-                        Card(
-                            modifier = Modifier.weight(1f).padding(4.dp).clickable { selectedCat = c },
-                            colors = CardDefaults.cardColors(containerColor = Surface1, contentColor = OnBg)
-                        ) { Text(c, Modifier.padding(16.dp), fontWeight = FontWeight.SemiBold) }
-                    }
-                    if (row.size == 1) Spacer(Modifier.weight(1f))
-                }
-            }
-        } else {
-            val list = servicesFor(selectedCat!!)
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = { selectedCat = null }) {
-                    Icon(Icons.Filled.ArrowBack, contentDescription = null, tint = OnBg)
-                }
-                Spacer(Modifier.width(6.dp))
-                Text(selectedCat!!, fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = OnBg)
-            }
-            Spacer(Modifier.height(10.dp))
-
-            LazyColumn {
-                items(list) { svc ->
-                    var showEdit by remember { mutableStateOf(false) }
-                    val baseId = servicesCatalog.first { it.uiKey == svc.uiKey }.serviceId
-                    val curId = overrides[svc.uiKey] ?: baseId
-                    val hasOverride = overrides.containsKey(svc.uiKey)
-                    Card(
-                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                        colors = CardDefaults.cardColors(containerColor = Surface1, contentColor = OnBg)
-                    ) {
-                        Column(Modifier.padding(16.dp)) {
-                            Text(svc.uiKey, fontWeight = FontWeight.SemiBold, color = OnBg)
-                            Spacer(Modifier.height(4.dp))
-                            val hasOverride = overrides.containsKey(svc.uiKey)
-                            val baseId = servicesCatalog.first { it.uiKey == svc.uiKey }.serviceId
-                            val curId = overrides[svc.uiKey] ?: baseId
-                                                        Text("الرقم الحالي: $curId" + if (hasOverride) " (معدل)" else " (افتراضي)", color = Dim, fontSize = 10.sp)
-                            Spacer(Modifier.height(8.dp))
-                            Row {
-                                TextButton(onClick = { showEdit = true }) { Text("تعديل") }
-                                Spacer(Modifier.width(6.dp))
-                                TextButton(enabled = hasOverride, onClick = {
-                                    scope.launch {
-                                        val ok = apiAdminClearSvcOverride(token, svc.uiKey)
-                                        if (ok) {
-                                            snack = "تم إرجاع الافتراضي"
-                                            refreshKey++
-                                        } else snack = "فشل إرجاع الافتراضي"
-                                    }
-                                }) { Text("إرجاع الافتراضي") }
-                            }
-                        }
-                    }
-
-                    if (showEdit) {
-                        var newIdText by remember { mutableStateOf(curId.toString()) }
-                        AlertDialog(
-                            onDismissRequest = { showEdit = false },
-                            confirmButton = {
-                                TextButton(onClick = {
-                                    val num = newIdText.trim().toLongOrNull()
-                                    if (num != null && num > 0) {
-                                        scope.launch {
-                                            val ok = apiAdminSetSvcOverride(token, svc.uiKey, num)
-                                            if (ok) {
-                                                snack = "تم الحفظ"
-                                                showEdit = false
-                                                refreshKey++
-                                            } else snack = "فشل الحفظ"
-                                        }
-                                    }
-                                }) { Text("حفظ") }
-                            },
-                            dismissButton = { TextButton(onClick = { showEdit = false }) { Text("إلغاء") } },
-                            title = { Text("تعديل رقم الخدمة", color = OnBg) },
-                            text = {
-                                Column {
-                                    Text("الخدمة: ${svc.uiKey}", color = Dim, fontSize = 10.sp)
-                                    Spacer(Modifier.height(6.dp))
-                                    OutlinedTextField(
-                                        value = newIdText,
-                                        onValueChange = { s -> if (s.isEmpty() || s.all { it.isDigit() }) newIdText = s },
-                                        singleLine = true,
-                                        label = { Text("Service ID") }
-                                    )
-                                }
-                            }
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-/* =========================
-   شاشة الكروت المعلّقة (المالك)
-   ========================= */
-@Composable private fun AdminPendingCardsScreen(
-    token: String,
-    onBack: () -> Unit
-) {
-    val scope = rememberCoroutineScope()
-    var list by remember { mutableStateOf<List<PendingCard>?>(null) }
-    var loading by remember { mutableStateOf(true) }
-    var err by remember { mutableStateOf<String?>(null) }
-    var reloadKey by remember { mutableStateOf(0) }
-    var snack by remember { mutableStateOf<String?>(null) }
-    var execFor by remember { mutableStateOf<PendingCard?>(null) }
-    var amountText by remember { mutableStateOf("") }
-    LaunchedEffect(reloadKey) {
-        loading = true; err = null
-        list = apiAdminFetchPendingCards(token)
-        if (list == null) err = "تعذر جلب البيانات"
-        loading = false
-    }
-
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = null, tint = OnBg) }
-            Spacer(Modifier.width(6.dp))
-            Text("طلبات شحن أسيا سيل", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = OnBg)
-        }
-        Spacer(Modifier.height(10.dp))
-
-        when {
-            loading -> Text("يتم التحميل", color = Dim)
-            err != null -> Text(err!!, color = Bad)
-            list.isNullOrEmpty() -> Text("لا توجد كروت معلّقة.", color = Dim)
-            else -> LazyColumn {
-                items(list!!) { c ->
-                    val dt = if (c.createdAt > 0) {
-                        SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault()).format(Date(c.createdAt))
-                    } else ""
-                    Card(
-                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                        colors = CardDefaults.cardColors(containerColor = Surface1, contentColor = OnBg)
-                    ) {
-                        Column(Modifier.padding(16.dp)) {
-                            Text("طلب #${c.id}", fontWeight = FontWeight.SemiBold, color = OnBg)
-                            Spacer(Modifier.height(4.dp))
-                            Text("UID: ${c.uid}", color = Dim, fontSize = 10.sp)
-                            Spacer(Modifier.height(4.dp))
-                            val clip = LocalClipboardManager.current
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("الكارت: ", color = OnBg)
-                                Text(
-                                    c.card,
-                                    color = Accent,
-                                    modifier = Modifier
-                                        .clickable {
-                                            clip.setText(AnnotatedString(c.card))
-                                            snack = "تم نسخ رقم الكارت"
-                                        }
-                                        .padding(4.dp)
-                                )
-                            }
-                            if (dt.isNotEmpty()) {
-                                Spacer(Modifier.height(4.dp))
-                                Text("الوقت: $dt", color = Dim, fontSize = 10.sp)
-                            }
-                            Row {
-
-                                TextButton(onClick = { execFor = c }) { Text("تنفيذ") }
-                                TextButton(onClick = {
-                                    scope.launch {
-                                        val ok = apiAdminRejectTopupCard(c.id, token)
-                                        snack = if (ok) "تم الرفض" else "فشل الرفض"
-                                        if (ok) reloadKey++
-                                    }
-                                }) { Text("رفض") }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        snack?.let {
-            Spacer(Modifier.height(10.dp))
-            Text(it, color = OnBg)
-            LaunchedEffect(it) { delay(2000); snack = null }
-        }
-    }
-
-    if (execFor != null) {
-        AlertDialog(
-            onDismissRequest = { execFor = null },
-            confirmButton = {
-                val scope2 = rememberCoroutineScope()
-                TextButton(onClick = {
-                    val amt = amountText.toDoubleOrNull()
-                    if (amt == null || amt <= 0.0) return@TextButton
-                    scope2.launch {
-                        val ok = apiAdminExecuteTopupCard(execFor!!.id, amt, token)
-                        if (ok) {
-                            execFor = null
-                            amountText = ""
-                            // بعد التنفيذ سيتم تحديث القائمة عبر reloadKey
-                            snack = "تم التنفيذ"
-                            reloadKey++
-                        } else snack = "فشل التنفيذ"
-                    }
-                }) { Text("إرسال") }
-            },
-            dismissButton = { TextButton(onClick = { execFor = null }) { Text("إلغاء") } },
-            title = { Text("تنفيذ الشحن", color = OnBg) },
-            text = {
-                Column {
-                    Text("أدخل مبلغ الشحن ليُضاف لرصيد المستخدم", color = Dim, fontSize = 10.sp)
-                    Spacer(Modifier.height(6.dp))
-                    OutlinedTextField(
-                        value = amountText,
-                        onValueChange = { s -> if (s.isEmpty() || s.toDoubleOrNull() != null) amountText = s },
-                        singleLine = true,
-                        label = { Text("المبلغ") }
-                    )
-                }
-            }
-        )
-    }
-}
-/* =========================
-   شاشات مضافة لإكمال النواقص
-   ========================= */
-
-/** إضافة/خصم رصيد — تنفذ الطلب بنفسها داخل Coroutine */
-@Composable private fun TopupDeductScreen(
-    title: String,
-    token: String,
-    endpoint: String,
-    onBack: () -> Unit
-) {
-    val scope = rememberCoroutineScope()
-    var uid by remember { mutableStateOf("") }
-    var amount by remember { mutableStateOf("") }
-    var busy by remember { mutableStateOf(false) }
-    var msg by remember { mutableStateOf<String?>(null) }
-
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = null, tint = OnBg) }
-            Spacer(Modifier.width(6.dp))
-            Text(title, fontSize = 20.sp, fontWeight = FontWeight.Bold, color = OnBg)
-        }
-        Spacer(Modifier.height(12.dp))
-
-        OutlinedTextField(
-            value = uid, onValueChange = { uid = it.trim() },
-            singleLine = true, label = { Text("UID المستخدم") }
-        )
-        Spacer(Modifier.height(8.dp))
-        OutlinedTextField(
-            value = amount, onValueChange = { s -> if (s.isEmpty() || s.toDoubleOrNull() != null) amount = s },
-            singleLine = true, label = { Text("المبلغ") }
-        )
-        Spacer(Modifier.height(12.dp))
-        Button(
-            enabled = !busy,
-            onClick = {
-                val a = amount.toDoubleOrNull()
-                if (uid.isBlank() || a == null || a <= 0.0) { msg = "أدخل UID ومبلغًا صحيحًا"; return@Button }
-                busy = true
-                scope.launch {
-                    val ok = apiAdminWalletChange(endpoint, token, uid, a)
-                    busy = false
-                    msg = if (ok) "تمت العملية بنجاح" else "فشلت العملية"
-                }
-            }
-        ) { Text(if (busy) "جارٍ التنفيذ" else "تنفيذ") }
-
-        Spacer(Modifier.height(10.dp))
-        msg?.let { Text(it, color = OnBg) }
-    }
-}
-
-/** عدد المستخدمين */
-@Composable private fun UsersCountScreen(
-    token: String,
-    onBack: () -> Unit
-) {
-    val scope = rememberCoroutineScope()
-    var count by remember { mutableStateOf<Int?>(null) }
-    var loading by remember { mutableStateOf(true) }
-
-    LaunchedEffect(Unit) {
-        loading = true
-        count = apiAdminUsersCount(token)
-        loading = false
-    }
-
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = null, tint = OnBg) }
-            Spacer(Modifier.width(6.dp))
-            Text("عدد المستخدمين", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = OnBg)
-        }
-        Spacer(Modifier.height(12.dp))
-        if (loading) Text("يتم التحميل", color = Dim)
-        else Text("العدد: ${count ?: 0}", color = OnBg, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(8.dp))
-        OutlinedButton(onClick = {
-            loading = true
-            scope.launch { count = apiAdminUsersCount(token); loading = false }
-        }) { Text("تحديث") }
-    }
-}
-
-/** أرصدة المستخدمين */
-@Composable private fun UsersBalancesScreen(
-    token: String,
-    onBack: () -> Unit
-) {
-    val scope = rememberCoroutineScope()
-    var rows by remember { mutableStateOf<List<Triple<String,String,Double>>?>(null) }
-    var loading by remember { mutableStateOf(true) }
-
-    LaunchedEffect(Unit) {
-        loading = true
-        rows = apiAdminUsersBalances(token)
-        loading = false
-    }
-
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = null, tint = OnBg) }
-            Spacer(Modifier.width(6.dp))
-            Text("أرصدة المستخدمين", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = OnBg)
-        }
-        Spacer(Modifier.height(12.dp))
-        when {
-            loading -> Text("يتم التحميل", color = Dim)
-            rows == null -> Text("تعذر جلب البيانات", color = Bad)
-            rows!!.isEmpty() -> Text("لا توجد بيانات.", color = Dim)
-            else -> LazyColumn {
-                items(rows!!) { (u, state, bal) ->
-                    Card(
-                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                        colors = CardDefaults.cardColors(containerColor = Surface1, contentColor = OnBg)
-                    ) {
-                        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Column(Modifier.weight(1f)) {
-                                Text("UID: $u", fontWeight = FontWeight.SemiBold, color = OnBg)
-                                Text("الحالة: $state", color = Dim, fontSize = 10.sp)
-                            }
-                            Text("${"%.2f".format(bal)}$", color = OnBg, fontWeight = FontWeight.Bold)
-                        }
-                    }
-                }
-            }
-        }
-        Spacer(Modifier.height(8.dp))
-        OutlinedButton(onClick = {
-            loading = true
-            scope.launch { rows = apiAdminUsersBalances(token); loading = false }
-        }) { Text("تحديث") }
-    }
-}
-
-/** فحص رصيد المزود */
-@Composable private fun ProviderBalanceScreen(
-    token: String,
-    onBack: () -> Unit
-) {
-    val scope = rememberCoroutineScope()
-    var bal by remember { mutableStateOf<Double?>(null) }
-    var loading by remember { mutableStateOf(true) }
-    var err by remember { mutableStateOf<String?>(null) }
-
-    LaunchedEffect(Unit) {
-        loading = true; err = null
-        bal = apiAdminProviderBalance(token)
-        if (bal == null) err = "تعذر جلب الرصيد"
-        loading = false
-    }
-
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = null, tint = OnBg) }
-            Spacer(Modifier.width(6.dp))
-            Text("فحص رصيد API", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = OnBg)
-        }
-        Spacer(Modifier.height(12.dp))
-        when {
-            loading -> Text("يتم التحميل", color = Dim)
-            err != null -> Text(err!!, color = Bad)
-            else -> Text("الرصيد: ${"%.2f".format(bal ?: 0.0)}", color = OnBg, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-        }
-        Spacer(Modifier.height(8.dp))
-        OutlinedButton(onClick = {
-            loading = true; err = null
-            scope.launch {
-                bal = apiAdminProviderBalance(token)
-                if (bal == null) err = "تعذر جلب الرصيد"
-                loading = false
-            }
-        }) { Text("تحديث") }
-    }
-}
-
-/* =========================
-   شريط سفلي
-   ========================= */
-@Composable private fun BottomNavBar(current: Tab, onChange: (Tab) -> Unit, modifier: Modifier = Modifier) {
-    NavigationBar(modifier = modifier.fillMaxWidth(), containerColor = Surface1) {
-        NavItem(current == Tab.HOME, { onChange(Tab.HOME) }, Icons.Filled.Home, "الرئيسية")
-        NavItem(current == Tab.SERVICES, { onChange(Tab.SERVICES) }, Icons.Filled.List, "الخدمات")
-        NavItem(current == Tab.WALLET, { onChange(Tab.WALLET) }, Icons.Filled.AccountBalanceWallet, "رصيدي")
-        NavItem(current == Tab.ORDERS, { onChange(Tab.ORDERS) }, Icons.Filled.ShoppingCart, "الطلبات")
-        NavItem(current == Tab.SUPPORT, { onChange(Tab.SUPPORT) }, Icons.Filled.ChatBubble, "الدعم")
-    }
-}
-@Composable private fun RowScope.NavItem(
-    selected: Boolean, onClick: () -> Unit,
-    icon: androidx.compose.ui.graphics.vector.ImageVector, label: String
-) {
-    NavigationBarItem(
-        selected = selected, onClick = onClick,
-        icon = { Icon(icon, contentDescription = label) },
-        label = { Text(label, fontSize = 10.sp, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal) },
-        colors = NavigationBarItemDefaults.colors(
-            selectedIconColor = Color.White, selectedTextColor = Color.White,
-            indicatorColor = Accent.copy(alpha = 0.25f),
-            unselectedIconColor = Dim, unselectedTextColor = Dim
-        )
-    )
-}
-
-/* =========================
-   تخزين محلي + أدوات شبكة
-   ========================= */
-private fun prefs(ctx: Context) = ctx.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
-
-// =========================
-// حظر أسيا سيل + عدادات محلية
-// =========================
-private const val PREF_ASIA_BAN_UNTIL = "asia_ban_until_ms"
-private const val PREF_ASIA_BAN_REASON = "asia_ban_reason"
-private const val PREF_ASIA_CARD_TIMES = "asia_card_times"    // JSONObject: { "CARD_DIGITS": [ts, ts, ...] }
-private const val PREF_ASIA_RECENT = "asia_recent_times"      // JSONArray: [ts, ts, ...]
-
-private fun clearAsiacellBan(ctx: Context) {
-    prefs(ctx).edit().remove(PREF_ASIA_BAN_UNTIL).remove(PREF_ASIA_BAN_REASON).apply()
-}
-
-private fun loadAsiacellBanUntil(ctx: Context): Long {
-    val until = prefs(ctx).getLong(PREF_ASIA_BAN_UNTIL, 0L)
-    if (until > 0 && System.currentTimeMillis() > until) {
-        clearAsiacellBan(ctx) // انتهى الحظر تلقائيًا
-        return 0L
-    }
-    return until
-}
-
-private fun setAsiacellBan(ctx: Context, reason: String) {
-    val until = System.currentTimeMillis() + 60L * 60L * 1000L // ساعة
-    prefs(ctx).edit()
-        .putLong(PREF_ASIA_BAN_UNTIL, until)
-        .putString(PREF_ASIA_BAN_REASON, reason)
-        .apply()
-}
-
-private fun asiacellBanRemainingMinutes(ctx: Context): Long {
-    val until = loadAsiacellBanUntil(ctx)
-    val left = until - System.currentTimeMillis()
-    return if (left <= 0) 0 else (left + 59_999L) / 60_000L
-}
-
-private fun loadJsonObjectOrEmpty(s: String?): JSONObject =
-    try { if (!s.isNullOrBlank()) JSONObject(s) else JSONObject() } catch (_: Throwable) { JSONObject() }
-
-private fun loadJsonArrayOrEmpty(s: String?): JSONArray =
-    try { if (!s.isNullOrBlank()) JSONArray(s) else JSONArray() } catch (_: Throwable) { JSONArray() }
-
-/**
- * يفحص الحظر + السرعة + تكرار نفس الكارت، ويحدث العدادات إن لم يُحظر.
- * @return Pair(allowed, reasonOrNull)
- *  - allowed=false, reason in {"ban_active","speed","repeat"} عند الحظر.
- */
-private fun asiacellPreCheckAndRecord(ctx: Context, digitsRaw: String): Pair<Boolean, String?> {
-    val now = System.currentTimeMillis()
-    if (loadAsiacellBanUntil(ctx) > now) return false to "ban_active"
-
-    val digits = digitsRaw.filter { it.isDigit() }
-
-    // 1) فحص السرعة: 3 محاولات خلال دقيقة -> حظر ساعة
-    val recStr = prefs(ctx).getString(PREF_ASIA_RECENT, "[]")
-    val recent = loadJsonArrayOrEmpty(recStr)
-    val keep = JSONArray()
-    var recentCount = 0
-    for (i in 0 until recent.length()) {
-        val t = recent.optLong(i, 0L)
-        if (t > now - 60_000L) { keep.put(t); recentCount++ }
-    }
-    if (recentCount >= 2) { // هذه ستكون المحاولة الثالثة خلال دقيقة
-        setAsiacellBan(ctx, "speed")
-        return false to "speed"
-    }
-
-    // 2) تكرار نفس الرقم: أكثر من مرتين خلال 24 ساعة -> حظر ساعة
-    val mapStr = prefs(ctx).getString(PREF_ASIA_CARD_TIMES, "{}")
-    val obj = loadJsonObjectOrEmpty(mapStr)
-    val arr = obj.optJSONArray(digits) ?: JSONArray()
-    val arrKeep = JSONArray()
-    var sameCardCount = 0
-    for (i in 0 until arr.length()) {
-        val t = arr.optLong(i, 0L)
-        if (t > now - 24L * 60L * 60L * 1000L) {
-            arrKeep.put(t); sameCardCount++
-        }
-    }
-    if (sameCardCount >= 2) { // المحاولة الحالية ستكون الثالثة لهذا الرقم
-        setAsiacellBan(ctx, "repeat")
-        return false to "repeat"
-    }
-
-    // لم يُحظر: نسجل المحاولة الحالية
-    keep.put(now)
-    prefs(ctx).edit().putString(PREF_ASIA_RECENT, keep.toString()).apply()
-    arrKeep.put(now)
-    obj.put(digits, arrKeep)
-    prefs(ctx).edit().putString(PREF_ASIA_CARD_TIMES, obj.toString()).apply()
-
-    return true to null
-}
-private fun loadOrCreateUid(ctx: Context): String {
-
-    val p = prefs(ctx)
-    val key = "uid"
-    val existing = p.getString(key, null)
-    if (!existing.isNullOrBlank()) return existing
-    // Generate 7-digit numeric UID, never starting with 0
-    val first = (1..9).random().toString()
-    val rest = (1..6).map { ('0'..'9').random() }.joinToString("")
-    val uid = first + rest
-    p.edit().putString(key, uid).apply()
-    return uid
-
-}
-private fun saveUid(ctx: Context, uid: String) { prefs(ctx).edit().putString("uid", uid).apply() }
-
-/* ============ Local password storage (device only) ============ */
-/* تنبيه أمني: السيرفر يخزّن كلمة المرور كـ hash فقط. محليًا نحتفظ بنسخة مشفرة-مبسّطة لأجل "العرض لاحقًا" على نفس الجهاز. */
-private fun obf(s: String): String {
-    val k = "RATLUZEN_SALT_2025".toByteArray()
-    val bytes = s.toByteArray(Charsets.UTF_8)
-    val xored = ByteArray(bytes.size) { i -> (bytes[i].toInt() xor k[i % k.size].toInt()).toByte() }
-    return android.util.Base64.encodeToString(xored, android.util.Base64.NO_WRAP)
-}
-private fun deobf(b64: String): String {
-    return try {
-        val k = "RATLUZEN_SALT_2025".toByteArray()
-        val xored = android.util.Base64.decode(b64, android.util.Base64.NO_WRAP)
-        val bytes = ByteArray(xored.size) { i -> (xored[i].toInt() xor k[i % k.size].toInt()).toByte() }
-        String(bytes, Charsets.UTF_8)
-    } catch (_: Exception) { "" }
-}
-private fun saveLocalPassword(ctx: Context, uid: String, pwd: String) {
-    prefs(ctx).edit().putString("user_pwd_$uid", obf(pwd)).apply()
-}
-private fun loadLocalPassword(ctx: Context, uid: String): String? {
-    val raw = prefs(ctx).getString("user_pwd_$uid", null) ?: return null
-    val dec = deobf(raw)
-    return if (dec.isNotBlank()) dec else null
-}
-
-private fun loadOwnerMode(ctx: Context): Boolean = prefs(ctx).getBoolean("owner_mode", false)
-private fun saveOwnerMode(ctx: Context, on: Boolean) { prefs(ctx).edit().putBoolean("owner_mode", on).apply() }
-private fun loadOwnerToken(ctx: Context): String? = prefs(ctx).getString("owner_token", null)
-private fun saveOwnerToken(ctx: Context, token: String?) { prefs(ctx).edit().putString("owner_token", token).apply() }
-
-private fun loadNotices(ctx: Context): List<AppNotice> {
-    val raw = prefs(ctx).getString("notices_json", "[]") ?: "[]"
-    return try {
-        val arr = JSONArray(raw)
-        (0 until arr.length()).map { i ->
-            val o = arr.getJSONObject(i)
-            AppNotice(
-                title = o.optString("title"),
-                body = o.optString("body"),
-                ts = o.optLong("ts"),
-                orderId = o.optString("orderId", "").takeIf { it.isNotBlank() },
-                serviceName = o.optString("serviceName", "").takeIf { it.isNotBlank() },
-                amount = o.optString("amount", "").takeIf { it.isNotBlank() },
-                code = o.optString("code", "").takeIf { it.isNotBlank() },
-                status = o.optString("status", "").takeIf { it.isNotBlank() },
-                forOwner = o.optBoolean("forOwner")
+                tokens = _tokens_for_uid(cur, OWNER_UID)
+        except Exception as e:
+            logger.exception("owner notify (db) failed: %s", e)
+
+        for t in tokens:
+            try:
+                _fcm_send_push(t, n_title, n_body, order_id)
+            except Exception as e:
+                logger.exception("owner notify (push) failed: %s", e)
+    finally:
+        put_conn(c)
+
+def _needs_code(title: str, otype: Optional[str]) -> bool:
+    t = (title or "").lower()
+    if (otype or "").lower() == "topup_card":
+        return False
+    for k in ("itunes","ايتونز","voucher","code","card","gift","رمز","كود","بطاقة","كارت","شراء"):
+        if k in t:
+            return True
+    return False
+
+# Admin auth compatibility helper
+def _pick_admin_password(header_val: Optional[str], password_qs: Optional[str], body: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    cand = header_val or password_qs
+    if not cand and body:
+        cand = body.get("password") or body.get("admin_password") or body.get("x-admin-password")
+    return cand
+
+# New helpers (compatibility)
+def _normalize_product(raw: str, fallback_title: str = "") -> str:
+    t = (raw or "").strip().lower()
+    ft = (fallback_title or "").strip().lower()
+    def has_any(s: str, keys: Tuple[str, ...]) -> bool:
+        s = s or ""
+        return any(k in s for k in keys)
+
+    # PUBG UC
+    if has_any(t, ("pubg","bgmi","uc","ببجي","شدات")) or has_any(ft, ("pubg","bgmi","uc","ببجي","شدات")):
+        return "pubg_uc"
+    # Ludo Diamonds
+    if has_any(t, ("ludo_diamond","ludo-diamond","diamonds","الماس","الماسات","لودو")) and not has_any(t, ("gold","ذهب")):
+        return "ludo_diamond"
+    if has_any(ft, ("الماس","الماسات","diamonds","لودو")) and not has_any(ft, ("gold","ذهب")):
+        return "ludo_diamond"
+    # Ludo Gold
+    if has_any(t, ("ludo_gold","gold","ذهب")) or has_any(ft, ("gold","ذهب")):
+        return "ludo_gold"
+    # iTunes
+    if has_any(t, ("itunes","ايتونز")) or has_any(ft, ("itunes","ايتونز")):
+        return "itunes"
+    # Atheer / Asiacell / Korek balance vouchers
+    if has_any(t, ("atheer","اثير")) or has_any(ft, ("atheer","اثير")):
+        return "atheer"
+    if has_any(t, ("asiacell","اسياسيل","أسيا")) or has_any(ft, ("asiacell","اسياسيل","أسيا")):
+        return "asiacell"
+    if has_any(t, ("korek","كورك")) or has_any(ft, ("korek","كورك")):
+        return "korek"
+    return t or "itunes"
+
+def _parse_usd(d: Dict[str, Any]) -> int:
+    """Extract a positive integer USD *pack* value from a flexible payload.
+
+    This helper is used for iTunes / رصيد الهاتف فقط.
+    For PUBG / Ludo we use separate helpers so that fractional prices مثل 2.50 أو 8.99
+    لا تُقص إلى أعداد صحيحة.
+    """
+    # Primary fields where the client sends the USD pack value (5,10,15,...)
+    for k in ("usd", "usd_amount", "amount", "amt"):
+        if k in d and d[k] not in (None, ""):
+            try:
+                v = float(d[k])
+            except Exception:
+                continue
+            if v <= 0:
+                continue
+            return int(v)
+
+    # Fallbacks (rare): treat price_usd as pack size if no explicit usd/amount
+    for k in ("price_usd", "priceUsd", "price"):
+        if k in d and d[k] not in (None, ""):
+            try:
+                v = float(d[k])
+            except Exception:
+                continue
+            if v <= 0:
+                continue
+            return int(v)
+
+    return 0
+
+
+def _parse_game_quantity(d: Dict[str, Any]) -> int:
+    """Extract quantity for game services (PUBG UC / Ludo).
+
+    Examples:
+      650 شدة، 810 الماسة، 56468 ذهب
+    """
+    for k in (
+        "quantity",
+        "qty",
+        "amount",
+        "amount_uc",
+        "amount_uc_value",
+        "amount_gold",
+        "amount_diamond",
+        "units",
+        "pack",
+    ):
+        if k in d and d[k] not in (None, ""):
+            try:
+                v = float(d[k])
+            except Exception:
+                continue
+            if v <= 0:
+                continue
+            return int(v)
+    return 0
+
+
+def _parse_game_price(d: Dict[str, Any]) -> float:
+    """Extract price (with decimals) for game services (PUBG / Ludo)."""
+    # Preferred explicit price fields used by the app
+    for k in ("price", "priceUsd", "price_usd", "usd_price"):
+        if k in d and d[k] not in (None, ""):
+            try:
+                v = float(d[k])
+            except Exception:
+                continue
+            if v <= 0:
+                continue
+            return float(v)
+
+    # Backwards compatibility: some أقدم إصدارات كانت ترسل السعر في حقل usd/amount
+    for k in ("usd", "usd_amount", "amount", "amt"):
+        if k in d and d[k] not in (None, ""):
+            try:
+                v = float(d[k])
+            except Exception:
+                continue
+            if v <= 0:
+                continue
+            return float(v)
+
+    return 0.0
+
+
+
+
+def _push_user(conn, user_id: int, order_id: Optional[int], title: str, body: str):
+    """Store notification in DB then push FCM to all user's devices (user_devices + fallback)."""
+    # 1) Insert row in user_notifications (unread)
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at) "
+                "VALUES (%s,%s,%s,%s,'unread', NOW())",
+                (user_id, order_id, title, body)
             )
-        }
-    } catch (_: Exception) { emptyList() }
-}
-private fun saveNotices(ctx: Context, notices: List<AppNotice>) {
-    val arr = JSONArray()
-    notices.forEach {
-        val o = JSONObject()
-        o.put("title", it.title)
-        o.put("body", it.body)
-        o.put("ts", it.ts)
-        if (it.orderId != null) o.put("orderId", it.orderId)
-        if (it.serviceName != null) o.put("serviceName", it.serviceName)
-        if (it.amount != null) o.put("amount", it.amount)
-        if (it.code != null) o.put("code", it.code)
-        if (it.status != null) o.put("status", it.status)
-        o.put("forOwner", it.forOwner)
-        arr.put(o)
-    }
-    prefs(ctx).edit().putString("notices_json", arr.toString()).apply()
-}
+    except Exception as e:
+        logger.exception("push_user insert failed: %s", e)
 
-/* تتبع آخر وقت قراءة الإشعارات لكل وضع (مستخدم/مالك) */
-private fun lastSeenKey(forOwner: Boolean) = if (forOwner) "last_seen_owner" else "last_seen_user"
-private fun loadLastSeen(ctx: Context, forOwner: Boolean): Long =
-    prefs(ctx).getLong(lastSeenKey(forOwner), 0L)
-private fun saveLastSeen(ctx: Context, forOwner: Boolean, ts: Long = System.currentTimeMillis()) {
-    prefs(ctx).edit().putLong(lastSeenKey(forOwner), ts).apply()
-}
-/* شبكة - GET (suspend) */
-/* ======= Auto-Exec (Admin) helpers ======= */
-private suspend fun adminAutoExecStatus(token: String): Boolean {
-    val (code, txt) = httpGet(AdminEndpoints.autoExecStatus, headers = mapOf("x-admin-password" to token))
-    return if (code in 200..299 && !txt.isNullOrBlank()) {
-        try { JSONObject(txt).optBoolean("enabled", false) } catch (_: Exception) { false }
-    } else false
-}
-private suspend fun adminAutoExecToggle(token: String, enabled: Boolean): Boolean {
-    val body = JSONObject().put("enabled", enabled)
-    val (code, _) = httpPost(AdminEndpoints.autoExecToggle, body, headers = mapOf("x-admin-password" to token))
-    return code in 200..299
-}
-private suspend fun adminAutoExecRun(token: String, limit: Int = 3, onlyWhenEnabled: Boolean = true): Boolean {
-    val body = JSONObject().put("limit", limit).put("only_when_enabled", onlyWhenEnabled)
-    val (code, _) = httpPost(AdminEndpoints.autoExecRun, body, headers = mapOf("x-admin-password" to token))
-    return code in 200..299
-}
+    # 2) Collect tokens and send FCM
+    tokens = []
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT uid FROM public.users WHERE id=%s", (user_id,))
+            r = cur.fetchone()
+            uid = r[0] if r else None
+            if uid:
+                tokens = _tokens_for_uid(cur, uid)
+    except Exception as e:
+        logger.exception("push_user DB read failed: %s", e)
+    try:
+        for t in tokens:
+            _fcm_send_push(t, title, body, order_id)
+    except Exception as e:
+        logger.exception("push_user send failed: %s", e)
 
-/* ======= Code Pools helpers (iTunes + Phone Cards) ======= */
 
-data class StoredCode(
-    @SerializedName("id") val id: Int = 0,
-    @SerializedName("code") val code: String = "",
-    @SerializedName("service") val service: String? = null,
-    @SerializedName("telco") val telco: String? = null,
-    @SerializedName("category") val category: String? = null,
-    @SerializedName("used") val used: Boolean = false,
-    @SerializedName("created_at") val createdAt: Long? = null
-)
+def _format_amount_for_notification(amount) -> str:
+    """
+    Format amount (Decimal/float/int) for display in notifications
+    without scientific notation, e.g. 1.0E+3 -> 1000.
+    """
+    try:
+        # Prefer Decimal for consistent formatting
+        from decimal import Decimal as _Decimal
+        if isinstance(amount, _Decimal):
+            s = format(amount, "f")
+        else:
+            s = format(_Decimal(str(amount)), "f")
+        if "." in s:
+            s = s.rstrip("0").rstrip(".")
+        return s
+    except Exception:
+        try:
+            return str(amount)
+        except Exception:
+            return "0"
 
-// -- Generic JSON parse with safety
-private fun parseCodesJson(txt: String?): List<StoredCode> {
-    if (txt.isNullOrBlank()) return emptyList()
-    return try {
-        val arr = JSONArray(txt)
-        (0 until arr.length()).mapNotNull { i ->
-            val o = arr.optJSONObject(i) ?: return@mapNotNull null
-            StoredCode(
-                id = o.optInt("id", 0),
-                code = o.optString("code", ""),
-                service = o.optString("service", null),
-                telco = o.optString("telco", null),
-                category = (o.opt("category")?.toString() ?: o.optString("pack", null)),
-                used = o.optBoolean("used", false),
-                createdAt = if (o.has("created_at")) o.optLong("created_at") else null
+# =========================
+
+# Models
+# =========================
+class UpsertUserIn(BaseModel):
+    uid: str
+
+class ProviderOrderIn(BaseModel):
+    uid: str
+    service_id: Optional[int] = None
+    service_name: str
+    link: Optional[str] = None
+    quantity: int = Field(ge=1, default=1)
+    price: float = Field(ge=0, default=0)
+
+class ManualOrderIn(BaseModel):
+    uid: str
+    title: str
+
+class WalletChangeIn(BaseModel):
+    uid: str
+    amount: float
+
+class AsiacellSubmitIn(BaseModel):
+    uid: str
+    card: str
+
+class WalletCompatIn(BaseModel):
+    uid: str
+    amount: float
+    reason: Optional[str] = None
+
+class PayTabsCreateIn(BaseModel):
+    uid: str
+    usd: float
+
+class PayTabsCreateOut(BaseModel):
+    payment_url: str
+
+# =========================
+# Middleware logging
+# =========================
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    t0 = time.time()
+    response = await call_next(request)
+    dt = int((time.time() - t0) * 1000)
+    logger.info("%s %s -> %s (%d ms)", request.method, request.url.path, response.status_code, dt)
+    return response
+
+@app.get("/")
+def root():
+    return {"ok": True, "msg": "backend running"}
+
+@app.get("/health")
+def health():
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return {"ok": True, "ts": int(time.time()*1000)}
+    finally:
+        put_conn(conn)
+
+# =========================
+# Public user APIs
+# =========================
+@app.post("/api/users/upsert")
+def upsert_user(body: UpsertUserIn):
+    uid = (body.uid or "").strip()
+    if not uid:
+        raise HTTPException(422, "uid required")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_user(cur, uid)
+        return {"ok": True, "uid": uid}
+    finally:
+        put_conn(conn)
+
+
+# Endpoint to store FCM token for a UID
+class FcmTokenIn(BaseModel):
+    uid: str
+    fcm: str
+    platform: Optional[str] = "android"
+
+@app.post("/api/users/fcm_token")
+def api_users_fcm_token(body: FcmTokenIn):
+    uid = (body.uid or "").strip()
+    fcm = (body.fcm or "").strip()
+    platform = (body.platform or "android").strip().lower() or "android"
+    if not uid or not fcm:
+        raise HTTPException(422, "uid and fcm token required")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                cur.execute("INSERT INTO public.users(uid) VALUES(%s) RETURNING id", (uid,))
+                user_id = cur.fetchone()[0]
+            else:
+                user_id = r[0]
+
+            # fallback single-token column
+            cur.execute("UPDATE public.users SET fcm_token=%s WHERE id=%s", (fcm, user_id))
+
+            # upsert into user_devices
+            try:
+                cur.execute("""
+                    INSERT INTO public.user_devices(uid, fcm_token, platform)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (fcm_token) DO UPDATE SET uid=EXCLUDED.uid, platform=COALESCE(EXCLUDED.platform,'android'), updated_at=NOW()
+                """, (uid, fcm, platform))
+            except Exception:
+                pass
+
+        return {"ok": True, "uid": uid}
+    finally:
+        put_conn(conn)
+
+# ---- Wallet balance (with several aliases to match the app) ----
+@app.get("/api/wallet/balance")
+def wallet_balance(uid: str):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT balance FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+        return {"ok": True, "balance": float(r[0] if r else 0.0)}
+    finally:
+        put_conn(conn)
+
+# aliases
+@app.get("/api/get_balance")
+def wallet_balance_alias1(uid: str):
+    return wallet_balance(uid)
+
+@app.get("/api/balance")
+def wallet_balance_alias2(uid: str):
+    return wallet_balance(uid)
+
+@app.get("/api/wallet/get")
+def wallet_balance_alias3(uid: str):
+    return wallet_balance(uid)
+
+@app.get("/api/wallet/get_balance")
+def wallet_balance_alias4(uid: str):
+    return wallet_balance(uid)
+
+@app.get("/api/users/{uid}/balance")
+def wallet_balance_alias5(uid: str):
+    return wallet_balance(uid)
+
+@app.post("/api/wallet/paytabs/create", response_model=PayTabsCreateOut)
+def wallet_paytabs_create(body: PayTabsCreateIn):
+    """
+    Create PayTabs hosted payment page for wallet top-up.
+    """
+    if not body.uid or body.usd is None or body.usd <= 0:
+        raise HTTPException(422, "invalid amount")
+
+    # ensure user exists
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (body.uid,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "user not found")
+    finally:
+        put_conn(conn)
+
+    url = _create_paytabs_payment_page(body.uid, body.usd)
+    return PayTabsCreateOut(payment_url=url)
+
+
+@app.post("/api/wallet/paytabs/callback")
+async def wallet_paytabs_callback(request: Request):
+    """
+    Server-to-server callback from PayTabs.
+
+    We:
+    - read the JSON body
+    - check that the payment is authorised
+    - extract the UID from cart_id (format: WALLET-<uid>-<timestamp>)
+    - credit the user's wallet balance
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    logger.info("PayTabs callback payload: %s", data)
+
+    cart_id = (data.get("cart_id") or "").strip()
+    payment_result = data.get("payment_result") or {}
+    status = (payment_result.get("response_status") or "").upper()
+
+    uid = None
+    if cart_id.startswith("WALLET-"):
+        parts = cart_id.split("-")
+        if len(parts) >= 3:
+            uid = parts[1]
+
+    if not uid:
+        return {"ok": False, "reason": "missing uid in cart_id", "cart_id": cart_id}
+
+    if status != "A":
+        # Not Authorised (A = Authorised). We don't add balance.
+        return {"ok": False, "reason": f"payment not authorised: {status}", "uid": uid}
+
+    try:
+        amount = float(data.get("cart_amount") or 0)
+    except Exception:
+        amount = 0.0
+
+    if amount <= 0:
+        return {"ok": False, "reason": "invalid amount", "uid": uid}
+
+    # PayTabs amount is in {"IQD"}; convert back to wallet USD using fixed rate
+    usd_amount = Decimal(amount) / Decimal("1320.0")
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            # make sure user exists
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            row = cur.fetchone()
+            if not row:
+                cur.execute("INSERT INTO public.users(uid) VALUES(%s) RETURNING id", (uid,))
+                user_id = cur.fetchone()[0]
+            else:
+                user_id = row[0]
+
+            cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (usd_amount, user_id))
+            cur.execute(
+                """
+                INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                VALUES(%s,%s,%s,%s)
+                """,
+                (user_id, usd_amount, "paytabs_topup", Json({"paytabs": data, "iqd_amount": amount})),
             )
-        }
-    } catch (_: Exception) { emptyList() }
-}
 
-private suspend fun apiAdminListItunesCodes(token: String): List<StoredCode> {
-    val (code, txt) = httpGet(AdminEndpoints.itunesCodesList, headers = mapOf("x-admin-password" to token))
-    return if (code in 200..299) parseCodesJson(txt) else emptyList()
-}
+        display_amount = _format_amount_for_notification(usd_amount)
+        _push_user(conn, user_id, None, "تمت إضافة رصيد", f"تم شحن رصيدك بمبلغ {display_amount} دولار.")
+    finally:
+        put_conn(conn)
 
-private suspend fun apiAdminAddItunesCodes(token: String, category: String, codes: List<String>): Boolean {
-    val arr = JSONArray()
-    codes.filter { it.isNotBlank() }.forEach { arr.put(it.trim()) }
-    val body = JSONObject().put("codes", arr).put("category", category)
-    val (code, _) = httpPost(AdminEndpoints.itunesCodesAdd, body, headers = mapOf("x-admin-password" to token))
-    return code in 200..299
-}
-
-private suspend fun apiAdminDeleteItunesCode(token: String, id: Int): Boolean {
-    val (code, _) = httpPost(AdminEndpoints.itunesCodeDelete(id), JSONObject(), headers = mapOf("x-admin-password" to token))
-    return code in 200..299
-}
-
-private suspend fun apiAdminListCardCodes(token: String, telco: String): List<StoredCode> {
-    val (code, txt) = httpGet(AdminEndpoints.cardCodesList(telco), headers = mapOf("x-admin-password" to token))
-    return if (code in 200..299) parseCodesJson(txt) else emptyList()
-}
-
-private suspend fun apiAdminAddCardCodes(token: String, telco: String, category: String, codes: List<String>): Boolean {
-    val arr = JSONArray()
-    codes.filter { it.isNotBlank() }.forEach { arr.put(it.trim()) }
-    val body = JSONObject().put("codes", arr).put("category", category)
-    val (code, _) = httpPost(AdminEndpoints.cardCodesAdd(telco), body, headers = mapOf("x-admin-password" to token))
-    return code in 200..299
-}
-
-private suspend fun apiAdminDeleteCardCode(token: String, telco: String, id: Int): Boolean {
-    val (code, _) = httpPost(AdminEndpoints.cardCodeDelete(telco, id), JSONObject(), headers = mapOf("x-admin-password" to token))
-    return code in 200..299
-}
-
-// -- Scoped Auto-Exec helpers
-private suspend fun adminAutoExecGetScoped(token: String, scope: String): Boolean {
-    val (code, txt) = httpGet(AdminEndpoints.autoExecStatusScoped(scope), headers = mapOf("x-admin-password" to token))
-    return code in 200..299 && (try { JSONObject(txt ?: "{}").optBoolean("enabled", false) } catch (_: Exception) { false })
-}
-
-private suspend fun adminAutoExecSetScoped(token: String, scope: String, enabled: Boolean): Boolean {
-    val body = JSONObject().put("scope", scope).put("enabled", enabled)
-    val (code, _) = httpPost(AdminEndpoints.autoExecSet, body, headers = mapOf("x-admin-password" to token))
-    return code in 200..299
-}
-
-/* ======= /Code Pools helpers ======= */
-/* ======= /Auto-Exec helpers ======= */
-suspend fun httpGet(path: String, headers: Map<String, String> = emptyMap()): Pair<Int, String?> =
-    withContext(Dispatchers.IO) {
-        try {
-            val url = URL("$API_BASE$path")
-            val con = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = 8000
-                readTimeout = 8000
-                headers.forEach { (k, v) -> setRequestProperty(k, v) }
-            }
-            val code = con.responseCode
-            val txt = (if (code in 200..299) con.inputStream else con.errorStream)
-                ?.bufferedReader()?.use { it.readText() }
-            code to txt
-        } catch (_: Exception) { -1 to null }
-    }
-
-/* POST JSON (blocking) — نغلفها بدالة suspend أدناه */
-private fun httpPostBlocking(path: String, json: JSONObject, headers: Map<String, String> = emptyMap()): Pair<Int, String?> {
-    return try {
-        val url = URL("$API_BASE$path")
-        val con = (url.openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            doOutput = true
-            connectTimeout = 12000
-            readTimeout = 12000
-            setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            headers.forEach { (k, v) -> setRequestProperty(k, v) }
-        }
-        OutputStreamWriter(con.outputStream, Charsets.UTF_8).use { it.write(json.toString()) }
-        val code = con.responseCode
-        val txt = (if (code in 200..299) con.inputStream else con.errorStream)
-            ?.bufferedReader()?.use { it.readText() }
-        code to txt
-    } catch (_: Exception) { -1 to null }
-}
-
-/* POST form مطلق (KD1S) — نغلفها بدالة suspend */
-private fun httpPostFormAbsolute(fullUrl: String, fields: Map<String, String>, headers: Map<String, String> = emptyMap()): Pair<Int, String?> {
-    return try {
-        val url = URL(fullUrl)
-        val form = fields.entries.joinToString("&") { (k, v) -> "${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v, "UTF-8")}" }
-        val con = (url.openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            doOutput = true
-            connectTimeout = 12000
-            readTimeout = 12000
-            setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-            headers.forEach { (k, v) -> setRequestProperty(k, v) }
-        }
-        con.outputStream.use { it.write(form.toByteArray(Charsets.UTF_8)) }
-        val code = con.responseCode
-        val txt = (if (code in 200..299) con.inputStream else con.errorStream)
-            ?.bufferedReader()?.use { it.readText() }
-        code to txt
-    } catch (_: Exception) { -1 to null }
-}
-
-/* أغلفة suspend للـ POSTs */
-private suspend fun httpPost(path: String, json: JSONObject, headers: Map<String, String> = emptyMap()): Pair<Int, String?> =
-    withContext(Dispatchers.IO) { httpPostBlocking(path, json, headers) }
-
-private suspend fun httpPostFormAbs(fullUrl: String, fields: Map<String, String>, headers: Map<String, String> = emptyMap()): Pair<Int, String?> =
-    withContext(Dispatchers.IO) { httpPostFormAbsolute(fullUrl, fields, headers) }
-
-/* ===== وظائف مشتركة مع الخادم ===== */
-private suspend fun pingHealth(): Boolean? {
-    val (code, _) = httpGet("/health")
-    return code in 200..299
-}
-private suspend fun tryUpsertUid(uid: String) {
-    httpPost("/api/users/upsert", JSONObject().put("uid", uid))
-}
-private suspend fun apiGetBalance(uid: String): Double? {
-    val (code, txt) = httpGet("/api/wallet/balance?uid=$uid")
-    return if (code in 200..299 && txt != null) {
-        try { JSONObject(txt.trim()).optDouble("balance") } catch (_: Exception) { null }
-    } else null
-}
-private suspend fun apiCreateProviderOrder(
-    uid: String, serviceId: Long, serviceName: String, link: String, quantity: Int, price: Double
-): Boolean {
-    val body = JSONObject()
-        .put("uid", uid)
-        .put("service_id", serviceId)
-        .put("service_name", serviceName)
-        .put("link", link)
-        .put("quantity", quantity)
-        .put("price", price)
-    val (code, txt) = httpPost("/api/orders/create/provider", body)
-    return code in 200..299 && (txt?.contains("ok", ignoreCase = true) == true)
-}
-
-/* أسيا سيل */
-private suspend fun apiSubmitAsiacellCard(uid: String, card: String): Boolean {
-    val (code, txt) = httpPost(
-        "/api/wallet/asiacell/submit",
-        JSONObject().put("uid", uid).put("card", card)
-    )
-    if (code !in 200..299) return false
-    return try {
-        if (txt == null) return true
-        val obj = JSONObject(txt.trim())
-        obj.optBoolean("ok", true) || obj.optString("status").equals("received", true)
-    } catch (_: Exception) { true }
-}
-
-/* PayTabs – شحن الرصيد عبر الماستر/فيزا */
-private suspend fun apiCreatePayTabsPayment(uid: String, amountUsd: Double): String? {
-    val body = JSONObject()
-        .put("uid", uid)
-        .put("usd", amountUsd)
-    val (code, txt) = httpPost("/api/wallet/paytabs/create", body)
-    if (code !in 200..299 || txt == null) return null
-    return try {
-        val obj = JSONObject(txt.trim())
-        obj.optString("payment_url", null)
-    } catch (_: Exception) {
-        null
-    }
-}
-
-private suspend fun apiCreateManualOrder(uid: String, name: String): Boolean {
-    val body = JSONObject().put("uid", uid).put("title", name)
-    val (code, txt) = httpPost("/api/orders/create/manual", body)
-    return code in 200..299 && (txt?.contains("ok", true) == true)
-}
+    return {"ok": True, "uid": uid, "amount": amount}
 
 
-suspend fun apiCreateManualPaidOrder(uid: String, product: String, usd: Double, accountId: String? = null): Pair<Boolean, String?> {
-    val body = JSONObject()
-        .put("uid", uid)
-        .put("product", product)
-        .put("usd", usd)
-    if (!accountId.isNullOrBlank()) body.put("account_id", accountId)
-    val (code, txt) = httpPost("/api/orders/create/manual_paid", body)
-    val ok = code in 200..299 && (txt?.contains("ok", true) == true || txt?.contains("order_id", true) == true)
-    return Pair(ok, txt)
-}
-suspend fun apiCreateManualPaidOrder(uid: String, product: String, usd: Int, accountId: String? = null): Pair<Boolean, String?> {
-    val body = JSONObject()
-        .put("uid", uid)
-        .put("product", product)
-        .put("usd", usd)
-    if (!accountId.isNullOrBlank()) body.put("account_id", accountId)
-    val (code, txt) = httpPost("/api/orders/create/manual_paid", body)
-    val ok = code in 200..299 && (txt?.contains("ok", true) == true || txt?.contains("order_id", true) == true)
-    return Pair(ok, txt)
-}
+@app.api_route("/payment/result", methods=["GET", "POST"], response_class=HTMLResponse)
+async def wallet_paytabs_return(request: Request):
+    """
+    Simple landing page for PayTabs return URL.
+    The wallet balance is updated in the /api/wallet/paytabs/callback endpoint.
+    This page is only to show a friendly message to the user.
+    """
+    html = """<html><head><meta charset="utf-8"><title>نتيجة الدفع</title></head>
+    <body style="font-family: sans-serif; text-align: center; padding-top: 40px;">
+      <h2>تم استلام نتيجة الدفع</h2>
+      <p>إذا كانت عملية الدفع ناجحة، سيتم تحديث رصيدك داخل التطبيق خلال لحظات.</p>
+      <p>يمكنك الآن إغلاق هذه الصفحة والعودة إلى التطبيق.</p>
+    </body></html>"""
+    return HTMLResponse(content=html)
 
-private suspend fun apiGetMyOrders(uid: String): List<OrderItem>? {
-    val (code, txt) = httpGet("/api/orders/my?uid=$uid")
-    if (code !in 200..299 || txt == null) return null
-    return try {
-        val trimmed = txt.trim()
-        val arr: JSONArray = if (trimmed.startsWith("[")) {
-            JSONArray(trimmed)
-        } else {
-            val obj = JSONObject(trimmed)
-            when {
-                obj.has("orders") -> obj.optJSONArray("orders") ?: JSONArray()
-                obj.has("list")   -> obj.optJSONArray("list") ?: JSONArray()
-                else -> JSONArray()
-            }
-        }
-        (0 until arr.length()).map { i ->
-            val o = arr.getJSONObject(i)
-            OrderItem(
-                id = o.optString("id"),
-                title = o.optString("title"),
-                quantity = o.optInt("quantity"),
-                price = o.optDouble("price"),
-                payload = o.optString("payload"),
-                status = when (o.optString("status")) {
-                    "Done" -> OrderStatus.Done
-                    "Rejected" -> OrderStatus.Rejected
-                    "Refunded" -> OrderStatus.Refunded
-                    "Processing" -> OrderStatus.Processing
-                    else -> OrderStatus.Pending
-                },
-                createdAt = o.optLong("created_at"),
-                uid = o.optString("uid","")
+
+# Create provider order core
+def _create_provider_order_core(cur, uid: str, service_id: Optional[int], service_name: str,
+                                link: Optional[str], quantity: int, price: float) -> int:
+    cur.execute("SELECT id, balance, is_banned FROM public.users WHERE uid=%s", (uid,))
+    r = cur.fetchone()
+    if not r:
+        raise HTTPException(404, "user not found")
+    user_id, bal, banned = r[0], float(r[1]), bool(r[2])
+    if banned:
+        raise HTTPException(403, "user banned")
+
+    # apply service-id override by service_name (ui_key)
+    eff_sid = service_id
+    try:
+        if service_name:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS public.service_id_overrides(
+                    ui_key TEXT PRIMARY KEY,
+                    service_id BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("SELECT service_id FROM public.service_id_overrides WHERE ui_key=%s", (service_name,))
+            r_eff = cur.fetchone()
+            if r_eff and r_eff[0]:
+                eff_sid = int(r_eff[0])
+    except Exception:
+        pass
+
+    # apply pricing override by service_name (ui_key)
+    eff_price = price
+    try:
+        rowp = None
+        if service_name:
+            # exact match
+            cur.execute("SELECT price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (service_name,))
+            rowp = cur.fetchone()
+
+        # normalization fallback on ui_key
+        if not rowp and service_name:
+            cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides")
+            allp = cur.fetchall() or []
+            sn = _normalize_ui_key(service_name)
+            for ui_key, ppk, mn, mx, mode in allp:
+                if _normalize_ui_key(ui_key) == sn:
+                    rowp = (ppk, mn, mx, mode)
+                    break
+
+        # fallback by service_id mapping if present
+        if not rowp and service_id:
+            try:
+                cur.execute("SELECT p.price_per_k, p.min_qty, p.max_qty, COALESCE(p.mode,'per_k') FROM public.service_id_overrides s JOIN public.service_pricing_overrides p ON p.ui_key = s.ui_key WHERE s.service_id=%s", (int(service_id),))
+                rowp = cur.fetchone()
+            except Exception:
+                pass
+
+        if rowp:
+            ppk = float(rowp[0]); mn = int(rowp[1]); mx = int(rowp[2]); mode = (rowp[3] or 'per_k')
+            if mode == 'flat':
+                eff_price = float(ppk)
+            else:
+                if quantity < mn or quantity > mx:
+                    raise HTTPException(400, f"quantity out of allowed range [{mn}-{mx}]")
+                eff_price = float(Decimal(quantity) * Decimal(ppk) / Decimal(1000))
+
+        if not rowp:
+            # category-level fallback for PUBG/Ludo
+            key = None
+            sname = (service_name or "").lower()
+            if any(w in sname for w in ["pubg","ببجي","uc"]):
+                key = "cat.pubg"
+            elif any(w in sname for w in ["ludo","لودو"]):
+                key = "cat.ludo"
+            if key:
+                cur.execute("SELECT price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (key,))
+                rowp = cur.fetchone()
+                if rowp:
+                    ppk = float(rowp[0]); mn = int(rowp[1]); mx = int(rowp[2]); mode = (rowp[3] or 'per_k')
+                    if mode == 'flat':
+                        eff_price = float(ppk)
+                    else:
+                        if quantity < mn or quantity > mx:
+                            raise HTTPException(400, f"quantity out of allowed range [{mn}-{mx}]")
+                        eff_price = float(Decimal(quantity) * Decimal(ppk) / Decimal(1000))
+    except Exception:
+        pass
+
+    # charge if paid# charge if paid (use effective price)
+    if eff_price and eff_price > 0:
+        if bal < eff_price:
+            raise HTTPException(400, "insufficient balance")
+        cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (Decimal(eff_price), user_id))
+        cur.execute("""
+            INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+            VALUES(%s,%s,%s,%s)
+        """, (user_id, Decimal(-eff_price), "order_charge",
+              Json({"service_id": service_id, "name": service_name, "qty": quantity, "price_effective": eff_price})))
+
+    cur.execute("""
+        INSERT INTO public.orders(user_id, title, service_id, link, quantity, price, status, payload, type)
+        VALUES(%s,%s,%s,%s,%s,%s,'Pending',%s,%s)
+        RETURNING id
+    """, (user_id, service_name, eff_sid, link, quantity, Decimal(eff_price or 0),
+          Json({"source": "provider_form", "service_id_provided": service_id, "service_id_effective": eff_sid, "price_effective": eff_price}), 'provider'))
+    oid = cur.fetchone()[0]
+    return oid
+
+@app.post("/api/orders/create/provider")
+def create_provider_order(body: ProviderOrderIn):
+    conn = get_conn()
+    try:
+        # create order & collect data inside txn
+        with conn, conn.cursor() as cur:
+            oid = _create_provider_order_core(
+                cur, body.uid, body.service_id, body.service_name,
+                body.link, body.quantity, body.price
             )
-        }
-    } catch (_: Exception) { null }
-}
+            # collect needed fields but DO NOT notify yet (commit first)
+            cur.execute("SELECT user_id, title FROM public.orders WHERE id=%s", (oid,))
+            row = cur.fetchone()
+            user_id = row[0] if row else None
+            title = row[1] if row else body.service_name
 
-/* ===== إشعارات المستخدم من الخادم ===== */
-private fun noticeKey(n: AppNotice) = n.title + "|" + n.body + "|" + n.ts
+        # now outside transaction (COMMITTED): safe to notify
+        if user_id:
+            _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {title}.")
+        _notify_owner_new_order(conn, oid)
+        return {"ok": True, "order_id": oid}
+    finally:
+        put_conn(conn)
 
-private fun mergeNotices(local: List<AppNotice>, incoming: List<AppNotice>): List<AppNotice> {
-    val seen = local.associateBy { noticeKey(it) }.toMutableMap()
-    incoming.forEach { n -> seen.putIfAbsent(noticeKey(n), n) }
-    return seen.values.sortedByDescending { it.ts }
-}
+# Compat creation paths
+PROVIDER_CREATE_PATHS = [
+    "/api/orders/create", "/api/order/create",
+    "/api/create/order",  "/api/orders/add",
+    "/api/add_order",     "/api/orders/provider/create"
+]
+def _parse_provider_payload(d: Dict[str, Any]) -> Dict[str, Any]:
+    uid = (d.get("uid") or d.get("user_id") or "").strip()
+    sv = d.get("service_id", d.get("service", d.get("category_id")))
+    service_id = int(sv) if sv not in (None, "", []) else None
+    link = d.get("link") or d.get("url") or d.get("target") or None
+    qty_raw = d.get("quantity", d.get("qty", d.get("amount", 0)))
+    quantity = int(qty_raw or 0)
+    price = float(d.get("price", d.get("cost", 0)) or 0)
+    service_name = d.get("service_name") or d.get("name") or (f"Service {service_id}" if service_id else "Manual")
+    return dict(uid=uid, service_id=service_id, link=link, quantity=quantity, price=price, service_name=service_name)
 
-private suspend fun apiFetchNotificationsByUid(uid: String, limit: Int = 50): List<AppNotice>? {
-    // 1) try by-uid
-    val (code1, txt1) = httpGet("/api/user/by-uid/$uid/notifications?status=unread&limit=$limit")
-    if (code1 in 200..299 && txt1 != null) {
-        try {
-            val arr = org.json.JSONArray(txt1!!.trim())
-            val out = mutableListOf<AppNotice>()
-            for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                val title = o.optString("title","إشعار")
-                val body  = o.optString("body","")
-                val tsMs  = o.optLong("created_at", System.currentTimeMillis())
-                out += AppNotice(title, body, if (tsMs < 2_000_000_000L) tsMs*1000 else tsMs, forOwner = false)
+for path in PROVIDER_CREATE_PATHS:
+    @app.post(path)
+    async def provider_create_compat(request: Request, _path=path):
+        data = await _read_json_object(request)
+        try:
+            p = _parse_provider_payload(data)
+            if not p["uid"] or p["quantity"] <= 0:
+                raise ValueError
+        except Exception:
+            raise HTTPException(422, "invalid payload")
+        conn = get_conn()
+        try:
+            # Do all DB writes first
+            with conn, conn.cursor() as cur:
+                oid = _create_provider_order_core(cur, p["uid"], p["service_id"], p["service_name"], p["link"], p["quantity"], p["price"])
+                # collect user_id for notify after commit
+                cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
+                ur = cur.fetchone()
+                user_id = ur[0] if ur else None
+
+            # After COMMIT: push notifications
+            if user_id:
+                _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {p['service_name']}.")
+            _notify_owner_new_order(conn, oid)
+            return {"ok": True, "order_id": oid}
+        finally:
+            put_conn(conn)
+
+# Manual order
+@app.post("/api/orders/create/manual")
+def create_manual_order(body: ManualOrderIn):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            user_id = _ensure_user(cur, body.uid)
+            cur.execute("""
+                INSERT INTO public.orders(user_id, title, quantity, price, status, payload, type)
+                VALUES(%s,%s,0,0,'Pending','{}'::jsonb,'manual')
+                RETURNING id
+            """, (user_id, body.title))
+            oid = cur.fetchone()[0]
+        _notify_user(conn, user_id, oid, "تم استلام طلبك", f"تم استلام طلب {body.title}.")
+        _notify_owner_new_order(conn, oid)
+        return {"ok": True, "order_id": oid}
+    finally:
+        put_conn(conn)
+
+# Asiacell submit (topup via card)
+def _asiacell_submit_core(cur, uid: str, card_digits: str) -> int:
+    user_id = _ensure_user(cur, uid)
+    cur.execute("""
+        INSERT INTO public.orders(user_id, title, quantity, price, status, payload, type)
+        VALUES(%s,%s,0,0,'Pending', %s, 'topup_card')
+        RETURNING id
+    """, (user_id, "كارت أسيا سيل", Json({"card": card_digits})))
+    return cur.fetchone()[0]
+
+def _extract_digits(raw: Any) -> str:
+    return "".join(ch for ch in str(raw) if ch.isdigit())
+
+def _create_paytabs_payment_page(uid: str, amount: float) -> str:
+    """
+    Create PayTabs Hosted Payment Page and return redirect_url.
+    Uses PAYTABS_* env vars and BACKEND_PUBLIC_URL.
+    """
+    if not PAYTABS_PROFILE_ID or not PAYTABS_SERVER_KEY or not PAYTABS_BASE_URL:
+        raise HTTPException(500, "PayTabs is not configured")
+
+    try:
+        profile_id_int = int(PAYTABS_PROFILE_ID)
+    except Exception:
+        raise HTTPException(500, "PAYTABS_PROFILE_ID must be integer")
+
+    url = f"{PAYTABS_BASE_URL}/payment/request"
+
+    # simple unique cart id
+    cart_id = f"WALLET-{uid}-{int(time.time())}"[:64]
+
+    backend_domain = BACKEND_PUBLIC_URL or "https://example.com"
+    callback_url = backend_domain.rstrip("/") + "/api/wallet/paytabs/callback"
+    return_url = backend_domain.rstrip("/") + "/payment/result"
+
+    customer = {
+        "name": f"Wallet user {uid}",
+        "email": f"{uid}@ratluzen-wallet.local",
+        "phone": "0000000000",
+        "street1": "N/A",
+        "city": "Baghdad",
+        "state": "BG",
+        "country": "IQ",
+        "zip": "00000",
+    }
+
+    payload = {
+        "profile_id": profile_id_int,
+        "tran_type": "sale",
+        "tran_class": "ecom",
+        "cart_id": cart_id,
+        "cart_currency": PAYTABS_CURRENCY,
+        "cart_amount": round(float(amount) * 1320.0, 2),
+        "cart_description": f"Wallet top-up for UID {uid}",
+        "payment_methods": ["creditcard"],
+        "callback": callback_url,
+        "return": return_url,
+        "hide_shipping": True,
+        "customer_details": customer,
+        "shipping_details": customer,
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "authorization": PAYTABS_SERVER_KEY,
+    }
+
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=20)
+    except Exception as e:
+        raise HTTPException(502, f"Error connecting to PayTabs: {e}")
+
+    if resp.status_code < 200 or resp.status_code >= 300:
+        logging.getLogger("smm").error(
+            "PayTabs API error: url=%s status=%s body=%s",
+            url,
+            resp.status_code,
+            (resp.text or "")[:400],
+        )
+        raise HTTPException(502, f"PayTabs API error: HTTP {resp.status_code}")
+
+    try:
+        data = resp.json()
+    except Exception:
+        raise HTTPException(502, "Invalid JSON from PayTabs")
+
+    redirect_url = data.get("redirect_url") or data.get("invoice_link")
+    if not redirect_url:
+        raise HTTPException(502, "PayTabs did not return redirect_url")
+
+    return redirect_url
+
+
+ASIACELL_PATHS = [
+    "/api/wallet/asiacell/submit",
+    "/api/topup/asiacell/submit",
+    "/api/asiacell/submit",
+    "/api/asiacell/recharge",
+    "/api/wallet/asiacell",
+    "/api/topup/asiacell",
+    "/api/asiacell",
+]
+
+@app.post("/api/wallet/asiacell/submit")
+def submit_asiacell(body: AsiacellSubmitIn):
+    digits = _extract_digits(body.card)
+    if len(digits) < 10:
+        raise HTTPException(422, "invalid card length")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            oid = _asiacell_submit_core(cur, body.uid, digits)
+            # collect user_id for notify after commit
+            cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
+            r = cur.fetchone()
+            user_id = r[0] if r else None
+
+        # After COMMIT: push notifications
+        if user_id:
+            _notify_user(conn, user_id, oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
+        _notify_owner_new_order(conn, oid)
+        return {"ok": True, "order_id": oid, "status": "received"}
+    finally:
+        put_conn(conn)
+
+for path in ASIACELL_PATHS[1:]:
+    @app.post(path)
+    async def submit_asiacell_compat(request: Request, _path=path):
+        data = await _read_json_object(request)
+        uid = (data.get("uid") or data.get("user_id") or "").strip()
+        raw = (data.get("card") or data.get("code") or data.get("voucher") or
+               data.get("number") or data.get("serial") or
+               data.get("recharge_no") or data.get("recharge_number") or
+               data.get("value") or data.get("pin") or "")
+        digits = _extract_digits(raw)
+        if not uid or len(digits) < 10:
+            raise HTTPException(422, "invalid payload")
+        conn = get_conn()
+        try:
+            with conn, conn.cursor() as cur:
+                oid = _asiacell_submit_core(cur, uid, digits)
+                cur.execute("SELECT user_id FROM public.orders WHERE id=%s", (oid,))
+                r = cur.fetchone()
+                if r:
+                    _notify_user(conn, r[0], oid, "تم استلام طلبك", "تم استلام طلب كارت أسيا سيل.")
+            _notify_owner_new_order(conn, oid)
+            return {"ok": True, "order_id": oid, "status": "received"}
+        finally:
+            put_conn(conn)
+
+# Orders of a user
+def _orders_for_uid(uid: str) -> List[dict]:
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                return []
+            user_id = r[0]
+            cur.execute("""
+                SELECT id, title, quantity, price,
+                       status, EXTRACT(EPOCH FROM created_at)*1000, link
+                FROM public.orders
+                WHERE user_id=%s
+                ORDER BY id DESC
+            """, (user_id,))
+            rows = cur.fetchall()
+        return [{
+            "id": row[0],
+            "title": row[1],
+            "quantity": row[2],
+            "price": float(row[3] or 0),
+            "status": row[4],
+            "created_at": int(row[5] or 0),
+            "link": row[6]
+        } for row in rows]
+    finally:
+        put_conn(conn)
+
+@app.get("/api/orders/my")
+def my_orders(uid: str):
+    return _orders_for_uid(uid)
+
+# more aliases for safety
+@app.get("/api/orders")
+def orders_alias(uid: str):
+    return _orders_for_uid(uid)
+
+@app.get("/api/user/orders")
+def user_orders_alias(uid: str):
+    return _orders_for_uid(uid)
+
+@app.get("/api/users/{uid}/orders")
+def user_orders_path(uid: str):
+    return _orders_for_uid(uid)
+
+@app.get("/api/orders/list")
+def orders_list(uid: str):
+    return {"orders": _orders_for_uid(uid)}
+
+@app.get("/api/user/orders/list")
+def user_orders_list(uid: str):
+    return {"orders": _orders_for_uid(uid)}
+
+# =========================
+# Notifications
+# =========================
+@app.get("/api/notifications/by_uid")
+def _alias_notifications_by_uid(uid: str, status: str = "unread", limit: int = 50):
+    return list_user_notifications(uid=uid, status=status, limit=limit)
+
+@app.get("/api/user/by-uid/{uid}/notifications")
+def list_user_notifications(uid: str, status: str = "unread", limit: int = 50):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                return []
+            user_id = r["id"]
+            where = "WHERE user_id=%s"
+            params = [user_id]
+            if status not in ("unread","read","all"):
+                status = "unread"
+            if status != "all":
+                where += " AND status=%s"
+                params.append(status)
+            logger.info("list_notifications request uid=%s status=%s limit=%s", uid, status, limit)
+            cur.execute(f"""
+                SELECT id, user_id, order_id, title, body, status,
+                       EXTRACT(EPOCH FROM created_at)*1000 AS created_at,
+                       EXTRACT(EPOCH FROM read_at)*1000   AS read_at
+                FROM public.user_notifications
+                {where}
+                ORDER BY id DESC
+                LIMIT %s
+            """, (*params, limit))
+            rows = cur.fetchall() or []
+            logger.info("list_notifications uid=%s -> %s rows", uid, len(rows))
+            return rows
+    finally:
+        put_conn(conn)
+
+@app.post("/api/user/{uid}/notifications/{nid}/read")
+def mark_notification_read(uid: str, nid: int):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                raise HTTPException(404, "user not found")
+            user_id = r["id"]
+            cur.execute(
+                "UPDATE public.user_notifications SET status='read', read_at=NOW() WHERE id=%s AND user_id=%s RETURNING id",
+                (nid, user_id)
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "notification not found")
+            return {"ok": True, "id": row["id"]}
+    finally:
+        put_conn(conn)
+
+# =========================
+# Manual PAID orders (charge now, refund on reject)
+# =========================
+@app.post("/api/orders/create/manual_paid")
+async def create_manual_paid(request: Request):
+    """
+    Creates a manual order (iTunes / Atheer / Asiacell / Korek / PUBG / Ludo) and atomically charges user balance.
+
+    هذه الـ endpoint تُستخدم لكل الطلبات اليدوية التي تخصم من المحفظة مباشرة ثم تعيد المبلغ
+    في حال قام المالك برفض الطلب لاحقًا.
+
+    Body (flexible JSON), أمثلة للحقول المتوقعة:
+      {
+        "uid": "1234567",
+        "product": "pubg_uc" | "ludo_diamond" | "ludo_gold" | "itunes" | "atheer" | "asiacell" | "korek",
+        // لببجي/لودو:
+        "quantity": 650,        // 650 شدة - أو 810 الماسة - أو 56468 ذهب (كميات)
+        "price": 2.50,          // السعر بالدولار ويحتوي أجزاء
+        // أو لإصدار أقدم:
+        // "usd": 2.50           // في هذه الحالة نعتبره هو السعر
+        // لخدمات الرصيد/ايتونز:
+        // "usd": 5              // قيمة الرصيد بالدولار (5, 10, 15, ...)
+        "account_id": "PLAYER_ID(optional)"
+      }
+    """
+    data = await _read_json_object(request)
+    uid = (data.get("uid") or "").strip()
+    product_raw = (data.get("product") or data.get("type") or data.get("category") or data.get("title") or "").strip()
+
+    # Player account / game id (optional but stored)
+    account_id = (data.get("account_id") or data.get("accountId") or data.get("game_id") or "").strip()
+
+    if not uid:
+        raise HTTPException(422, "invalid payload")
+
+    product = _normalize_product(product_raw, fallback_title=data.get("title") or "")
+
+    telco_products = ("itunes", "atheer", "asiacell", "korek")
+    game_products = ("pubg_uc", "ludo_diamond", "ludo_gold")
+
+    usd = 0            # يستخدم مع ايتونز/الرصيد (5,10,15,...)
+    game_qty = 0       # 60 شدة، 650 شدة، 810 الماسة، 56468 ذهب ...
+    price = 0.0        # السعر الفعلي الذي سيتم خصمه من المحفظة (يدعم الكسور)
+    title = ""
+
+    # -------- Telco / iTunes (topups) --------
+    if product in telco_products:
+        usd = _parse_usd(data)
+        if usd <= 0:
+            raise HTTPException(422, "invalid usd for telco/itunes")
+
+        # سعر افتراضي حسب كل 5$ (يمكن أن يتغير عبر overrides بالأسفل)
+        steps = usd / 5.0
+        if product == "itunes":
+            price = steps * 9.0
+            title = f"شراء رصيد ايتونز {usd}$"
+        elif product == "atheer":
+            price = steps * 7.0
+            title = f"شراء رصيد اثير {usd}$"
+        elif product == "asiacell":
+            price = steps * 7.0
+            title = f"شراء رصيد اسياسيل {usd}$"
+        elif product == "korek":
+            price = steps * 7.0
+            title = f"شراء رصيد كورك {usd}$"
+
+    # -------- PUBG / Ludo (games) --------
+    elif product in game_products:
+        # الكمية مثل 60 شدة / 810 الماسة / 56468 ذهب
+        game_qty = _parse_game_quantity(data)
+        if game_qty <= 0:
+            # للتوافق مع إصدارات أقدم قد ترسل الكمية في usd أو amount فقط
+            game_qty = _parse_usd(data)
+        if game_qty <= 0:
+            raise HTTPException(422, "invalid quantity for game service")
+
+        # السعر الفعلي الذي يحتوي أجزاء
+        game_price = _parse_game_price(data)
+        if game_price <= 0:
+            raise HTTPException(422, "invalid price for game service")
+
+        price = float(game_price)
+        # نخزّن أيضًا نسخة تقريبية في usd فقط للاستخدامات الثانوية (مثلاً الـpayload/meta القديمة)
+        usd = int(price) if price > 0 else 0
+
+        if product == "pubg_uc":
+            title = f"شحن شدات ببجي {game_qty} شدة بسعر {price}$"
+        elif product == "ludo_diamond":
+            title = f"شراء الماسات لودو {game_qty} الماسة بسعر {price}$"
+        elif product == "ludo_gold":
+            title = f"شراء ذهب لودو {game_qty} ذهب بسعر {price}$"
+    else:
+        raise HTTPException(422, "invalid product")
+
+    if account_id:
+        title = f"{title} | ID: {account_id}"
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+
+            # --- Dynamic pricing overrides for topup (iTunes/Atheer/Asiacell/Korek) ---
+            # إذا كان هناك override مثل ui_key = "topup.<product>.<usd>" نستخدمه كسعر ثابت للبكج.
+            override_row = None
+            if product in telco_products:
+                try:
+                    _ensure_pricing_table(cur)
+                    try:
+                        _ensure_pricing_mode_column(cur)
+                    except Exception:
+                        pass
+                    ui_key = f"topup.{product}.{usd}"
+                    cur.execute(
+                        "SELECT price_per_k, COALESCE(min_qty,0), COALESCE(max_qty,0), COALESCE(mode,'per_k') "
+                        "FROM public.service_pricing_overrides WHERE ui_key=%s",
+                        (ui_key,)
+                    )
+                    override_row = cur.fetchone()
+                except Exception:
+                    override_row = None
+
+            # التحقق من قيم ايتونز/الرصيد: نسمح بقيم مخصّصة إذا وجد override
+            if product in telco_products:
+                allowed_telco = {5, 10, 15, 20, 25, 30, 40, 50, 100}
+                if (usd not in allowed_telco) and (not override_row):
+                    raise HTTPException(422, "invalid usd for telco/itunes")
+
+            # حساب السعر النهائي والعنوان مع تطبيق override إن وجد (لخدمات الرصيد فقط)
+            if product in telco_products:
+                if override_row:
+                    ppk, mn, mx, mode = float(override_row[0]), int(override_row[1] or 0), int(override_row[2] or 0), (override_row[3] or "per_k")
+                    # في حالة الـ topup نعامل price_per_k كسعر ثابت للبكج
+                    price = float(ppk)
+                    effective_usd = int(mn) if mn and mn > 0 else int(usd)
+                    usd = effective_usd
+                    ar_label = {"itunes": "ايتونز", "atheer": "اثير", "asiacell": "اسياسيل", "korek": "كورك"}.get(product, product)
+                    title = f"شراء رصيد {ar_label} {usd}$"
+                else:
+                    # إعادة حساب احتياطية في حال تغيّر usd
+                    steps = usd / 5.0
+                    if product == "itunes":
+                        price = steps * 9.0
+                        title = f"شراء رصيد ايتونز {usd}$"
+                    elif product == "atheer":
+                        price = steps * 7.0
+                        title = f"شراء رصيد اثير {usd}$"
+                    elif product == "asiacell":
+                        price = steps * 7.0
+                        title = f"شراء رصيد اسياسيل {usd}$"
+                    elif product == "korek":
+                        price = steps * 7.0
+                        title = f"شراء رصيد كورك {usd}$"
+
+            # ---------------------------------------------------------------------------
+            # ensure user & balance
+            cur.execute("SELECT id, balance, is_banned FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                cur.execute("INSERT INTO public.users(uid) VALUES(%s) RETURNING id, 0.0, FALSE", (uid,))
+                r = cur.fetchone()
+            user_id, bal, banned = int(r[0]), float(r[1] or 0), bool(r[2])
+            if banned:
+                raise HTTPException(403, "user banned")
+            if bal < price:
+                raise HTTPException(400, "insufficient balance")
+
+            # charge
+            cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (Decimal(price), user_id))
+            # meta: نحتفظ بكل من السعر والكمية لألعاب ببجي/لودو، و usd للبقية
+            meta: Dict[str, Any] = {"product": product, "account_id": account_id}
+            if product in telco_products:
+                meta["usd"] = usd
+            else:
+                meta["usd"] = price  # للتوافق مع البيانات القديمة
+                meta["game_qty"] = game_qty
+                meta["price"] = price
+            cur.execute(
+                "INSERT INTO public.wallet_txns(user_id, amount, reason, meta) VALUES(%s,%s,%s,%s)",
+                (user_id, Decimal(-price), "order_charge", Json(meta))
+            )
+
+            # create pending manual order carrying the price for future refund if rejected
+            payload: Dict[str, Any] = {"product": product, "charged": float(price)}
+            if product in telco_products:
+                payload["usd"] = usd
+            else:
+                payload["usd"] = price
+                payload["game_qty"] = game_qty
+            if account_id:
+                payload["account_id"] = account_id
+
+            quantity_value = usd if product in telco_products else (game_qty or usd)
+            cur.execute(
+                """
+                INSERT INTO public.orders(user_id, title, quantity, price, status, payload, type)
+                VALUES(%s,%s,%s,%s,'Pending',%s,'manual')
+                RETURNING id
+                """
+                ,
+                (user_id, title, quantity_value, float(price), Json(payload))
+            )
+            oid = cur.fetchone()[0]
+
+        # optional: immediate user notification (order received)
+        body = title + (f" | ID: {account_id}" if account_id else "")
+        _notify_user(conn, user_id, oid, "تم استلام طلبك", body)
+        _notify_owner_new_order(conn, oid)
+
+        return {"ok": True, "order_id": oid, "charged": float(price)}
+    finally:
+        put_conn(conn)
+
+
+# Additional compat aliases for manual_paid (covering multiple potential paths from the app)
+@app.post("/api/create/manual_paid")
+async def create_manual_paid_alias1(request: Request):
+    return await create_manual_paid(request)
+
+@app.post("/api/orders/manual_paid/create")
+async def create_manual_paid_alias2(request: Request):
+    return await create_manual_paid(request)
+
+@app.post("/api/orders/create/manual-paid")
+async def create_manual_paid_alias3(request: Request):
+    return await create_manual_paid(request)
+
+@app.post("/api/createManualPaidOrder")
+async def create_manual_paid_alias4(request: Request):
+    return await create_manual_paid(request)
+
+@app.post("/api/orders/createManualPaid")
+async def create_manual_paid_alias5(request: Request):
+    return await create_manual_paid(request)
+
+@app.post("/api/orders/createManualPaidOrder")
+async def create_manual_paid_alias6(request: Request):
+    return await create_manual_paid(request)
+
+@app.post("/api/manual_paid")
+async def create_manual_paid_alias7(request: Request):
+    return await create_manual_paid(request)
+
+@app.post("/api/orders/manualPaid")
+async def create_manual_paid_alias8(request: Request):
+    return await create_manual_paid(request)
+
+# =========================
+# Approve/Deliver/Reject
+# =========================
+@app.post("/api/admin/orders/{oid}/approve")
+def admin_approve_order(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    body = {}
+    try:
+        body = json.loads(request._body.decode()) if hasattr(request, "_body") and request._body else {}
+    except Exception:
+        try:
+            body = request._json  # type: ignore
+        except Exception:
+            body = {}
+    _require_admin(_pick_admin_password(x_admin_password, password, body) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, user_id, service_id, link, quantity, price, status, provider_order_id, title, payload, type
+                FROM public.orders WHERE id=%s FOR UPDATE
+            """, (oid,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "order not found")
+
+            (order_id, user_id, service_id, link, quantity, price, status, provider_order_id, title, payload, otype) = row
+            price = float(price or 0)
+
+            if status not in ("Pending", "Processing"):
+                raise HTTPException(400, "invalid status")
+
+            # manual/topup_card doesn't call provider
+            if otype in ("topup_card", "manual") or service_id is None:
+                cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
+                return {"ok": True, "status": "Done"}
+
+            try:
+                resp = requests.post(
+                    PROVIDER_API_URL,
+                    data={"key": PROVIDER_API_KEY, "action": "add", "service": str(service_id), "link": link, "quantity": str(quantity)},
+                    timeout=25
+                )
+            except Exception:
+                _refund_if_needed(cur, user_id, price, order_id)
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                return {"ok": False, "status": "Rejected", "reason": "provider_unreachable"}
+
+            if resp.status_code // 100 != 2:
+                _refund_if_needed(cur, user_id, price, order_id)
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                return {"ok": False, "status": "Rejected", "reason": "provider_http"}
+
+            try:
+                data = resp.json()
+            except Exception:
+                _refund_if_needed(cur, user_id, price, order_id)
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                return {"ok": False, "status": "Rejected", "reason": "bad_provider_json"}
+
+            provider_id = data.get("order") or data.get("order_id")
+            if not provider_id:
+                _refund_if_needed(cur, user_id, price, order_id)
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+                return {"ok": False, "status": "Rejected", "reason": "no_provider_id"}
+
+            cur.execute("""
+                UPDATE public.orders
+                SET provider_order_id=%s, status='Processing'
+                WHERE id=%s
+            """, (str(provider_id), order_id))
+            return {"ok": True, "status": "Processing", "provider_order_id": provider_id}
+    finally:
+        put_conn(conn)
+
+def _refund_if_needed(cur, user_id: int, price: float, order_id: int):
+    # Correctly use the price parameter (eff_price might be used elsewhere).
+    if price and price > 0:
+        cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(price), user_id))
+        cur.execute("""
+            INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+            VALUES(%s,%s,%s,%s)
+        """, (user_id, Decimal(price), "order_refund", Json({"order_id": order_id})))
+
+@app.post("/api/admin/orders/{oid}/deliver")
+async def admin_deliver(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    data = await _read_json_object(request)
+    _require_admin(_pick_admin_password(x_admin_password, password, data) or "")
+
+    code_val = (data.get("code") or "").strip()
+    amount   = data.get("amount")
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id, user_id, price, status, payload, title, COALESCE(type,'') FROM public.orders WHERE id=%s FOR UPDATE", (oid,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "order not found")
+            order_id, user_id, price, status, payload, title, otype = row[0], row[1], float(row[2] or 0), row[3], (row[4] or {}), row[5], (row[6] or "")
+
+            if status in ("Done", "Rejected", "Refunded"):
+                return {"ok": True, "status": status}
+
+            needs_code = _needs_code(title, otype)
+            is_jsonb = _payload_is_jsonb(conn)
+
+            current = {}
+            if isinstance(payload, dict):
+                current.update(payload)
+
+            if needs_code:
+                if not code_val:
+                    raise HTTPException(400, "code is required for this order")
+                current["card"] = code_val
+                current["code"] = code_val
+
+            if (otype or "").lower() == "topup_card" and amount is not None:
+                try:
+                    current["amount"] = float(amount)
+                except Exception:
+                    pass
+
+            # Persist order as Done
+            if current:
+                if is_jsonb:
+                    cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(current), order_id))
+                else:
+                    cur.execute("UPDATE public.orders SET status='Done', payload=(%s)::jsonb::text WHERE id=%s", (json.dumps(current, ensure_ascii=False), order_id))
+            else:
+                cur.execute("UPDATE public.orders SET status='Done' WHERE id=%s", (order_id,))
+
+            # Credit wallet for Asiacell direct topup (topup_card type)
+            if (otype or "").lower() == "topup_card":
+                add = 0.0
+                try:
+                    add = float(amount or 0)
+                except Exception:
+                    add = 0.0
+                if add > 0:
+                    cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(add), user_id))
+                    cur.execute("""
+                        INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                        VALUES(%s,%s,%s,%s)
+                    """, (user_id, Decimal(add), "asiacell_topup", Json({"order_id": order_id, "amount": add})))
+
+        # Build notification
+        title_txt = f"تم تنفيذ طلبك {title or ''}".strip()
+        if code_val:
+            body_txt = f"الكود: {code_val}"
+        elif amount is not None:
+            body_txt = f"المبلغ: {amount}"
+        else:
+            body_txt = title or "تم التنفيذ"
+
+        _notify_user(conn, user_id, order_id, title_txt, body_txt)
+        return {"ok": True, "status": "Done"}
+    finally:
+        put_conn(conn)
+
+# Aliases for deliver / reject to match various admin clients
+@app.post("/api/admin/orders/{oid}/execute")
+async def admin_execute_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return await admin_deliver(oid, request, x_admin_password, password)
+
+@app.post("/api/admin/card/{oid}/execute")
+async def admin_card_execute_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return await admin_deliver(oid, request, x_admin_password, password)
+
+@app.post("/api/admin/orders/{oid}/reject")
+async def admin_reject(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    """
+    Rejects the order and refunds balance once if order is paid.
+    """
+    data = await _read_json_object(request)
+    _require_admin(_pick_admin_password(x_admin_password, password, data) or "")
+    reason = (data.get("reason") or data.get("message") or "").strip()
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id, user_id, price, status, payload, title, COALESCE(type,'') FROM public.orders WHERE id=%s FOR UPDATE", (oid,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "order not found")
+
+            order_id, user_id, price, status, payload, title, otype = row[0], row[1], float(row[2] or 0), row[3], (row[4] or {}), row[5], (row[6] or "")
+            if status in ("Done", "Rejected", "Refunded"):
+                return {"ok": True, "status": status}
+
+            is_jsonb = _payload_is_jsonb(conn)
+            current: Dict[str, Any] = {}
+            if isinstance(payload, dict):
+                current.update(payload)
+
+            if reason:
+                current["reject_reason"] = reason
+
+            already_refunded = bool(current.get("refunded")) if isinstance(current, dict) else False
+            if price > 0 and not already_refunded:
+                cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(price), user_id))
+                cur.execute(
+                    """
+                    INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                    VALUES(%s,%s,%s,%s)
+                    """,
+                    (user_id, Decimal(price), "order_refund", Json({"order_id": order_id, "reject": True}))
+                )
+                current["refunded"] = True
+                current["refunded_amount"] = float(price)
+
+            # Persist status & payload
+            if current:
+                if is_jsonb:
+                    cur.execute("UPDATE public.orders SET status='Rejected', payload=%s WHERE id=%s", (Json(current), order_id))
+                else:
+                    cur.execute("UPDATE public.orders SET status='Rejected', payload=(%s)::jsonb::text WHERE id=%s", (json.dumps(current, ensure_ascii=False), order_id))
+            else:
+                cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (order_id,))
+
+        _notify_user(conn, user_id, order_id, "تم رفض طلبك", reason or "عذرًا، تم رفض هذا الطلب")
+        return {"ok": True, "status": "Rejected"}
+    finally:
+        put_conn(conn)
+@app.post("/api/admin/card/{oid}/reject")
+async def admin_card_reject_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return await admin_reject(oid, request, x_admin_password, password)
+
+# =========================
+# Admin pending buckets
+# =========================
+@app.get("/api/admin/pending/itunes")
+def admin_pending_itunes(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT o.id, o.title, o.quantity, o.price, o.status,
+                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
+                       o.link, u.uid
+                FROM public.orders o
+                JOIN public.users u ON u.id = o.user_id
+                WHERE o.status='Pending'
+                  AND (LOWER(o.title) LIKE '%itunes%' OR o.title LIKE '%ايتونز%')
+                ORDER BY o.id DESC
+            """)
+            rows = cur.fetchall()
+        out = []
+        for (oid, title, qty, price, status, created_at, link, uid) in rows:
+            d = {
+                "id": oid, "title": title, "quantity": qty,
+                "price": float(price or 0), "status": status,
+                "created_at": int(created_at or 0), "link": link, "uid": uid
             }
+            out.append(d)
+        return out
+    finally:
+        put_conn(conn)
+
+
+@app.get("/api/admin/pending/pubg")
+def admin_pending_pubg(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT o.id, o.title, o.quantity, o.price, o.status,
+                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
+                       o.link, u.uid,
+                       o.payload AS payload_text
+                FROM public.orders o
+                JOIN public.users u ON u.id = o.user_id
+                WHERE o.status='Pending' AND (
+                    LOWER(o.title) LIKE '%pubg%' OR
+                    LOWER(o.title) LIKE '%bgmi%' OR
+                    LOWER(o.title) LIKE '%uc%' OR
+                    o.title LIKE '%شدات%' OR
+                    o.title LIKE '%بيجي%' OR
+                    o.title LIKE '%ببجي%'
+                )
+                ORDER BY o.id DESC
+            """)
+            rows = cur.fetchall()
+        out = []
+        for (oid, title, qty, price, status, created_at, link, uid, payload_text) in rows:
+            account_id = ""
+            category = ""
+            if payload_text:
+                try:
+                    import json as _json
+                    j = _json.loads(payload_text) if isinstance(payload_text, str) else payload_text
+                    if isinstance(j, dict):
+                        account_id = str(j.get("account_id") or j.get("player_id") or j.get("id") or j.get("game_id") or j.get("pubg_id") or "")
+                        category = str(j.get("category") or "")
+                except Exception:
+                    pass
+            if not account_id:
+                def _grab(s):
+                    import re as _re
+                    s = s or ""
+                    m = _re.search(r'(?<!\d)(\d{6,20})(?!\d)', s)
+                    return m.group(1) if m else ""
+                account_id = _grab(link) or _grab(title)
+            d = {
+                "id": oid, "title": title, "quantity": qty,
+                "price": float(price or 0), "status": status,
+                "created_at": int(created_at or 0), "link": link, "uid": uid
+            }
+            if account_id:
+                d["account_id"] = account_id
+            if category:
+                d["category"] = category
+            out.append(d)
+        return out
+    finally:
+        put_conn(conn)
+
+@app.get("/api/admin/pending/ludo")
+def admin_pending_ludo(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT o.id, o.title, o.quantity, o.price, o.status,
+                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
+                       o.link, u.uid,
+                       o.payload AS payload_text
+                FROM public.orders o
+                JOIN public.users u ON u.id = o.user_id
+                WHERE o.status='Pending' AND (
+                    LOWER(o.title) LIKE '%ludo%' OR
+                    o.title LIKE '%لودو%' OR
+                    o.title LIKE '%ليدو%'
+                )
+                ORDER BY o.id DESC
+            """)
+            rows = cur.fetchall()
+        out = []
+        for (oid, title, qty, price, status, created_at, link, uid, payload_text) in rows:
+            account_id = ""
+            category = ""
+            if payload_text:
+                try:
+                    import json as _json
+                    j = _json.loads(payload_text) if isinstance(payload_text, str) else payload_text
+                    if isinstance(j, dict):
+                        account_id = str(j.get("account_id") or j.get("player_id") or j.get("id") or j.get("game_id") or "")
+                        category = str(j.get("category") or "")
+                except Exception:
+                    pass
+            if not account_id:
+                def _grab(s):
+                    import re as _re
+                    s = s or ""
+                    m = _re.search(r'(?<!\d)(\d{6,20})(?!\d)', s)
+                    return m.group(1) if m else ""
+                account_id = _grab(link) or _grab(title)
+            d = {
+                "id": oid, "title": title, "quantity": qty,
+                "price": float(price or 0), "status": status,
+                "created_at": int(created_at or 0), "link": link, "uid": uid
+            }
+            if account_id:
+                d["account_id"] = account_id
+            if category:
+                d["category"] = category
+            out.append(d)
+        return out
+    finally:
+        put_conn(conn)
+@app.get("/api/admin/pending/cards")
+def admin_pending_cards(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT o.id, o.title, o.quantity, o.price, o.status, "
+                "EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at, "
+                "o.link, u.uid, o.payload AS payload_text "
+                "FROM public.orders o "
+                "JOIN public.users u ON u.id = o.user_id "
+                "WHERE COALESCE(o.status,'Pending')='Pending' "
+                "ORDER BY o.id DESC"
+            )
+            rows = cur.fetchall()
+        out = []
+        def _norm(s: str) -> str:
+            s = (s or "").lower()
+            trans = str.maketrans({"أ":"ا","إ":"ا","آ":"ا","ٱ":"ا","ى":"ي","ـ":""})
+            s = s.translate(trans)
+            return s.replace(" ", "").replace("-", "")
+        for (oid, title, qty, price, status, created_at, link, uid, payload_text) in rows:
+            telco = ""
+            category = ""
+            payload_code = ""
+            if payload_text:
+                try:
+                    import json as _json
+                    j = _json.loads(payload_text) if isinstance(payload_text, str) else payload_text
+                    if isinstance(j, dict):
+                        telco = str(j.get("telco","") or "")
+                        category = str(j.get("category","") or "")
+                        payload_code = str(j.get("code") or j.get("card") or "")
+                except Exception:
+                    pass
+            nt = _norm(title or "")
+            if not telco:
+                if any(t in nt for t in ["اسياسيل","asiacell","asiacel","asiacelliq","asiacelliraq"]):
+                    telco = "asiacell"
+                elif any(t in nt for t in ["كورك","korek"]):
+                    telco = "korek"
+                elif any(t in nt for t in ["زين","zain","اثير","atheer"]):
+                    telco = "atheer"
+            if not telco:
+                continue
+            d = {
+                "id": oid, "title": title, "quantity": qty,
+                "price": float(price or 0), "status": status,
+                "created_at": int(created_at or 0), "link": link, "uid": uid,
+                "telco": telco
+            }
+            if category:
+                d["category"] = category
+            # إظهار رقم الكارت داخل قائمة أسيا سيل فقط إذا كان محفوظاً في الـpayload
+            if telco == "asiacell" and payload_code:
+                d["code"] = payload_code
+                d["card"] = payload_code
+            out.append(d)
+        return out
+    finally:
+        put_conn(conn)
+@app.get("/api/admin/pending/balances")
+def admin_pending_balances(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(r"""
+                SELECT o.id, o.title, o.quantity, o.price, o.status,
+                       EXTRACT(EPOCH FROM o.created_at)*1000 AS created_at,
+                       o.link, u.uid
+                FROM public.orders o
+                JOIN public.users u ON u.id = o.user_id
+                WHERE o.status='Pending'
+                  AND (
+                        LOWER(o.title) LIKE '%asiacell%' OR
+                        o.title LIKE '%أسيا%' OR
+                        o.title LIKE '%اسياسيل%' OR
+                        LOWER(o.title) LIKE '%korek%' OR
+                        o.title LIKE '%كورك%' OR
+                        o.title LIKE '%اثير%'
+                  )
+                  AND (
+                        LOWER(o.title) LIKE '%voucher%' OR
+                        LOWER(o.title) LIKE '%code%' OR
+                        LOWER(o.title) LIKE '%card%' OR
+                        o.title LIKE '%رمز%' OR
+                        o.title LIKE '%كود%' OR
+                        o.title LIKE '%بطاقة%' OR
+                        o.title LIKE '%كارت%' OR
+                        o.title LIKE '%شراء%'
+                  )
+                  AND (o.type IS NULL OR o.type <> 'topup_card')
+                  AND NOT (
+                        LOWER(o.title) LIKE '%topup%' OR
+                        LOWER(o.title) LIKE '%top-up%' OR
+                        LOWER(o.title) LIKE '%recharge%' OR
+                        o.title LIKE '%شحن%' OR
+                        o.title LIKE '%شحن عبر%' OR
+                        o.title LIKE '%شحن اسيا%' OR
+                        LOWER(o.title) LIKE '%direct%'
+                  )
+                  AND NOT (
+                        LOWER(o.title) LIKE '%itunes%' OR
+                        o.title LIKE '%ايتونز%'
+                  )
+                ORDER BY o.id DESC
+            """)
+            rows = cur.fetchall()
+        out = []
+        for (oid, title, qty, price, status, created_at, link, uid) in rows:
+            d = {
+                "id": oid, "title": title, "quantity": qty,
+                "price": float(price or 0), "status": status,
+                "created_at": int(created_at or 0), "link": link, "uid": uid
+            }
+            out.append(d)
+        return out
+    finally:
+        put_conn(conn)
+
+# =========================
+# Admin: pending API services (compact list for Android UI)
+# =========================
+@app.get("/api/admin/pending/services")
+def admin_pending_services_endpoint(
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None,
+    limit: int = 100
+):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    o.id,
+                    o.created_at,
+                    COALESCE(o.status, 'Pending') AS status,
+                    o.title,
+                    o.quantity,
+                    o.price,
+                    o.link,
+                    u.uid,
+                    o.service_id,
+                    o.type,
+                    o.payload
+                FROM public.orders o
+                JOIN public.users u ON u.id = o.user_id
+                WHERE COALESCE(o.status, 'Pending') = 'Pending'
+                ORDER BY COALESCE(o.created_at, NOW()) DESC
+                LIMIT %s
+            """, (int(limit),))
+            rows = cur.fetchall()
+
+        out: List[Dict[str, Any]] = []
+        for (oid, created_at, status, title, qty, price, link, uid, service_id, otype, payload) in rows:
+            # Only API/provider-like
+            typ = str(otype or "").lower()
+            is_api = typ in ("provider","api","smm","service") or (isinstance(payload, dict) and str(payload.get("source","")).lower()=="provider_form") or (service_id is not None)
+            if not is_api:
+                continue
+            try:
+                created_ms = int(created_at.timestamp() * 1000)
+            except Exception:
+                created_ms = int(time.time() * 1000)
+            out.append({
+                "id": int(oid),
+                "title": str(title or "—"),
+                "quantity": int(qty or 0),
+                "price": float(price or 0),
+                "link": link or "",
+                "status": "Pending",
+                "created_at": created_ms,
+                "uid": uid or "",
+                "account_id": (payload or {}).get("account_id") if isinstance(payload, dict) else ""
+            })
+        return {"list": out}
+    finally:
+        put_conn(conn)
+
+# =========================
+# Admin: wallet adjust + compatibility
+# =========================
+@app.post("/api/admin/users/{uid}/wallet/adjust")
+async def admin_wallet_adjust(uid: str, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    data = await _read_json_object(request)
+    _require_admin(_pick_admin_password(x_admin_password, password, data) or "")
+
+    amount = data.get("amount")
+    reason = (data.get("reason") or "manual_adjust").strip()
+    no_notify = bool(data.get("no_notify") or False)
+
+    if amount is None:
+        raise HTTPException(400, "amount is required")
+    try:
+        amt = float(amount)
+    except Exception:
+        raise HTTPException(400, "amount must be a number")
+    if amt == 0:
+        return {"ok": True, "status": "noop"}
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                raise HTTPException(404, "user not found")
+            user_id = r[0]
+
+            cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(amt), user_id))
+
+            meta = {"admin": True}
+            if no_notify:
+                meta["no_notify"] = True
+            cur.execute(
+                """
+                INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                VALUES(%s,%s,%s,%s)
+                """,
+                (user_id, Decimal(amt), reason, Json(meta))
+            )
+
+        return {"ok": True, "status": "adjusted", "amount": amt, "reason": reason}
+    finally:
+        put_conn(conn)
+
+# Single "change" endpoint (positive = topup, negative = deduct) to match older apps
+@app.post("/api/admin/wallet/change")
+async def admin_wallet_change(request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    data = await _read_json_object(request)
+    _require_admin(_pick_admin_password(x_admin_password, password, data) or "")
+    uid = (data.get("uid") or "").strip()
+    if not uid:
+        raise HTTPException(400, "uid required")
+    try:
+        amount = float(data.get("amount"))
+    except Exception:
+        raise HTTPException(400, "amount must be number")
+
+    direction = "topup" if amount >= 0 else "deduct"
+    if direction == "deduct":
+        body = WalletCompatIn(uid=uid, amount=abs(amount), reason=data.get("reason"))
+        return admin_wallet_deduct(body, x_admin_password or password or "")
+    else:
+        body = WalletCompatIn(uid=uid, amount=amount, reason=data.get("reason"))
+        return admin_wallet_topup(body, x_admin_password or password or "")
+
+@app.post("/api/admin/wallet/topup")
+def admin_wallet_topup(body: WalletCompatIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(x_admin_password or password or "")
+    uid = (body.uid or "").strip()
+    if not uid:
+        raise HTTPException(400, "uid required")
+    try:
+        amt = float(body.amount)
+    except Exception:
+        raise HTTPException(400, "amount must be number")
+    if amt <= 0:
+        raise HTTPException(400, "amount must be > 0")
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                cur.execute("INSERT INTO public.users(uid) VALUES(%s) RETURNING id", (uid,))
+                user_id = cur.fetchone()[0]
+            else:
+                user_id = r[0]
+
+            cur.execute("UPDATE public.users SET balance=balance+%s WHERE id=%s", (Decimal(amt), user_id))
+            cur.execute(
+                """
+                INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                VALUES(%s,%s,%s,%s)
+                """,
+                (user_id, Decimal(amt), body.reason or "manual_topup", Json({"compat": "topup"}))
+            )
+        _push_user(conn, user_id, None, "تمت إضافة رصيد", f"تمت إضافة {amt} إلى رصيدك.")
+        return {"ok": True, "status": "adjusted", "amount": amt, "direction": "topup"}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/wallet/deduct")
+def admin_wallet_deduct(body: WalletCompatIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+
+
+    _require_admin(x_admin_password or password or "")
+    uid = (body.uid or "").strip()
+    if not uid:
+        raise HTTPException(400, "uid required")
+    try:
+        amt = float(body.amount)
+    except Exception:
+        raise HTTPException(400, "amount must be number")
+    if amt <= 0:
+        raise HTTPException(400, "amount must be > 0")
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id, balance FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                raise HTTPException(404, "user not found")
+            user_id, bal_now = int(r[0]), float(r[1] or 0)
+            if bal_now < amt:
+                raise HTTPException(400, "insufficient balance")
+
+            cur.execute("UPDATE public.users SET balance=balance-%s WHERE id=%s", (Decimal(amt), user_id))
+            cur.execute(
+                """
+                INSERT INTO public.wallet_txns(user_id, amount, reason, meta)
+                VALUES(%s,%s,%s,%s)
+                """,
+                (user_id, Decimal(-amt), body.reason or "manual_deduct", Json({"compat": "deduct"}))
+            )
+        _push_user(conn, user_id, None, "تم خصم رصيد", f"تم خصم {amt} من رصيدك.")
+        return {"ok": True, "status": "adjusted", "amount": -amt, "direction": "deduct"}
+    finally:
+        put_conn(conn)
+
+@app.get("/api/admin/users/count")
+def admin_users_count(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None, plain: int = 0):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM public.users")
+            n = int(cur.fetchone()[0])
+        if str(plain) == "1":
+            return n
+        return {"ok": True, "count": n}
+    finally:
+        put_conn(conn)
+
+@app.get("/api/admin/users/balances")
+def admin_users_balances(
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None,
+    q: str = "", limit: int = 100, offset: int = 0, sort: str = "balance_desc"
+):
+    """
+    DEFAULT: returns a JSON ARRAY for UI compatibility.
+    """
+    _require_admin(x_admin_password or password or "")
+
+    q = (q or "").strip()
+    try:
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+    except Exception:
+        limit, offset = 100, 0
+
+    sort_map = {
+        "balance_desc": "balance DESC",
+        "balance_asc": "balance ASC",
+        "created_desc": "created_at DESC",
+        "created_asc": "created_at ASC",
+        "uid_asc": "uid ASC",
+        "uid_desc": "uid DESC",
+    }
+    order_by = sort_map.get(sort, "balance DESC")
+
+    where = "WHERE TRUE"
+    params = []
+    if q:
+        where += " AND (uid ILIKE %s)"
+        params.append(f"%{q}%")
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, uid, balance, is_banned,
+                       EXTRACT(EPOCH FROM created_at)*1000 AS created_at
+                FROM public.users
+                {where}
+                ORDER BY {order_by}
+                LIMIT %s OFFSET %s
+                """,
+                (*params, limit, offset)
+            )
+            rows = cur.fetchall()
+
+        items = [
+            {
+                "id": r[0],
+                "uid": r[1],
+                "balance": float(r[2] or 0),
+                "is_banned": bool(r[3]),
+                "created_at": int(r[4] or 0),
+            } for r in rows
+        ]
+        # Return ARRAY directly
+        return items
+    finally:
+        put_conn(conn)
+
+@app.get("/api/admin/users/balances_meta")
+def admin_users_balances_meta(
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None,
+    q: str = "", limit: int = 100, offset: int = 0, sort: str = "balance_desc"
+):
+    _require_admin(x_admin_password or password or "")
+
+    q = (q or "").strip()
+    try:
+        limit_val = max(1, min(int(limit), 500))
+        offset_val = max(0, int(offset))
+    except Exception:
+        limit_val, offset_val = 100, 0
+
+    sort_map = {
+        "balance_desc": "balance DESC",
+        "balance_asc": "balance ASC",
+        "created_desc": "created_at DESC",
+        "created_asc": "created_at ASC",
+        "uid_asc": "uid ASC",
+        "uid_desc": "uid DESC",
+    }
+    order_by = sort_map.get(sort, "balance DESC")
+
+    where = "WHERE TRUE"
+    params = []
+    if q:
+        where += " AND (uid ILIKE %s)"
+        params.append(f"%{q}%")
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM public.users {where}", params)
+            total = int(cur.fetchone()[0])
+            cur.execute(
+                f"""
+                SELECT id, uid, balance, is_banned,
+                       EXTRACT(EPOCH FROM created_at)*1000 AS created_at
+                FROM public.users
+                {where}
+                ORDER BY {order_by}
+                LIMIT %s OFFSET %s
+                """,
+                (*params, limit_val, offset_val)
+            )
+            rows = cur.fetchall()
+        items = [
+            {
+                "id": r[0],
+                "uid": r[1],
+                "balance": float(r[2] or 0),
+                "is_banned": bool(r[3]),
+                "created_at": int(r[4] or 0),
+            } for r in rows
+        ]
+        return {
+            "ok": True,
+            "total": total,
+            "limit": limit_val,
+            "offset": offset_val,
+            "sort": sort,
+            "items": items,
+            "data": items,
+            "total_users": total
+        }
+    finally:
+        put_conn(conn)
+
+# =========================
+# Service ID overrides (server-level)
+# =========================
+class SvcOverrideIn(BaseModel):
+    ui_key: str
+    service_id: Optional[int] = None
+
+def _ensure_overrides_table(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.service_id_overrides(
+            ui_key TEXT PRIMARY KEY,
+            service_id BIGINT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
+
+@app.get("/api/admin/service_ids/list")
+def admin_list_service_ids(
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_overrides_table(cur)
+            cur.execute("SELECT ui_key, service_id FROM public.service_id_overrides ORDER BY ui_key")
+            rows = cur.fetchall()
+            return {"list": [{"ui_key": r[0], "service_id": int(r[1])} for r in rows]}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/service_ids/set")
+def admin_set_service_id(
+    body: SvcOverrideIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.ui_key or not body.service_id or int(body.service_id) <= 0:
+        raise HTTPException(422, "invalid payload")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_overrides_table(cur)
+            cur.execute("""
+                INSERT INTO public.service_id_overrides(ui_key, service_id)
+                VALUES(%s,%s)
+                ON CONFLICT (ui_key) DO UPDATE SET service_id=EXCLUDED.service_id, created_at=now()
+            """, (body.ui_key, int(body.service_id)))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/service_ids/clear")
+def admin_clear_service_id(
+    body: SvcOverrideIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.ui_key:
+        raise HTTPException(422, "invalid payload")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_overrides_table(cur)
+            cur.execute("DELETE FROM public.service_id_overrides WHERE ui_key=%s", (body.ui_key,))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+# =========================
+# Pricing overrides (server-level)
+# =========================
+class PricingIn(BaseModel):
+    ui_key: str
+    price_per_k: Optional[float] = None
+    min_qty: Optional[int] = None
+    max_qty: Optional[int] = None
+    mode: Optional[str] = None  # 'per_k' (default) or 'flat'
+
+
+
+class PricingClearIn(BaseModel):
+    ui_key: str
+def _ensure_pricing_table(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.service_pricing_overrides(
+            ui_key TEXT PRIMARY KEY,
+            price_per_k NUMERIC(18,6) NOT NULL,
+            min_qty INTEGER NOT NULL,
+            max_qty INTEGER NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'per_k',
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
+
+def _ensure_pricing_mode_column(cur):
+    try:
+        cur.execute("ALTER TABLE public.service_pricing_overrides ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'per_k'")
+    except Exception:
+        pass
+
+
+# ===== Pricing version meta (for cache-busting on clear) =====
+def _ensure_pricing_meta_table(cur):
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS public.service_pricing_meta(
+                id INTEGER PRIMARY KEY,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """ )
+        cur.execute("""
+            INSERT INTO public.service_pricing_meta(id, updated_at)
+            VALUES (1, now())
+            ON CONFLICT (id) DO NOTHING
+        """ )
+    except Exception:
+        pass
+
+def _bump_pricing_version():
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_meta_table(cur)
+            cur.execute("""
+                UPDATE public.service_pricing_meta
+                SET updated_at = NOW()
+                WHERE id = 1
+            """ )
+    finally:
+        put_conn(conn)
+# =============================================================
+
+
+
+def _ensure_pricing_bumps(cur):
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS public.pricing_bumps(
+                id BIGSERIAL PRIMARY KEY,
+                bumped_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+    except Exception:
+        pass
+
+def _bump_pricing_version(*args):
+    """Bump pricing version. Compatible with two usages:
+    - _bump_pricing_version()            -> updates meta + inserts bump row
+    - _bump_pricing_version(cur)         -> inserts bump row using provided cursor
+    """
+    try:
+        if args:
+            cur = args[0]
+            _ensure_pricing_bumps(cur)
+            cur.execute("INSERT INTO public.pricing_bumps DEFAULT VALUES")
+            return
+        # No-arg path: open connection and update meta + bumps
+        conn = get_conn()
+        try:
+            with conn, conn.cursor() as cur:
+                _ensure_pricing_meta_table(cur)
+                cur.execute("UPDATE public.service_pricing_meta SET updated_at = NOW() WHERE id = 1")
+                _ensure_pricing_bumps(cur)
+                cur.execute("INSERT INTO public.pricing_bumps DEFAULT VALUES")
+        finally:
+            put_conn(conn)
+    except Exception:
+        pass
+
+
+@app.get("/api/admin/pricing/list")
+def admin_list_pricing(
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table(cur)
+            cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode, 'per_k') FROM public.service_pricing_overrides ORDER BY ui_key")
+            rows = cur.fetchall()
+            out = [{"ui_key": r[0], "price_per_k": float(r[1]), "min_qty": int(r[2]), "max_qty": int(r[3]), "mode": (r[4] or "per_k")} for r in rows]
+            return {"list": out}
+    finally:
+        put_conn(conn)
+
+
+@app.post("/api/admin/pricing/set")
+def admin_set_pricing(
+    body: PricingIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.ui_key or body.price_per_k is None or body.min_qty is None or body.max_qty is None:
+        raise HTTPException(422, "invalid payload")
+    if int(body.min_qty) < 0 or int(body.max_qty) < int(body.min_qty):
+        raise HTTPException(422, "invalid range")
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table(cur)
+            try:
+                _ensure_pricing_mode_column(cur)
+            except Exception:
+                pass
+
+            # BEFORE snapshot
+            try:
+                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+                _before = cur.fetchone()
+            except Exception:
+                _before = None
+
+            # Upsert
+            cur.execute(
+                """
+                INSERT INTO public.service_pricing_overrides (ui_key, price_per_k, min_qty, max_qty, mode, updated_at)
+                VALUES (%s, %s, %s, %s, COALESCE(%s,'per_k'), now())
+                ON CONFLICT (ui_key)
+                DO UPDATE SET
+                    price_per_k = EXCLUDED.price_per_k,
+                    min_qty     = EXCLUDED.min_qty,
+                    max_qty     = EXCLUDED.max_qty,
+                    mode        = COALESCE(EXCLUDED.mode,'per_k'),
+                    updated_at  = now()
+                """,
+                (body.ui_key, Decimal(body.price_per_k), int(body.min_qty), int(body.max_qty), (body.mode or 'per_k'))
+            )
+
+            # AFTER snapshot
+            try:
+                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+                _after = cur.fetchone()
+            except Exception:
+                _after = None
+
+        # bump version for client cache refresh (support both unified and cursor-style implementations)
+        try:
+            _bump_pricing_version()
+        except Exception:
+            try:
+                with get_conn() as c:
+                    with c.cursor() as cur:
+                        _bump_pricing_version(cur)  # type: ignore
+            except Exception:
+                pass
+
+        try:
+            _notify_pricing_change_via_tokens(conn, body.ui_key, _before, _after)
+        except Exception as e:
+            logger.exception("notify after set failed: %s", e)
+
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+
+@app.post("/api/admin/pricing/clear")
+def admin_clear_pricing(
+    body: PricingClearIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.ui_key:
+        raise HTTPException(422, "invalid payload")
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table(cur)
+            try:
+                _ensure_pricing_mode_column(cur)
+            except Exception:
+                pass
+
+            # BEFORE snapshot (for notification)
+            try:
+                cur.execute("SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+                _before = cur.fetchone()
+            except Exception:
+                _before = None
+
+            # Delete override
+            cur.execute("DELETE FROM public.service_pricing_overrides WHERE ui_key=%s", (body.ui_key,))
+
+        # bump version for client cache refresh
+        try:
+            _bump_pricing_version()
+        except Exception:
+            try:
+                with get_conn() as c:
+                    with c.cursor() as cur:
+                        _bump_pricing_version(cur)  # type: ignore
+            except Exception:
+                pass
+
+        # Notify after commit
+        try:
+            _notify_pricing_change_via_tokens(conn, body.ui_key, _before, None)
+        except Exception as e:
+            logger.exception("notify after clear failed: %s", e)
+
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+
+@app.get("/api/public/pricing/version")
+def public_pricing_version():
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            # Ensure tables
+            try:
+                _ensure_pricing_table(cur)
+            except Exception:
+                pass
+            try:
+                _ensure_pricing_mode_column(cur)
+            except Exception:
+                pass
+            # Try both meta & bumps styles
+            v_overrides = 0
+            v_meta = 0
+            v_bumps = 0
+            try:
+                cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM MAX(updated_at))*1000, 0) FROM public.service_pricing_overrides")
+                v_overrides = int((cur.fetchone() or [0])[0] or 0)
+            except Exception:
+                v_overrides = 0
+            try:
+                cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM updated_at)*1000, 0) FROM public.service_pricing_meta WHERE id=1")
+                v_meta = int((cur.fetchone() or [0])[0] or 0)
+            except Exception:
+                v_meta = 0
+            try:
+                cur.execute("SELECT COALESCE(EXTRACT(EPOCH FROM MAX(bumped_at))*1000, 0) FROM public.pricing_bumps")
+                v_bumps = int((cur.fetchone() or [0])[0] or 0)
+            except Exception:
+                v_bumps = 0
+            v = max(v_overrides, v_meta, v_bumps)
+            return {"version": int(v)}
+    finally:
+        put_conn(conn)
+
+
+@app.get("/api/public/pricing/bulk")
+def public_pricing_bulk(keys: str):
+    if not keys:
+        return {"map": {}, "keys": []}
+    key_list_raw = [k.strip() for k in keys.split(",") if k.strip()]
+    if not key_list_raw:
+        return {"map": {}, "keys": []}
+    # prepare normalized variants
+    norm_map = {k: _normalize_ui_key(k) for k in key_list_raw}
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_pricing_table(cur)
+            try:
+                _ensure_pricing_mode_column(cur)
+            except Exception:
+                pass
+            # Exact matches first
+            cur.execute(
+                """
+                SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'),
+                       EXTRACT(EPOCH FROM COALESCE(updated_at, NOW()))*1000 AS updated_at
+                FROM public.service_pricing_overrides
+                WHERE ui_key = ANY(%s)
+                """,
+                (key_list_raw,)
+            )
+            rows = cur.fetchall() or []
+            by_ui = {ui_key: (ui_key, price_per_k, min_qty, max_qty, mode, updated_ms) for ui_key, price_per_k, min_qty, max_qty, mode, updated_ms in rows}
+
+            # normalization fallback
+            missing = [k for k in key_list_raw if k not in by_ui]
+            if missing:
+                cur.execute(
+                    """
+                    SELECT ui_key, price_per_k, min_qty, max_qty, COALESCE(mode,'per_k'),
+                           EXTRACT(EPOCH FROM COALESCE(updated_at, NOW()))*1000 AS updated_at
+                    FROM public.service_pricing_overrides
+                    """
+                )
+                all_rows = cur.fetchall() or []
+                by_norm = {_normalize_ui_key(ui_key): (ui_key, price_per_k, min_qty, max_qty, mode, updated_ms)
+                           for ui_key, price_per_k, min_qty, max_qty, mode, updated_ms in all_rows}
+                for mk in missing:
+                    nk = norm_map.get(mk)
+                    if nk and nk in by_norm:
+                        ui_key, price_per_k, min_qty, max_qty, mode, updated_ms = by_norm[nk]
+                        by_ui[mk] = (ui_key, price_per_k, min_qty, max_qty, mode, updated_ms)
+
+            out = {}
+            for original in key_list_raw:
+                row = by_ui.get(original)
+                if row:
+                    (_k, price_per_k, min_qty, max_qty, mode, updated_ms) = row
+                    out[original] = {
+                        "price_per_k": float(price_per_k) if price_per_k is not None else None,
+                        "min_qty": int(min_qty) if min_qty is not None else None,
+                        "max_qty": int(max_qty) if max_qty is not None else None,
+                        "mode": mode or "per_k",
+                        "updated_at": int(updated_ms or 0)
+                    }
+            return {"map": out, "keys": key_list_raw}
+    finally:
+        put_conn(conn)
+
+
+# =========================
+# Per-order pricing override (PUBG/Ludo only)
+# =========================
+class OrderPricingIn(BaseModel):
+    order_id: int
+    price: Optional[float] = None  # flat price per order
+    mode: Optional[str] = None     # reserved for future
+
+def _ensure_order_pricing_table(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.order_pricing_overrides(
+            order_id BIGINT PRIMARY KEY,
+            price NUMERIC(18,6) NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'flat',
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
+
+@app.post("/api/admin/pricing/order/set")
+def admin_set_order_pricing(
+    body: OrderPricingIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.order_id or body.price is None:
+        raise HTTPException(422, "invalid payload")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_order_pricing_table(cur)
+            # fetch order to validate status and category
+            cur.execute("SELECT id, title, status FROM public.orders WHERE id=%s", (int(body.order_id),))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "order not found")
+            oid, sname, status = int(row[0]), str(row[1] or "").lower(), str(row[2] or "Pending")
+            # only allow when Pending
+            if status != "Pending":
+                raise HTTPException(409, "order not pending")
+            # allow only PUBG/Ludo
+            if not (("pubg" in sname) or ("ببجي" in sname) or ("uc" in sname) or ("ludo" in sname) or ("لودو" in sname)):
+                raise HTTPException(422, "not pubg/ludo order")
+            cur.execute("""
+                INSERT INTO public.order_pricing_overrides(order_id, price, mode, updated_at)
+                VALUES(%s,%s,'flat', now())
+                ON CONFLICT (order_id) DO UPDATE SET price=EXCLUDED.price, updated_at=now()
+            """, (oid, Decimal(body.price)))
+            # reflect immediately on orders.price for UI consistency
+            cur.execute("UPDATE public.orders SET price=%s WHERE id=%s", (Decimal(body.price), oid))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/pricing/order/clear")
+def admin_clear_order_pricing(
+    body: OrderPricingIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.order_id:
+        raise HTTPException(422, "invalid payload")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_order_pricing_table(cur)
+            cur.execute("DELETE FROM public.order_pricing_overrides WHERE order_id=%s", (int(body.order_id),))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+# =========================
+# Per-order quantity setter (PUBG/Ludo only)
+# =========================
+class OrderQtyIn(BaseModel):
+    order_id: int
+    quantity: int
+    reprice: Optional[bool] = False  # if True, will recompute price if a per_k rule exists
+
+@app.post("/api/admin/pricing/order/set_qty")
+def admin_set_order_quantity(
+    body: OrderQtyIn,
+    x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+    password: Optional[str] = None
+):
+    _require_admin(x_admin_password or password or "")
+    if not body.order_id or body.quantity is None:
+        raise HTTPException(422, "invalid payload")
+    if body.quantity <= 0:
+        raise HTTPException(422, "quantity must be > 0")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            # Validate order
+            cur.execute("SELECT id, title, status FROM public.orders WHERE id=%s", (int(body.order_id),))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "order not found")
+            oid, sname, status = int(row[0]), str(row[1] or "").lower(), str(row[2] or "Pending")
+            if status != "Pending":
+                raise HTTPException(409, "order not pending")
+            if not (("pubg" in sname) or ("ببجي" in sname) or ("uc" in sname) or ("ludo" in sname) or ("لودو" in sname)):
+                raise HTTPException(422, "not pubg/ludo order")
+
+            # Update quantity
+            cur.execute("UPDATE public.orders SET quantity=%s WHERE id=%s", (int(body.quantity), oid))
+
+            # Optional: reprice if per_k rule exists
+            if body.reprice:
+                # Try service-specific override then category fallback
+                cur.execute("SELECT price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (sname,))
+                rowp = cur.fetchone()
+                if not rowp:
+                    key = None
+                    if any(w in sname for w in ["pubg","ببجي","uc"]):
+                        key = "cat.pubg"
+                    elif any(w in sname for w in ["ludo","لودو"]):
+                        key = "cat.ludo"
+                    if key:
+                        cur.execute("SELECT price_per_k, min_qty, max_qty, COALESCE(mode,'per_k') FROM public.service_pricing_overrides WHERE ui_key=%s", (key,))
+                        rowp = cur.fetchone()
+                if rowp:
+                    ppk = float(rowp[0]); mn = int(rowp[1]); mx = int(rowp[2]); mode = (rowp[3] or 'per_k')
+                    if mode == 'per_k':
+                        if body.quantity < mn or body.quantity > mx:
+                            raise HTTPException(400, f"quantity out of allowed range [{mn}-{mx}]")
+                        eff_price = float(Decimal(body.quantity) * Decimal(ppk) / Decimal(1000))
+                        cur.execute("UPDATE public.orders SET price=%s WHERE id=%s", (Decimal(eff_price), oid))
+
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+# =========================
+# Topup cards alias routes (execute / reject) to match the app
+# =========================
+@app.post("/api/admin/topup/{oid}/execute")
+async def admin_execute_topup_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return await admin_deliver(oid, request, x_admin_password, password)
+
+@app.post("/api/admin/topup/{oid}/reject")
+async def admin_reject_topup_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return await admin_reject(oid, request, x_admin_password, password)
+@app.post("/api/admin/topup_cards/{oid}/execute")
+async def admin_execute_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return await admin_deliver(oid, request, x_admin_password, password)
+
+@app.post("/api/admin/topup_cards/{oid}/reject")
+async def admin_reject_topup_cards_alias(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return await admin_reject(oid, request, x_admin_password, password)
+
+# --- Asiacell aliases (execute / reject) ---
+@app.post("/api/admin/asiacell/{oid}/execute")
+async def admin_execute_asiacell(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return await admin_deliver(oid, request, x_admin_password, password)
+
+@app.post("/api/admin/asiacell/{oid}/reject")
+async def admin_reject_asiacell(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return await admin_reject(oid, request, x_admin_password, password)
+
+# ======================================================================
+# Extra compatibility routes to match the app's newer paths
+# (kept from your previous version)
+# ======================================================================
+
+# ---- Pending buckets aliases ----
+@app.get("/api/admin/pending/pubg_orders")
+def _alias_pending_pubg(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_pending_pubg(x_admin_password, password)
+
+@app.get("/api/admin/pending/ludo_orders")
+def _alias_pending_ludo(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_pending_ludo(x_admin_password, password)
+
+@app.get("/api/admin/pending/api")
+@app.get("/api/admin/api/pending")
+@app.get("/api/admin/pending/services_list")
+@app.get("/api/admin/pending/provider")
+def _alias_pending_services(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None, limit: int = 100):
+    return admin_pending_services_endpoint(x_admin_password=x_admin_password, password=password, limit=limit)
+
+# ---- Per-order pricing & quantity setters (PUBG/Ludo) ----
+@app.post("/api/admin/orders/{oid}/set_price")
+async def _alias_set_price(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    data = await _read_json_object(request)
+    if "price" not in data:
+        raise HTTPException(422, "price required")
+    body = OrderPricingIn(order_id=oid, price=float(data["price"]))
+    return admin_set_order_pricing(body, x_admin_password, password)
+
+@app.post("/api/admin/orders/{oid}/set_quantity")
+async def _alias_set_qty(oid: int, request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    data = await _read_json_object(request)
+    if "quantity" not in data:
+        raise HTTPException(422, "quantity required")
+    body = OrderQtyIn(order_id=oid, quantity=int(data["quantity"]), reprice=bool(data.get("reprice", False)))
+    return admin_set_order_quantity(body, x_admin_password, password)
+
+@app.post("/api/admin/order/set_price")
+async def _alias_set_price2(request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    data = await _read_json_object(request)
+    oid = int(data.get("order_id", 0))
+    price = data.get("price")
+    if not oid or price is None:
+        raise HTTPException(422, "order_id and price required")
+    body = OrderPricingIn(order_id=oid, price=float(price))
+    return admin_set_order_pricing(body, x_admin_password, password)
+
+@app.post("/api/admin/order/set_qty")
+async def _alias_set_qty2(request: Request, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    data = await _read_json_object(request)
+    oid = int(data.get("order_id", 0))
+    qty = data.get("quantity")
+    if not oid or qty is None:
+        raise HTTPException(422, "order_id and quantity required")
+    body = OrderQtyIn(order_id=oid, quantity=int(qty), reprice=bool(data.get("reprice", False)))
+    return admin_set_order_quantity(body, x_admin_password, password)
+
+# ---- Service ID overrides aliases ----
+@app.get("/api/admin/services/overrides")
+def _alias_list_service_ids(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_list_service_ids(x_admin_password, password)
+
+@app.post("/api/admin/services/override/set")
+def _alias_set_service_id(body: SvcOverrideIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_set_service_id(body, x_admin_password, password)
+
+@app.post("/api/admin/services/override/clear")
+def _alias_clear_service_id(body: SvcOverrideIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_clear_service_id(body, x_admin_password, password)
+
+# ---- Pricing rules aliases ----
+@app.get("/api/admin/pricing/overrides")
+def _alias_list_pricing(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_list_pricing(x_admin_password, password)
+
+@app.post("/api/admin/pricing/override/set")
+def _alias_set_pricing(body: PricingIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_set_pricing(body, x_admin_password, password)
+
+@app.post("/api/admin/pricing/override/clear")
+def _alias_clear_pricing(body: PricingIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    return admin_clear_pricing(body, x_admin_password, password)
+
+
+class TestPushIn(BaseModel):
+    title: str = "طلب جديد (اختبار)"
+    body: str = "هذا إشعار تجريبي للمالك"
+    order_id: Optional[int] = None
+
+@app.post("/api/test/push_owner")
+def test_push_owner(p: TestPushIn):
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            owner_id = _ensure_owner_user_id(cur)
+            cur.execute(
+                "INSERT INTO public.user_notifications(user_id, order_id, title, body, status) VALUES (%s,%s,%s,%s,'unread')",
+                (owner_id, p.order_id, p.title, p.body)
+            )
+            toks = _tokens_for_uid(cur, OWNER_UID)
+        sent = 0
+        for t in toks:
+            _fcm_send_push(t, p.title, p.body, p.order_id)
+            sent += 1
+        return {"ok": True, "sent": sent, "owner_uid": OWNER_UID}
+    finally:
+        put_conn(conn)
+
+# =============== Run local ===============
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
+
+
+# === Auto-refund helper for canceled/rejected orders ===
+def _refund_order_if_needed(order_id: int) -> bool:
+    try:
+        ord_obj = db.get_order(order_id)
+        if not ord_obj:
+            return False
+        if ord_obj.get("status") in ("Refunded",):
+            return True
+        if ord_obj.get("status") in ("Rejected", "Canceled", "Cancelled"):
+            uid = ord_obj.get("uid")
+            amt = float(ord_obj.get("price") or 0.0)
+            already = ord_obj.get("refunded", False)
+            if amt > 0 and uid and not already:
+                db.add_balance(uid, amt)
+                db.mark_refunded(order_id)
+                return True
+        return False
+    except Exception as e:
+        logging.exception("refund helper failed: %s", e)
+        return False
+
+
+# =========================
+# Announcements + Provider balance (compat with app)
+# =========================
+from typing import Optional as _Optional
+
+@app.post("/api/admin/announcement/create")
+async def admin_announcement_create(request: Request, x_admin_password: _Optional[str] = Header(None, alias="x-admin-password"), password: _Optional[str] = None):
+    # Body JSON: { "body": "...", "title": "..."? }
+    # Requires: x-admin-password header or ?password= in query/body
+    data = await _read_json_object(request)
+    passwd = _pick_admin_password(x_admin_password, password, data)
+    _require_admin(passwd or "")
+    body = (data.get("body") or "").strip()
+    title = (data.get("title") or "").strip() or None
+    if not body:
+        raise HTTPException(422, "body is required")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            # 1) store the announcement
+            cur.execute(
+                "INSERT INTO public.announcements(title, body) VALUES(%s,%s) RETURNING id",
+                (title, body)
+            )
+            ann_id = cur.fetchone()[0]
+
+            # 2) bulk insert notifications for ALL users (no 'active' column dependency)
+            cur.execute(
+                """
+                INSERT INTO public.user_notifications (user_id, order_id, title, body, status, created_at)
+                SELECT id AS user_id, NULL, %s AS title, %s AS body, 'unread', NOW()
+                FROM public.users
+                """,
+                (title or 'إعلان', body)
+            )
+
+            # 3) collect DISTINCT FCM tokens (no dependency on users.active)
+            cur.execute(
+                """
+                SELECT DISTINCT d.fcm_token
+                FROM public.user_devices d
+                WHERE d.fcm_token IS NOT NULL AND d.fcm_token <> ''
+                """
+            )
+            tokens = [r[0] for r in cur.fetchall()]
+
+        # 4) fan-out FCM
+        sent = 0
+        for t in tokens:
+            try:
+                _fcm_send_push(t, title or 'إعلان', body, None)
+                sent += 1
+            except Exception as fe:
+                logger.exception("announcement FCM send failed: %s", fe)
+        logger.info("Announcement broadcast: id=%s, tokens_sent=%s", ann_id, sent)
+        return {"ok": True, "id": ann_id, "broadcasted": True, "tokens": sent}
+    finally:
+        put_conn(conn)
+
+@app.get("/api/public/announcements")
+def public_announcements(limit: int = 50):
+    # Returns: [ { "title": str|null, "body": str, "created_at": <epoch_ms> }, ... ]
+    if limit <= 0 or limit > 500:
+        limit = 50
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    title,
+                    body,
+                    (EXTRACT(EPOCH FROM created_at)*1000)::BIGINT AS created_at
+                FROM public.announcements
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                (limit,)
+            )
+            rows = cur.fetchall() or []
+            out = [{"id": None, "title": r[0], "body": r[1], "created_at": int(r[2]) if r[2] is not None else 0} for r in rows]
             return out
-        } catch (_: Exception) { /* fallthrough */ }
-    }
-    // 2) fallback to numeric id route if available (only if uid is numeric)
-    val uidNum = uid.toLongOrNull()
-    if (uidNum != null) {
-        val (code2, txt2) = httpGet("/api/user/$uidNum/notifications?status=unread&limit=$limit")
-        if (code2 in 200..299 && txt2 != null) {
-            try {
-                val arr = org.json.JSONArray(txt2!!.trim())
-                val out = mutableListOf<AppNotice>()
-                for (i in 0 until arr.length()) {
-                    val o = arr.getJSONObject(i)
-                    val title = o.optString("title","إشعار")
-                    val body  = o.optString("body","")
-                    val tsMs  = o.optLong("created_at", System.currentTimeMillis())
-                    out += AppNotice(title, body, if (tsMs < 2_000_000_000L) tsMs*1000 else tsMs, forOwner = false)
-                }
-                return out
-            } catch (_: Exception) { /* ignore */ }
-        }
-    }
-    return null
-}
+    finally:
+        put_conn(conn)
 
-/* دخول المالك */
-private suspend fun apiAdminLogin(password: String): String? {
-    val (code, _) = httpGet(
-        AdminEndpoints.pendingServices,
-        headers = mapOf("x-admin-password" to password)
-    )
-    return if (code in 200..299) password else null
-} 
-private suspend fun apiAdminPOST(path: String, token: String, body: JSONObject? = null): Boolean {
-    val (code, _) = if (body == null) {
-        httpPost(path, JSONObject(), headers = mapOf("x-admin-password" to token))
-    } else {
-        httpPost(path, body, headers = mapOf("x-admin-password" to token))
-    }
-    return code in 200..299
-}
-private suspend fun apiAdminWalletChange(endpoint: String, token: String, uid: String, amount: Double): Boolean {
-    val body = JSONObject().put("uid", uid).put("amount", amount)
-    val (code, _) = httpPost(endpoint, body, headers = mapOf("x-admin-password" to token))
-    return code in 200..299
-}
-private suspend fun apiAdminUsersCount(token: String): Int? {
-    val (c, t) = httpGet(AdminEndpoints.usersCount, mapOf("x-admin-password" to token))
-    return if (c in 200..299 && t != null) try { JSONObject(t.trim()).optInt("count") } catch (_: Exception) { null } else null
-}
-private suspend fun apiAdminUsersBalances(token: String): List<Triple<String,String,Double>>? {
-    val (c, t) = httpGet(AdminEndpoints.usersBalances, mapOf("x-admin-password" to token))
-    if (c !in 200..299 || t == null) return null
-    return try {
-        val trimmed = t.trim()
-        val arr: JSONArray = if (trimmed.startsWith("[")) {
-            JSONArray(trimmed)
-        } else {
-            val root = JSONObject(trimmed)
-            when {
-                root.has("list") -> root.optJSONArray("list") ?: JSONArray()
-                root.has("data") -> root.optJSONArray("data") ?: JSONArray()
-                else -> JSONArray()
-            }
-        }
-        val out = mutableListOf<Triple<String,String,Double>>()
-        for (i in 0 until arr.length()) {
-            val o = arr.getJSONObject(i)
-            val uid = o.optString("uid")
-            val bal = o.optDouble("balance", 0.0)
-            val banned = if (o.optBoolean("is_banned", false)) "محظور" else "نشط"
-            out += Triple(uid, banned, bal)
-        }
-        out
-    } catch (_: Exception) { null }
-}
+@app.get("/api/admin/provider/balance")
+def admin_provider_balance(x_admin_password: _Optional[str] = Header(None, alias="x-admin-password"), password: _Optional[str] = None):
+    # Returns provider balance as JSON: { "balance": <number> }
+    # Uses PROVIDER_API_URL / PROVIDER_API_KEY if configured (kd1s compatible).
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    bal = 0.0
+    try:
+        resp = requests.post(
+            PROVIDER_API_URL,
+            data={"key": PROVIDER_API_KEY, "action": "balance"},
+            timeout=20
+        )
+        txt = (resp.text or "").strip()
+        # Try JSON first
+        try:
+            import json as _json
+            obj = _json.loads(txt)
+            if isinstance(obj, dict):
+                if "balance" in obj and obj["balance"] is not None:
+                    bal = float(obj["balance"])
+                elif isinstance(obj.get("data"), dict) and "balance" in obj["data"]:
+                    bal = float(obj["data"]["balance"])
+            if bal == 0.0:
+                import re as _re
+                m = _re.search(r"(\d+(?:\.\d+)?)", txt)
+                if m:
+                    bal = float(m.group(1))
+        except Exception:
+            try:
+                bal = float(txt)
+            except Exception:
+                bal = 0.0
+    except Exception:
+        bal = 0.0
+    return {"balance": bal}
 
-/** فحص رصيد API (KD1S أولًا ثم مسار الباكند) */
-private suspend fun apiAdminProviderBalance(token: String): Double? {
-    if (PROVIDER_DIRECT_URL.isNotBlank() && PROVIDER_DIRECT_KEY_VALUE.isNotBlank()) {
-        val fields = mapOf("key" to PROVIDER_DIRECT_KEY_VALUE, "action" to "balance")
-        val (c, t) = httpPostFormAbs(PROVIDER_DIRECT_URL, fields)
-        parseBalancePayload(t)?.let { if (c in 200..299) return it }
-    }
-    val (c2, t2) = httpGet(AdminEndpoints.providerBalance, mapOf("x-admin-password" to token))
-    return if (c2 in 200..299) parseBalancePayload(t2) else null
-}
-
-private fun parseBalancePayload(t: String?): Double? {
-    if (t == null) return null
-    val s = t.trim()
-    return try {
-        when {
-            s.matches(Regex("""\d+(\.\d+)?""")) -> s.toDouble()
-            s.startsWith("{") -> {
-                val o = JSONObject(s)
-                when {
-                    o.has("balance") -> o.optString("balance").toDoubleOrNull() ?: o.optDouble("balance", Double.NaN)
-                    o.has("data") && o.get("data") is JSONObject -> o.getJSONObject("data").optDouble("balance", Double.NaN)
-                    else -> Double.NaN
-                }.let { if (it.isNaN()) null else it }
-            }
-            else -> null
-        }
-    } catch (_: Exception) { null }
-}
-
-/* ============== واجهات إدارة الكروت ============== */
-private suspend fun apiAdminFetchPendingCards(token: String): List<PendingCard>? {
-    val (c, t) = httpGet(AdminEndpoints.pendingCards, mapOf("x-admin-password" to token))
-    if (c !in 200..299 || t == null) return null
-    return try {
-        val arr = JSONArray(t.trim())
-        val out = mutableListOf<PendingCard>()
-        for (i in 0 until arr.length()) {
-            val o = arr.getJSONObject(i)
-            out += PendingCard(
-                id = o.optInt("id"),
-                uid = o.optString("uid"),
-                card = o.optString("card"),
-                createdAt = o.optLong("created_at", 0L)
-            )
-        }
-        out
-    } catch (_: Exception) { null }
-}
-private suspend fun apiAdminRejectTopupCard(id: Int, token: String): Boolean {
-    val (c, _) = httpPost(AdminEndpoints.topupCardReject(id), JSONObject(), mapOf("x-admin-password" to token))
-    return c in 200..299
-}
-private suspend fun apiAdminExecuteTopupCard(id: Int, amount: Double, token: String): Boolean {
-    val (c, _) = httpPost(
-        AdminEndpoints.topupCardExecute(id),
-        JSONObject().put("amount", amount),
-        mapOf("x-admin-password" to token)
-    )
-    return c in 200..299
-}
-
-/* =========================
-   الإعدادات + دخول المالك
-   ========================= */
-@Composable private fun SettingsDialog(
-    uid: String,
-    ownerMode: Boolean,
-    onUserLogin: (String) -> Unit,
-    onUserLoginSuccess: ((String) -> Unit)? = null,
-    onOwnerLogin: (token: String) -> Unit,
-    onOwnerLogout: () -> Unit,
-    onDismiss: () -> Unit
-) {
-    val clip = LocalClipboardManager.current
-    var showAdminLogin by remember { mutableStateOf(false) }
-    val ctx = LocalContext.current
-    var showBindDialog by remember { mutableStateOf(false) }
-    var showLoginDialog by remember { mutableStateOf(false) }
-    var showRevealDialog by remember { mutableStateOf(false) }
-    // حالة ارتباط كلمة المرور بهذا الـ UID
-    var isPassBound by remember { mutableStateOf<Boolean?>(null) }
-    var loginLinked by remember { mutableStateOf(false) }
-    // تحميل حالة البادجات من التخزين فقط (لا مزامنة لحظية)
-    val badgeKeyBound = "badge_pass_bound_" + uid
-    val badgeKeyLogin = "badge_login_linked_" + uid
-    isPassBound = readBadge(ctx, badgeKeyBound)
-    loginLinked = readBadge(ctx, badgeKeyLogin)
-
-    // Legacy aliases
-    var showBindUserPass by remember { mutableStateOf(false) }
-    var showUserLogin by remember { mutableStateOf(false) }
-    var snack by remember { mutableStateOf<String?>(null) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = { TextButton(onClick = onDismiss) { Text("إغلاق") } },
-        title = { Text("الإعدادات", color = OnBg) },
-        text = {
-            Column {
-                Text("المعرّف الخاص بك (UID):", fontWeight = FontWeight.SemiBold, color = OnBg)
-                Spacer(Modifier.height(6.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(uid, color = Accent, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                    Spacer(Modifier.width(8.dp))
-                    OutlinedButton(onClick = { clip.setText(AnnotatedString(uid)) }) { Text("نسخ") }
-                }
-                Spacer(Modifier.height(12.dp))
-                Divider(color = Surface1)
-                Spacer(Modifier.height(12.dp))
-
-                // ====== أمان الحساب (ربط كلمة مرور + تسجيل دخول + عرض كلمة المرور) ======
-                Text("أمان الحساب", color = OnBg, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(8.dp))
-                
-                Column {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        
-Box(modifier = Modifier.weight(1f).heightIn(min = 44.dp)) {
-    OutlinedButton(
-        modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp).alpha(if (isPassBound == true) 0.6f else 1f),
-        enabled = (isPassBound != true),
-        onClick = { if (isPassBound != true) { showBindDialog = true; showBindUserPass = true } }
-    ) { Text("ربط كلمة المرور") }
-    if (isPassBound == true) {
-        Box(
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(4.dp)
-                .background(Good, RoundedCornerShape(999.dp))
-                .padding(horizontal = 4.dp, vertical = 1.dp)
-        ) {
-            Text("مرتبط", color = Color.White, fontSize = 10.sp)
-        }
-    }
-}
-
-                        
-Box(modifier = Modifier.weight(1f).heightIn(min = 44.dp)) {
-    OutlinedButton(
-        modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
-        onClick = { showLoginDialog = true; showUserLogin = true }
-    ) { Text("تسجيل دخول UID") }
-    if (loginLinked) {
-        Box(
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(4.dp)
-                .background(Good, RoundedCornerShape(999.dp))
-                .padding(horizontal = 4.dp, vertical = 1.dp)
-        ) {
-            Text("تم دخول", color = Color.White, fontSize = 10.sp)
-        }
-    }
-}
-                    }
+@app.post("/api/test/push_user")
+def test_push_user(uid: str, title: str = "إشعار تجريبي", body: str = "اختبار الإشعارات", x_admin_password: str = Header(None, alias="x-admin-password"), password: str | None = None):
+    _require_admin(x_admin_password or (password or ""))
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (uid,))
+            r = cur.fetchone()
+            if not r:
+                raise HTTPException(404, "user not found")
+            user_id = int(r[0])
+        # store + push
+        _push_user(conn, user_id, None, title, body)
+        return {"ok": True}
+    finally:
+        put_conn(conn)
 
 
-if (isPassBound == true) {
-OutlinedButton(
-                        modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
-                        onClick = { showRevealDialog = true }
-                    ) { Text("عرض كلمة المرور") }
-}
-                }
-Spacer(Modifier.height(12.dp))
-                Divider(color = Surface1)
-                Spacer(Modifier.height(12.dp))
-                    
+# =========================
+# Admin: Announcements CRUD
 
-                if (ownerMode) {
-                    Text("وضع المالك: مفعل", color = Good, fontWeight = FontWeight.SemiBold)
-                    Spacer(Modifier.height(6.dp))
-                    OutlinedButton(onClick = onOwnerLogout) { Text("تسجيل خروج المالك") }
-                } else {
-                    Text("تسجيل المالك (كلمة المرور):", fontWeight = FontWeight.SemiBold, color = OnBg)
-                    Spacer(Modifier.height(6.dp))
-                    OutlinedButton(onClick = { showAdminLogin = true }) { Text("تسجيل المالك") }
-                }
-            }
-        }
-    )
+# ======== Auto-Exec (Admin) - background daemon & endpoints ========
+from pydantic import BaseModel
+import asyncio, logging, os
 
-    // Dialogs inside Settings
-    if (showBindDialog || showBindUserPass) {
-        BindPasswordDialog(uid = uid, onDismiss = { showBindDialog = false; showBindUserPass = false }, onBound = { isPassBound = true; saveBadge(ctx, "badge_pass_bound_" + uid, true) }, onToast = { snack = it })
-    }
-    if (showLoginDialog || showUserLogin) {
-        LoginUidDialog(onDismiss = { showLoginDialog = false; showUserLogin = false }, onLogged = { newUid -> 
-                            onUserLogin(newUid)
-                            loginLinked = true
-                            saveBadge(ctx, "badge_login_linked_" + newUid, true)
-                            isPassBound = true
-                            saveBadge(ctx, "badge_pass_bound_" + newUid, true)
-                        }, onToast = { snack = it })
-    }
-    if (showRevealDialog) {
-        RevealPasswordDialog(uid = uid, onDismiss = { showRevealDialog = false }, onToast = { snack = it })
+def _ensure_settings_table(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.settings(
+            key TEXT PRIMARY KEY,
+            value JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    """)
+
+def _get_flag(cur, key: str, default: bool = False) -> bool:
+    cur.execute("SELECT value FROM public.settings WHERE key=%s", (key,))
+    r = cur.fetchone()
+    if not r:
+        return default
+    v = r[0]
+    try:
+        if isinstance(v, dict):
+            return bool(v.get("enabled", default))
+        # If JSONB stored directly as bool
+        return bool(v)
+    except Exception:
+        return default
+
+def _set_flag(cur, key: str, enabled: bool) -> None:
+    cur.execute("""
+        INSERT INTO public.settings(key, value, updated_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+    """, (key, Json({"enabled": bool(enabled)})))
+
+class AutoExecToggleIn(BaseModel):
+    enabled: bool
+
+class AutoExecRunIn(BaseModel):
+    limit: int = 3
+    only_when_enabled: bool = True
+
+def _auto_exec_one_locked(cur):
+    # pick one eligible API/provider order only (ignore manual/topup_card/etc.)
+    cur.execute("""
+        SELECT id, user_id, service_id, link, quantity, price, title, type
+        FROM public.orders
+        WHERE COALESCE(status,'Pending')='Pending'
+          AND type='provider'
+        ORDER BY id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    """)
+    r = cur.fetchone()
+    if not r:
+        return None
+    (oid, user_id, service_id, link, qty, price, title, otype) = r
+
+    # Safety: if for أي سبب كان service_id فارغ، اعتبر الطلب غير صالح وارفُضه
+    if service_id is None:
+        cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (oid,))
+        return {"order_id": oid, "status": "Rejected", "reason": "missing_service_id"}
+
+    # Claim the order atomically to prevent duplicate processing by other workers
+    cur.execute("""
+        UPDATE public.orders
+        SET status='Processing'
+        WHERE id=%s AND COALESCE(status,'Pending')='Pending'
+        RETURNING id
+    """, (oid,))
+    claimed = cur.fetchone()
+    if not claimed:
+        # another worker took it
+        return None
+
+    return {
+        "order_id": int(oid),
+        "user_id": int(user_id),
+        "service_id": int(service_id),
+        "link": link or "",
+        "quantity": int(qty or 0),
+        "price": float(price or 0.0),
+        "title": title or ""
     }
 
-    // snack text
-    snack?.let {
-        Spacer(Modifier.height(10.dp))
-        Text(it, color = OnBg)
-        androidx.compose.runtime.LaunchedEffect(it) { kotlinx.coroutines.delay(2000); snack = null }
-    }
+def _auto_exec_process_one(conn, rec):
+    oid = rec["order_id"]; user_id = rec["user_id"]
+    service_id = rec["service_id"]; link = rec["link"]; qty = rec["quantity"]; eff_price = rec["price"]
+    try:
+        resp = requests.post(
+            PROVIDER_API_URL,
+            data={"key": PROVIDER_API_KEY, "action": "add",
+                  "service": str(service_id), "link": link, "quantity": str(qty)},
+            timeout=25
+        )
+    except Exception:
+        with conn, conn.cursor() as cur:
+            _refund_if_needed(cur, user_id, eff_price, oid)
+            cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (oid,))
+        return {"order_id": oid, "status": "Rejected", "reason": "provider_unreachable"}
 
-    if (showAdminLogin) {
-        var pass by remember { mutableStateOf("") }
-        var err by remember { mutableStateOf<String?>(null) }
-        val scope = rememberCoroutineScope()
+    if resp.status_code // 100 != 2:
+        with conn, conn.cursor() as cur:
+            _refund_if_needed(cur, user_id, eff_price, oid)
+            cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (oid,))
+        return {"order_id": oid, "status": "Rejected", "reason": "provider_http"}
 
-        AlertDialog(
-            onDismissRequest = { showAdminLogin = false },
-            confirmButton = {
-                TextButton(onClick = {
-                    scope.launch {
-                        err = null
-                        val token = apiAdminLogin(pass)
-                        if (token != null) { onOwnerLogin(token); showAdminLogin = false }
-                        else { err = "بيانات غير صحيحة" }
-                    }
-                }) { Text("تأكيد") }
-            },
-            dismissButton = { TextButton(onClick = { showAdminLogin = false }) { Text("إلغاء") } },
-            title = { Text("كلمة مرور المالك", color = OnBg) },
-            text = {
-                Column {
-                    OutlinedTextField(
-                        value = pass,
-                        onValueChange = { pass = it },
-                        singleLine = true,
-                        label = { Text("أدخل كلمة المرور") },
-                        colors = OutlinedTextFieldDefaults.colors(
-                            cursorColor = Accent,
-                            focusedBorderColor = Accent, unfocusedBorderColor = Dim,
-                            focusedLabelColor = OnBg, unfocusedLabelColor = Dim
+    try:
+        data = resp.json()
+    except Exception:
+        with conn, conn.cursor() as cur:
+            _refund_if_needed(cur, user_id, eff_price, oid)
+            cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (oid,))
+        return {"order_id": oid, "status": "Rejected", "reason": "bad_provider_json"}
+
+    provider_id = data.get("order") or data.get("order_id")
+    if not provider_id:
+        with conn, conn.cursor() as cur:
+            _refund_if_needed(cur, user_id, eff_price, oid)
+            cur.execute("UPDATE public.orders SET status='Rejected' WHERE id=%s", (oid,))
+        return {"order_id": oid, "status": "Rejected", "reason": "no_provider_id"}
+
+    with conn, conn.cursor() as cur:
+        cur.execute("""
+            UPDATE public.orders
+            SET provider_order_id=%s, status='Processing'
+            WHERE id=%s
+        """, (str(provider_id), oid))
+    try:
+        _notify_user(conn, user_id, oid, "تم قبول طلبك", "تم تحويل طلبك إلى المعالجة.")
+    except Exception:
+        pass
+    return {"order_id": oid, "status": "Processing", "provider_order_id": provider_id}
+
+def _auto_exec_run(conn, limit: int = 3):
+    processed = []
+    for _ in range(max(1, min(int(limit or 1), 20))):
+        with conn, conn.cursor() as cur:
+            _ensure_settings_table(cur)
+            rec = _auto_exec_one_locked(cur)
+            if not rec or rec.get("skipped"):
+                if rec and rec.get("skipped"):
+                    processed.append(rec)
+                # Nothing to do
+                break
+        out = _auto_exec_process_one(conn, rec)
+        processed.append(out)
+    return processed
+
+# ---- endpoints ----
+
+@app.get("/api/admin/auto_exec/status")
+def admin_auto_exec_status(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"),
+                           password: Optional[str] = None,
+                           scope: Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_settings_table(cur)
+            if scope:
+                flag = _scope_flag_name(scope)
+                enabled = _get_flag(cur, flag, False)
+                if scope == "itunes":
+                    try:
+                        _ensure_itunes_codes_table(cur)
+                        cur.execute(
+                            "SELECT COUNT(*) FROM public.itunes_codes "
+                            "WHERE used=FALSE"
                         )
-                    )
-                    if (err != null) {
-                        Spacer(Modifier.height(6.dp)); Text(err!!, color = Bad, fontSize = 10.sp)
-                    }
-                }
+                        free = int(cur.fetchone()[0])
+                    except Exception:
+                        free = 0
+                    return {"enabled": bool(enabled), "free_codes": free}
+                if scope == "cards":
+                    try:
+                        _ensure_card_codes_table(cur)
+                        cur.execute(
+                            "SELECT COUNT(*) FROM public.card_codes "
+                            "WHERE used=FALSE"
+                        )
+                        free = int(cur.fetchone()[0])
+                    except Exception:
+                        free = 0
+                    return {"enabled": bool(enabled), "free_codes": free}
+                return {"enabled": bool(enabled)}
+            enabled = _get_flag(cur, "auto_exec_api", False)
+        return {"enabled": bool(enabled)}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/auto_exec/toggle")
+def admin_auto_exec_toggle(body: AutoExecToggleIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_settings_table(cur)
+            _set_flag(cur, "auto_exec_api", bool(body.enabled))
+        # Wake up daemon (safe if already running)
+        try:
+            asyncio.create_task(_auto_exec_daemon())
+        except Exception:
+            pass
+        return {"ok": True, "enabled": bool(body.enabled)}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/auto_exec/run")
+def admin_auto_exec_run(body: AutoExecRunIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_settings_table(cur)
+            if body.only_when_enabled and not _get_flag(cur, "auto_exec_api", False):
+                return {"ok": True, "enabled": False, "processed": []}
+        processed = _auto_exec_run(conn, limit=body.limit)
+        return {"ok": True, "enabled": True, "processed": processed}
+    finally:
+        put_conn(conn)
+
+# ---- background daemon ----
+_AUTOEXEC_DAEMON_STARTED = False
+AUTOEXEC_IDLE_SLEEP = int(os.getenv("AUTOEXEC_IDLE_SLEEP", "5"))
+AUTOEXEC_LOOP_SLEEP = int(os.getenv("AUTOEXEC_LOOP_SLEEP", "2"))
+AUTOEXEC_LIMIT      = int(os.getenv("AUTOEXEC_LIMIT", "3"))
+
+async def _auto_exec_daemon():
+    global _AUTOEXEC_DAEMON_STARTED
+    _AUTOEXEC_DAEMON_STARTED = True
+    while True:
+        try:
+            conn = get_conn()
+            try:
+                with conn, conn.cursor() as cur:
+                    _ensure_settings_table(cur)
+                    enabled = _get_flag(cur, "auto_exec_api", False)
+            finally:
+                put_conn(conn)
+
+            if not enabled:
+                await asyncio.sleep(AUTOEXEC_IDLE_SLEEP)
+                continue
+
+            processed_any = False
+            conn = get_conn()
+            try:
+                batch = _auto_exec_run(conn, limit=AUTOEXEC_LIMIT)
+                processed_any = bool(batch)
+            finally:
+                put_conn(conn)
+
+            await asyncio.sleep(0.5 if processed_any else AUTOEXEC_LOOP_SLEEP)
+
+        except Exception as e:
+            logging.exception("auto-exec daemon loop error: %s", e)
+            await asyncio.sleep(3)
+
+@app.on_event("startup")
+async def _startup_autoexec():
+    try:
+        if not _AUTOEXEC_DAEMON_STARTED:
+            asyncio.create_task(_auto_exec_daemon())
+    except Exception as e:
+        logging.exception("failed to start auto-exec daemon: %s", e)
+# ======== /Auto-Exec (Admin) ========
+# =========================
+from fastapi import Header
+
+@app.get("/api/admin/announcements")
+def admin_announcements_list(limit: int = 200, x_admin_password: str | None = Header(None, alias="x-admin-password"), password: str | None = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    if limit <= 0 or limit > 500: limit = 200
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, title, body,
+                       (EXTRACT(EPOCH FROM created_at)*1000)::BIGINT AS created_at,
+                       (EXTRACT(EPOCH FROM updated_at)*1000)::BIGINT AS updated_at
+                FROM public.announcements
+                ORDER BY id DESC
+                LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall() or []
+            return [
+                {
+                    "id": int(r[0]),
+                    "title": r[1],
+                    "body": r[2],
+                    "created_at": int(r[3]) if r[3] is not None else 0,
+                    "updated_at": int(r[4]) if r[4] is not None else None,
+                } for r in rows
+            ]
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/announcements/{aid}/update")
+@app.post("/api/admin/announcement/{aid}/update")
+async def admin_announcement_update(aid: int, request: Request, x_admin_password: str | None = Header(None, alias="x-admin-password"), password: str | None = None):
+    data = await _read_json_object(request)
+    _require_admin(_pick_admin_password(x_admin_password, password, data) or "")
+    title = data.get("title", None)
+    body  = data.get("body",  None)
+    if title is None and body is None:
+        raise HTTPException(422, "title or body required")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            sets = []
+            params = []
+            if title is not None:
+                sets.append("title=%s"); params.append(title)
+            if body is not None:
+                sets.append("body=%s");  params.append(body)
+            sets.append("updated_at=NOW()")
+            q = f"UPDATE public.announcements SET {', '.join(sets)} WHERE id=%s RETURNING id"
+            params.append(aid)
+            cur.execute(q, tuple(params))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "announcement not found")
+        return {"ok": True, "id": aid, "updated": True}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/announcements/{aid}/delete")
+@app.post("/api/admin/announcement/{aid}/delete")
+def admin_announcement_delete(aid: int, x_admin_password: str | None = Header(None, alias="x-admin-password"), password: str | None = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM public.announcements WHERE id=%s RETURNING 1", (aid,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "announcement not found")
+        return {"ok": True, "id": aid, "deleted": True}
+    finally:
+        put_conn(conn)
+
+
+def _label_for_ui_key(ui_key: str):
+    """Return (category, label) from ui_key patterns like:
+       topup.itunes.10, topup.asiacell.5000, topup.korek.10000, topup.zain.10000,
+       topup.pubg.uc.60, topup.ludo.diamonds.100, cat.pubg, cat.ludo
+    """
+    try:
+        k = (ui_key or "").lower()
+        parts = k.split(".")
+        def first_digits(ps):
+            for p in ps[::-1]:
+                if p.isdigit():
+                    return p
+            return None
+
+        # Defaults
+        category = "service"
+        label = ui_key
+
+        if not parts:
+            return category, label
+
+        if parts[0] in ("topup", "cat"):
+            # iTunes
+            if "itunes" in parts:
+                category = "itunes"
+                amt = first_digits(parts)
+                label = f"iTunes ${amt}" if amt else "iTunes"
+                return category, label
+
+            # Phone balance
+            if any(x in parts for x in ("asiacell", "zain", "korek", "atheer")):
+                category = "phone"
+                op_map = {"asiacell": "آسيا سيل", "zain": "زين", "korek": "كورك", "atheer": "أثير"}
+                op = next((x for x in ("asiacell","zain","korek","atheer") if x in parts), None)
+                amt = first_digits(parts)
+                op_name = op_map.get(op, op or "الهاتف")
+                label = f"رصيد {op_name}" + (f" {amt}" if amt else "")
+                return category, label
+
+            # PUBG / BGMI
+            if any(x in parts for x in ("pubg", "bgmi", "uc")):
+                category = "pubg"
+                amt = first_digits(parts)
+                label = f"PUBG UC {amt}" if amt else "PUBG UC"
+                return category, label
+
+            # Ludo
+            if any("ludo" in x for x in parts):
+                category = "ludo"
+                # could be diamonds/gold
+                if "diamonds" in parts:
+                    base = "Ludo Diamonds"
+                elif "gold" in parts:
+                    base = "Ludo Gold"
+                else:
+                    base = "Ludo"
+                amt = first_digits(parts)
+                label = f"{base} {amt}" if amt else base
+                return category, label
+
+        return category, label
+    except Exception:
+        return "service", ui_key or "خدمة"
+
+
+def _fmt_price(v, currency: str = "$"):
+    try:
+        f = float(v)
+        return f"{f:g}{currency}"
+    except Exception:
+        return f"{v}{currency}" if v is not None else ""
+
+
+def _notify_pricing_change_via_tokens(conn, ui_key: str, before: Optional[tuple], after: Optional[tuple]) -> None:
+    """
+    إشعار FCM عربي بصيغة موحّدة لكل الخدمات (آيتونز/أثير/آسيا سيل/كورك/زين/ببجي/لودو/خدمات الـ API):
+      • رفع/تخفيض السعر:  تم رفع/تخفيض سعر {الباقة|الخدمة} من {السعر القديم} الى {السعر الجديد}
+      • تغيير الكمية (للباقات اليدوية مثل آيتونز/الرصيد و PUBG/Ludo):
+         تم تغيير كمية {الباقة القديمة} من {الباقة القديمة} الى {الباقة الجديدة}
+      • تغيير الحدود (للخدمات المرتبطة بالـ API فقط):
+         تم تغيير الحد الأدنى لخدمة {الاسم} من {قديمة} الى {جديدة}
+         تم تغيير الحد الأقصى لخدمة {الاسم} من {قديمة} الى {جديدة}
+    ملاحظة: لا نستخدم عبارة "بالألف" إطلاقاً.
+    """
+    try:
+        def as_row_dict(r):
+            if not r:
+                return None
+            return {
+                "price_per_k": float(r[1]) if r[1] is not None else None,
+                "min_qty": int(r[2]) if (len(r) > 2 and r[2] is not None) else None,
+                "max_qty": int(r[3]) if (len(r) > 3 and r[3] is not None) else None,
+                "mode": (r[4] or "per_k") if len(r) > 4 else "per_k",
             }
-        )
-    }
-}
+
+        parts = (ui_key or "").lower().split(".")
+
+        def _svc_cat(ps):
+            if "itunes" in ps: return "itunes"
+            if any(op in ps for op in ("atheer","asiacell","korek","zain")): return "phone"
+            if any(p in ps for p in ("pubg","bgmi","uc")): return "pubg"
+            if "ludo" in ps:
+                if "diamonds" in ps: return "ludo_dia"
+                if "gold" in ps: return "ludo_gold"
+                return "ludo"
+            # treat all other keys as API services
+            return "api"
+
+        def _svc_name_ar(ps):
+            # Arabic/English heuristics to mirror UI service labels for API services
+            cat = _svc_cat(ps)
+            # Manual categories keep their fixed names
+            if cat == "itunes": return "آيتونز"
+            if cat == "phone":
+                if "atheer" in ps:   return "أثير"
+                if "asiacell" in ps: return "آسيا سيل"
+                if "korek" in ps:    return "كورك"
+                if "zain" in ps:     return "زين"
+                return "رصيد"
+            if cat == "pubg": return "ببجي"
+            if cat == "ludo_dia": return "ألماس لودو"
+            if cat == "ludo_gold": return "ذهب لودو"
+            if cat == "ludo": return "لودو"
+
+            # API: build a nicer Arabic name from tokens
+            s = " ".join(ps).lower()
+            # platform detection
+            is_tt = any(k in s for k in ["tiktok","tik","تيكتوك","تيك توك","تيك"])
+            is_ig = any(k in s for k in ["instagram","insta","انستا","انستغرام","انستجرام"])
+            is_tg = any(k in s for k in ["telegram","teleg","tg","تيليجرام","تلجرام","تلي"])
+            is_yt = any(k in s for k in ["youtube","يوتيوب","يوتوب"])
+
+            plat = None
+            if is_tt: plat = "تيكتوك"
+            elif is_ig: plat = "انستغرام"
+            elif is_tg: plat = "تليجرام"
+            elif is_yt: plat = "يوتيوب"
+
+            # service types
+            is_follow = any(k in s for k in ["followers","follower","subs","متابع","متابعين"])
+            is_like   = any(k in s for k in ["likes","like","لايك","لايكات"])
+            is_view   = any(k in s for k in ["views","view","مشاهد","مشاهدات"])
+            is_live   = any(k in s for k in ["live","broadcast","stream","بث"])
+            is_score  = any(k in s for k in ["score","سكور"])
+            is_member = any(k in s for k in ["members","member","اعضاء","أعضاء"])
+            is_chan   = any(k in s for k in ["channel","قناة","قناه"])
+            is_group  = any(k in s for k in ["group","كروب","كروبات"])
+
+            # special cases
+            if is_score and is_live:
+                return "رفع سكور البث"
+            if is_score:
+                return "رفع السكور"
+
+            if is_tg and is_member:
+                if is_chan and not is_group:
+                    return "اعضاء قنوات تليجرام"
+                if is_group and not is_chan:
+                    return "اعضاء كروبات تليجرام"
+                return "اعضاء تليجرام"
+
+            if is_live and is_view:
+                if plat == "تيكتوك": return "مشاهدات بث تيكتوك"
+                if plat == "انستغرام": return "مشاهدات بث انستا"
+                return "مشاهدات البث المباشر"
+
+            if is_follow and plat: return f"متابعين {plat}"
+            if is_like and plat:   return f"لايكات {plat}"
+            if is_view and plat:   return f"مشاهدات {plat}"
+
+            if plat:
+                return f"خدمات {plat}"
+
+            # fallback: if Arabic tokens exist in key, show them; else generic
+            raw = " ".join(ps).replace("_", " ").replace(".", " ")
+            import re as _re
+            raw = _re.sub(r"\s+", " ", raw).strip()
+            if _re.search(r"[\u0600-\u06FF]", raw):
+                return raw
+            return "خدمة"
+
+        def _first_digits(ps):
+            for p in reversed(ps):
+                if p.isdigit():
+                    return int(p)
+            return None
+
+        def _fmt_usd(v):
+            try:
+                f = float(v)
+                if abs(f - round(f)) < 1e-9:
+                    return f"{int(round(f))}$"
+                return f"{f:g}$"
+            except Exception:
+                return f"{v}$"
+
+        def pack_for(cat, svc, amount):
+            if amount is None:
+                return svc
+            if cat in ("itunes","phone"):
+                return f"{amount}${svc}"             # 5$أثير / 10$آيتونز
+            if cat == "pubg":
+                return f"{amount}UC{svc}"           # 60UCببجي
+            if cat in ("ludo","ludo_dia","ludo_gold"):
+                return f"{svc} {amount}"            # ألماس لودو 100
+            # api: quantity term not used in messages; limits will be explicit below
+            return svc
+
+        # prepare snapshots
+        b = as_row_dict(before)
+        a = as_row_dict(after)
+        cat = _svc_cat(parts)
+        svc = _svc_name_ar(parts)
+        ui_amt = _first_digits(parts)
+
+        b_min = b.get("min_qty") if b else None
+        b_max = b.get("max_qty") if b else None
+        a_min = a.get("min_qty") if a else None
+        a_max = a.get("max_qty") if a else None
+
+        # For topup keys we store amount in ui_key, also we may use min_qty as amount override
+        if b_min is None: b_min = ui_amt
+        if a_min is None: a_min = ui_amt
+
+        old_price = b.get("price_per_k") if b else None
+        new_price = a.get("price_per_k") if a else None
+
+        title = "تحديث التسعير"
+        messages = []
+
+        # 1) السعر: رفع/تخفيض (all categories)
+        if (old_price is not None) and (new_price is not None) and abs(float(new_price) - float(old_price)) > 1e-9:
+            direction = "رفع" if float(new_price) > float(old_price) else "تخفيض"
+            # pick a representative pack for manual categories; API uses service name only
+            if cat in ("itunes","phone","pubg","ludo","ludo_dia","ludo_gold"):
+                ref_amount = a_min if a_min is not None else b_min
+                pack = pack_for(cat, svc, ref_amount)
+                messages.append(f"تم {direction} سعر {pack} من {_fmt_usd(old_price)} الى {_fmt_usd(new_price)}")
+            else:
+                messages.append(f"تم {direction} سعر {svc} من {_fmt_usd(old_price)} الى {_fmt_usd(new_price)} لكل الف")
+
+        # 2) تغيّر "الكمية" للباقات اليدوية فقط (itunes/phone/pubg/ludo)
+        if cat in ("itunes","phone","pubg","ludo","ludo_dia","ludo_gold"):
+            if (b_min is not None) and (a_min is not None) and (int(b_min) != int(a_min)):
+                prev_pack = pack_for(cat, svc, int(b_min))
+                next_pack = pack_for(cat, svc, int(a_min))
+                messages.append(f"تم تغيير كمية {prev_pack} من {prev_pack} الى {next_pack}")
+
+        # 3) تغيّر الحدود (API فقط): الحد الأدنى/الأقصى
+        if cat == "api":
+            if (b_min is not None) and (a_min is not None) and (int(b_min) != int(a_min)):
+                messages.append(f"تم تغيير الحد الأدنى لخدمة {svc} من {int(b_min)} الى {int(a_min)}")
+            if (b_max is not None) and (a_max is not None) and (int(b_max) != int(a_max)):
+                messages.append(f"تم تغيير الحد الأقصى لخدمة {svc} من {int(b_max)} الى {int(a_max)}")
+
+        if not messages:
+            messages.append(f"{svc} — تم التحديث")
+
+        body = " — ".join(messages)
+
+        # إرسال FCM
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT d.fcm_token FROM public.user_devices d WHERE d.fcm_token IS NOT NULL AND d.fcm_token <> ''")
+            tokens = [r[0] for r in (cur.fetchall() or [])]
+
+        sent = 0
+        for t in tokens:
+            try:
+                _fcm_send_push(t, title, body, None)
+                sent += 1
+            except Exception as fe:
+                logger.exception("pricing_change FCM send failed: %s", fe)
+
+        logger.info("pricing.change.notify ui_key=%s tokens=%d sent=%d", ui_key, len(tokens), sent)
+    except Exception as e:
+        logger.exception("notify pricing change failed: %s", e)
 
 
-/* =========================
-   حفظ/قراءة حالة الطلبات عبر SharedPreferences
-   ========================= */
-private fun loadOrderStatusMap(ctx: Context): Map<String, String> {
-    val raw = prefs(ctx).getString("order_status_map", "{}") ?: "{}"
-    return try {
-        val out = mutableMapOf<String, String>()
-        val o = JSONObject(raw)
-        val it = o.keys()
-        while (it.hasNext()) {
-            val k = it.next()
-            out[k] = o.optString(k, "")
-        }
-        out
-    } catch (_: Exception) { emptyMap() }
-}
-private fun saveOrderStatusMap(ctx: Context, map: Map<String, String>) {
-    val o = JSONObject()
-    map.forEach { (k, v) -> o.put(k, v) }
-    prefs(ctx).edit().putString("order_status_map", o.toString()).apply()
-}
+# ========= BEGIN Codes + Scoped Auto-Exec Patch (compat) =========
+# This patch adds:
+# - iTunes codes endpoints: add/list/delete (category-aware)
+# - Phone cards codes endpoints: add/list/delete (telco+category aware)
+# - Scoped auto-exec: /api/admin/auto_exec/status?scope=..., /api/admin/auto_exec/set
+# - Backward-compat: keep /auto_exec/status (unscoped), /auto_exec/toggle, /auto_exec/run untouched
+# - Daemons: per-scope (itunes, cards)
+# The patch avoids modifying existing logic; it only appends new capabilities.
 
-/* =========================
-   ربط FCM مع UID على السيرفر
-   ========================= */
-private suspend fun apiUpdateFcmToken(uid: String, token: String): Boolean {
-    val (code, _) = httpPost("/api/users/fcm_token", JSONObject().put("uid", uid).put("fcm", token))
-    return code in 200..299
-}
+from typing import Optional, List, Any, Dict
 
-/* =========================
-   عامل خلفي لفحص اكتمال الطلبات (WorkManager)
-   ========================= */
-class OrderDoneCheckWorker(appContext: Context, params: WorkerParameters) : CoroutineWorker(appContext, params) {
-    override suspend fun doWork(): ListenableWorker.Result {
-        val ctx = applicationContext
-        return try {
-            val uid = loadOrCreateUid(ctx)
-            val orders = apiGetMyOrders(uid) ?: emptyList()
-            val prev = loadOrderStatusMap(ctx)
-            val newMap = prev.toMutableMap()
+# ----- Tables ensure -----
+def _ensure_itunes_codes_table(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.itunes_codes(
+            id BIGSERIAL PRIMARY KEY,
+            code TEXT UNIQUE NOT NULL,
+            category TEXT NOT NULL DEFAULT 'generic',
+            used BOOLEAN NOT NULL DEFAULT FALSE,
+            used_by_order_id BIGINT NULL REFERENCES public.orders(id) ON DELETE SET NULL,
+            used_at TIMESTAMPTZ NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_itunes_codes_used ON public.itunes_codes(used)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_itunes_codes_cat ON public.itunes_codes(category)")
 
-            orders.forEach { o ->
-                val prevStatus = prev[o.id]
-                val cur = o.status.name
-                if (cur == "Done" && prevStatus != "Done") {
-                    AppNotifier.notifyNow(ctx, "تم اكتمال الطلب", "تم تنفيذ ${o.title} بنجاح.")
-                    val nn = AppNotice("اكتمال الطلب", "تم تنفيذ ${o.title} بنجاح.", forOwner = false)
-                    val existing = loadNotices(ctx)
-                    saveNotices(ctx, existing + nn)
-                }
-                newMap[o.id] = cur
-            }
-            saveOrderStatusMap(ctx, newMap)
-            ListenableWorker.Result.success()
-        } catch (_: Throwable) {
-            ListenableWorker.Result.retry()
-        }
-    }
+def _ensure_card_codes_table(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS public.card_codes(
+            id BIGSERIAL PRIMARY KEY,
+            telco TEXT NOT NULL CHECK (telco IN ('atheir','asiacell','korek')),
+            code TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'generic',
+            used BOOLEAN NOT NULL DEFAULT FALSE,
+            used_by_order_id BIGINT NULL REFERENCES public.orders(id) ON DELETE SET NULL,
+            used_at TIMESTAMPTZ NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE(telco, code)
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_card_codes_used ON public.card_codes(used)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_card_codes_tcat ON public.card_codes(telco, category)")
 
-    companion object {
-        fun schedule(context: Context) {
-            val constraints = Constraints.Builder()
-                .setRequiredNetworkType(NetworkType.CONNECTED)
-                .build()
-            val req = PeriodicWorkRequestBuilder<OrderDoneCheckWorker>(15, TimeUnit.MINUTES)
-                .setConstraints(constraints)
-                .build()
-            WorkManager.getInstance(context.applicationContext)
-                .enqueueUniquePeriodicWork(
-                    "order_done_checker",
-                    ExistingPeriodicWorkPolicy.UPDATE,
-                    req
-                )
-            // فحص فوري لمرة واحدة عند الإقلاع
-            val once = OneTimeWorkRequestBuilder<OrderDoneCheckWorker>().setConstraints(constraints).build()
-            WorkManager.getInstance(context.applicationContext).enqueue(once)
-        }
-    }
-}
+# ----- Inputs -----
+class CodesIn(BaseModel):
+    codes: Optional[List[str]] = None  # also accept "code" or "text"
+    category: Optional[str] = None
+    code: Optional[str] = None
+    text: Optional[str] = None
 
-@Composable
-private fun FixedTopBar(
-    online: Boolean?,
-    unread: Int,
-    balance: Double?,
-    onOpenNotices: () -> Unit,
-    onOpenSettings: () -> Unit,
-    onOpenWallet: () -> Unit
-) {
-    Surface(
-        color = Surface1,
-        contentColor = OnBg,
-        shadowElevation = 6.dp
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(56.dp)
-                .statusBarsPadding()
-                .padding(horizontal = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            // كبسولة الرصيد - أيقونة بيضاء ونص واضح
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(20.dp))
-                    .background(Color(0xFF2E3F47))
-                    .clickable { onOpenWallet() }
-                    .padding(horizontal = 14.dp, vertical = 8.dp)
-            ) {
-                Text(
-                    text = "$ " + (balance?.let { String.format(java.util.Locale.US, "%.2f", it) } ?: "--"),
-                    color = Color.White,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Spacer(Modifier.width(10.dp))
-                Icon(Icons.Filled.AccountBalanceWallet, contentDescription = null, tint = Color.White, modifier = Modifier.size(18.dp))
-            }
+def _normalize_codes(inp: CodesIn) -> List[str]:
+    out: List[str] = []
+    if inp.codes:
+        out.extend([str(x or "").strip() for x in inp.codes if str(x or "").strip()])
+    if inp.code:
+        out.append(str(inp.code).strip())
+    if inp.text:
+        for line in str(inp.text).splitlines():
+            s = line.strip()
+            if s:
+                out.append(s)
+    # de-duplicate while preserving order
+    seen = set()
+    uniq = []
+    for c in out:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    return uniq
 
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                // إشعارات مع بادج
-                NotificationBellCentered(unread = unread, onClick = onOpenNotices)
-                Spacer(Modifier.width(8.dp))
+# ----- Admin endpoints: iTunes -----
+@app.post("/api/admin/codes/itunes/add")
+def api_admin_codes_itunes_add(body: CodesIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password, (body.dict() if hasattr(body,'dict') else {})) or "")
+    codes = _normalize_codes(body)
+    if not codes:
+        raise HTTPException(422, "codes required")
+    category = (body.category or "generic").strip()
+    conn = get_conn()
+    added, skipped = 0, 0
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_itunes_codes_table(cur)
+            for c in codes:
+                cur.execute("INSERT INTO public.itunes_codes(code, category) VALUES(%s,%s) ON CONFLICT (code) DO NOTHING", (c, category))
+                if cur.rowcount: added += 1
+                else: skipped += 1
+        return {"ok": True, "added": added, "skipped": skipped}
+    finally:
+        put_conn(conn)
 
-                // حالة الخادم
-                val (txt, clr) = when (online) {
-                    true -> "متصل" to Good
-                    false -> "غير متصل" to Bad
-                    else -> "..." to Dim
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(Modifier.size(10.dp).clip(CircleShape).background(clr))
-                    Spacer(Modifier.width(6.dp))
-                    Text(txt, color = OnBg, fontSize = 10.sp)
-                }
-                Spacer(Modifier.width(8.dp))
+@app.get("/api/admin/codes/itunes/list")
+def api_admin_codes_itunes_list(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None, status: str = "unused", limit: int = 200, offset: int = 0, category: Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    where = ["TRUE"]
+    params: List[Any] = []
+    if (status or "unused").lower() in ("unused","free","available"):
+        where.append("used=FALSE")
+    elif (status or "").lower() in ("used","taken"):
+        where.append("used=TRUE")
+    if category:
+        where.append("category=%s"); params.append(category)
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_itunes_codes_table(cur)
+            cur.execute(f"""
+                SELECT id, code, category, used, used_by_order_id,
+                       (EXTRACT(EPOCH FROM created_at)*1000)::BIGINT
+                FROM public.itunes_codes
+                WHERE {' AND '.join(where)}
+                ORDER BY id DESC
+                LIMIT %s OFFSET %s
+            """, (*params, int(limit), int(offset)))
+            rows = cur.fetchall() or []
+        return [{
+            "id": int(r[0]), "code": r[1], "service": "itunes",
+            "category": r[2], "used": bool(r[3]), "used_by_order_id": (int(r[4]) if r[4] is not None else None),
+            "created_at": int(r[5] or 0)
+        } for r in rows]
+    finally:
+        put_conn(conn)
 
-                // الإعدادات
-                IconButton(onClick = onOpenSettings) {
-                    Icon(Icons.Filled.Settings, contentDescription = null, tint = OnBg)
-                }
-            }
-        }
-    }
-}
+@app.post("/api/admin/codes/itunes/{cid}/delete")
+def api_admin_codes_itunes_delete(cid: int, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_itunes_codes_table(cur)
+            cur.execute("DELETE FROM public.itunes_codes WHERE id=%s", (int(cid),))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
 
-/* =========================
-   واجهة مركز الإشعارات
-   ========================= */
-@Composable
-private fun NoticeCenterDialog(
-    notices: List<AppNotice>,
-    onClear: () -> Unit,
-    onDismiss: () -> Unit
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = { TextButton(onClick = onDismiss) { Text("إغلاق") } },
-        dismissButton = { TextButton(onClick = onClear) { Text("مسح الإشعارات") } },
-        title = { Text("الإشعارات") },
-        text = {
-            if (notices.isEmpty()) {
-                Text("لا توجد إشعارات حاليًا", color = Dim)
-            } else {
-                LazyColumn {
-                    items(notices.sortedByDescending { it.ts }) { itx ->
-                        val dt = java.text.SimpleDateFormat("yyyy/MM/dd HH:mm", java.util.Locale.getDefault())
-                            .format(java.util.Date(itx.ts))
-                        Text("• " + itx.title, fontWeight = FontWeight.SemiBold, color = OnBg)
-                        NoticeBody(itx.body)
-                        Text(dt, color = Dim, fontSize = 10.sp)
-                        Divider(Modifier.padding(vertical = 8.dp), color = Surface1)
-                    }
-                }
-            }
-        }
-    )
-}
+# ----- Admin endpoints: Phone cards -----
+@app.post("/api/admin/codes/cards/{telco}/add")
+def api_admin_codes_cards_add(telco: str, body: CodesIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password, (body.dict() if hasattr(body,'dict') else {})) or "")
+    telco = (telco or "").strip().lower()
+    if telco not in ("atheir","asiacell","korek"):
+        raise HTTPException(422, "invalid telco")
+    codes = _normalize_codes(body)
+    if not codes:
+        raise HTTPException(422, "codes required")
+    category = (body.category or "generic").strip()
+    conn = get_conn()
+    added, skipped = 0, 0
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_card_codes_table(cur)
+            for c in codes:
+                cur.execute("""
+                    INSERT INTO public.card_codes(telco, code, category) VALUES(%s,%s,%s)
+                    ON CONFLICT (telco, code) DO NOTHING
+                """, (telco, c, category))
+                if cur.rowcount: added += 1
+                else: skipped += 1
+        return {"ok": True, "added": added, "skipped": skipped}
+    finally:
+        put_conn(conn)
 
-@Composable
-private fun NotificationBellCentered(
-    unread: Int,
-    onClick: () -> Unit
-) {
-    Box {
-        IconButton(onClick = onClick) {
-            Icon(
-                Icons.Filled.Notifications,
-                contentDescription = null,
-                tint = OnBg
+@app.get("/api/admin/codes/cards/{telco}/list")
+def api_admin_codes_cards_list(telco: str, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None, status: str = "unused", limit: int = 200, offset: int = 0, category: Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    telco = (telco or "").strip().lower()
+    if telco not in ("atheir","asiacell","korek"):
+        raise HTTPException(422, "invalid telco")
+    where = ["telco=%s"]; params: List[Any] = [telco]
+    if (status or "unused").lower() in ("unused","free","available"):
+        where.append("used=FALSE")
+    elif (status or "").lower() in ("used","taken"):
+        where.append("used=TRUE")
+    if category:
+        where.append("category=%s"); params.append(category)
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_card_codes_table(cur)
+            cur.execute(f"""
+                SELECT id, code, telco, category, used, used_by_order_id,
+                       (EXTRACT(EPOCH FROM created_at)*1000)::BIGINT
+                FROM public.card_codes
+                WHERE {' AND '.join(where)}
+                ORDER BY id DESC
+                LIMIT %s OFFSET %s
+            """, (*params, int(limit), int(offset)))
+            rows = cur.fetchall() or []
+        return [{
+            "id": int(r[0]), "code": r[1], "telco": r[2],
+            "category": r[3], "used": bool(r[4]), "used_by_order_id": (int(r[5]) if r[5] is not None else None),
+            "created_at": int(r[6] or 0)
+        } for r in rows]
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/codes/cards/{telco}/{cid}/delete")
+def api_admin_codes_cards_delete(telco: str, cid: int, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    telco = (telco or "").strip().lower()
+    if telco not in ("atheir","asiacell","korek"):
+        raise HTTPException(422, "invalid telco")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_card_codes_table(cur)
+            cur.execute("DELETE FROM public.card_codes WHERE id=%s AND telco=%s", (int(cid), telco))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+# ----- Scoped Auto-Exec (itunes/cards) -----
+class AutoScopeSetIn(BaseModel):
+    scope: str
+    enabled: bool
+
+def _scope_flag_name(scope: str) -> str:
+    s = (scope or "").strip().lower()
+    return "auto_exec_itunes" if s == "itunes" else ("auto_exec_cards" if s == "cards" else "auto_exec_api")
+
+@app.get("/api/admin/auto_exec/status", name="auto_exec_status_scoped")
+def auto_exec_status_scoped(x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None, scope: Optional[str] = None):
+    # Backward compatible: if no scope -> return the generic flag
+    _require_admin(_pick_admin_password(x_admin_password, password) or "")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_settings_table(cur)
+            if scope:
+                flag = _scope_flag_name(scope)
+                enabled = _get_flag(cur, flag, False)
+                if scope == "itunes":
+                    _ensure_itunes_codes_table(cur)
+                    cur.execute("SELECT COUNT(*) FROM public.itunes_codes WHERE used=FALSE")
+                    free = int(cur.fetchone()[0])
+                    return {"enabled": bool(enabled), "free_codes": free}
+                if scope == "cards":
+                    _ensure_card_codes_table(cur)
+                    cur.execute("SELECT COUNT(*) FROM public.card_codes WHERE used=FALSE")
+                    free = int(cur.fetchone()[0])
+                    return {"enabled": bool(enabled), "free_codes": free}
+                return {"enabled": bool(enabled)}
+            else:
+                enabled = _get_flag(cur, "auto_exec_api", False)
+                return {"enabled": bool(enabled)}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/admin/auto_exec/set")
+def auto_exec_set(body: AutoScopeSetIn, x_admin_password: Optional[str] = Header(None, alias="x-admin-password"), password: Optional[str] = None):
+    _require_admin(_pick_admin_password(x_admin_password, password, (body.dict() if hasattr(body,'dict') else {})) or "")
+    scope = (body.scope or "").strip().lower()
+    if scope not in ("itunes","cards","api",""):
+        raise HTTPException(422, "invalid scope")
+    flag = _scope_flag_name(scope)
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            _ensure_settings_table(cur)
+            _set_flag(cur, flag, bool(body.enabled))
+        # Start daemons
+        try:
+            asyncio.create_task(_itunes_autoexec_daemon())
+            asyncio.create_task(_cards_autoexec_daemon())
+        except Exception:
+            pass
+        return {"ok": True, "scope": scope or "api", "enabled": bool(body.enabled)}
+    finally:
+        put_conn(conn)
+
+# ----- Pickers & processors -----
+def _parse_category_from_title(title: str) -> Optional[str]:
+    t = (title or "").lower()
+    # match 5,10,15,20,25,30,40,50,100 with or without $ symbol
+    m = re.search(r"(5|10|15|20|25|30|40|50|100)\s*\$|\$\s*(5|10|15|20|25|30|40|50|100)", t)
+    if m: return m.group(1) or m.group(2)
+    m = re.search(r"\b(5|10|15|20|25|30|40|50|100)\b", t)
+    return m.group(1) if m else None
+
+def _parse_telco_from_title(title: str) -> Optional[str]:
+    t = (title or "").lower()
+    if any(x in t for x in ["اثير","أثير","atheer","atheir","zain"]): return "atheir"
+    if any(x in t for x in ["asiacell","اسيا","اسياسيل","أسيا"]): return "asiacell"
+    if any(x in t for x in ["korek","كورك"]): return "korek"
+    return None
+
+def _itunes_pick_one_locked(cur):
+    cur.execute("""
+        SELECT o.id, o.user_id, o.title, COALESCE(o.payload, '{}'::jsonb)
+        FROM public.orders o
+        WHERE COALESCE(o.status,'Pending')='Pending'
+          AND (LOWER(o.title) LIKE '%itunes%' OR o.title LIKE '%ايتونز%')
+        ORDER BY o.id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    """)
+    r = cur.fetchone()
+    if not r: return None
+    title = r[2] or ""
+    category = _parse_category_from_title(title) or "generic"
+    return {"order_id": int(r[0]), "user_id": int(r[1]), "payload": r[3], "category": category}
+
+def _itunes_pick_code_locked(cur, category: str):
+    cur.execute("""
+        SELECT id, code
+        FROM public.itunes_codes
+        WHERE used=FALSE AND category=%s
+        ORDER BY id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    """, (category,))
+    r = cur.fetchone()
+    return ({"id": int(r[0]), "code": r[1]} if r else None)
+
+
+def _cards_pick_one_locked(cur):
+    # Pick manual phone-balance voucher orders (NOT direct topup_card)
+    cur.execute("""
+        SELECT o.id, o.user_id, o.title, COALESCE(o.payload, '{}'::jsonb)
+        FROM public.orders o
+        JOIN public.users u ON u.id = o.user_id
+        WHERE COALESCE(o.status,'Pending')='Pending'
+          AND (o.type IS NULL OR o.type <> 'topup_card')
+          AND (
+                LOWER(o.title) LIKE '%asiacell%' OR
+                o.title LIKE '%اسياسيل%' OR o.title LIKE '%أسيا%' OR
+                LOWER(o.title) LIKE '%korek%' OR
+                o.title LIKE '%كورك%' OR
+                LOWER(o.title) LIKE '%atheer%' OR LOWER(o.title) LIKE '%atheir%' OR
+                o.title LIKE '%اثير%' OR o.title LIKE '%أثير%' OR
+                LOWER(o.title) LIKE '%zain%' OR o.title LIKE '%زين%'
+          )
+        ORDER BY o.id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    """)
+    r = cur.fetchone()
+    if not r: return None
+    title = r[2] or ""
+    tel = _parse_telco_from_title(title)
+    category = _parse_category_from_title(title) or "generic"
+    return {"order_id": int(r[0]), "user_id": int(r[1]), "payload": r[3], "telco": tel, "category": category}
+
+
+def _cards_pick_code_locked(cur, telco: str, category: str):
+    cur.execute("""
+        SELECT id, code
+        FROM public.card_codes
+        WHERE used=FALSE AND telco=%s AND category=%s
+        ORDER BY id ASC
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    """, (telco, category))
+    r = cur.fetchone()
+    return ({"id": int(r[0]), "code": r[1]} if r else None)
+
+def _itunes_auto_process_one(conn):
+    with conn, conn.cursor() as cur:
+        _ensure_itunes_codes_table(cur)
+        rec = _itunes_pick_one_locked(cur)
+        if not rec: return None
+        code = _itunes_pick_code_locked(cur, rec["category"])
+        if not code:
+            logger.info("itunes_auto: skipped order due to no free code (category=%s)", rec.get("category"))
+            return {"skipped": True, "reason": "no_free_code", "category": rec.get("category")}
+        payload = rec.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                import json as _json
+                payload = _json.loads(payload) or {}
+            except Exception:
+                payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload["code"] = code["code"]
+        payload["card"] = code["code"]
+        payload["category"] = rec["category"]
+        if _payload_is_jsonb(conn):
+            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(payload), rec["order_id"]))
+        else:
+            from json import dumps as _dumps
+            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (_dumps(payload, ensure_ascii=False), rec["order_id"]))
+        cur.execute("UPDATE public.itunes_codes SET used=TRUE, used_by_order_id=%s, used_at=NOW() WHERE id=%s", (rec["order_id"], code["id"]))
+        out = {"order_id": rec["order_id"], "user_id": rec["user_id"], "code_id": code["id"]}
+    try:
+        _notify_user(conn, out["user_id"], out["order_id"], "تم تنفيذ طلبك ايتونز", f"الفئة {rec['category']} - الكود: {code['code']}")
+    except Exception:
+        pass
+    return out
+
+def _cards_auto_process_one(conn):
+    with conn, conn.cursor() as cur:
+        _ensure_card_codes_table(cur)
+        rec = _cards_pick_one_locked(cur)
+        if not rec: return None
+        telco = rec.get("telco")
+        if not telco:
+            logger.info("cards_auto: skipped order due to unknown telco (title=%s)", rec.get("title", ""))
+            return {"skipped": True, "reason": "unknown_telco"}
+        code = _cards_pick_code_locked(cur, telco, rec["category"])
+        if not code:
+            logger.info("cards_auto: skipped order due to no free code (telco=%s, category=%s)", telco, rec.get("category"))
+            return {"skipped": True, "reason": "no_free_code", "telco": telco, "category": rec.get("category")}
+        payload = rec.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                import json as _json
+                payload = _json.loads(payload) or {}
+            except Exception:
+                payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload["code"] = code["code"]
+        payload["card"] = code["code"]
+        payload["telco"] = telco
+        payload["category"] = rec["category"]
+        if _payload_is_jsonb(conn):
+            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (Json(payload), rec["order_id"]))
+        else:
+            from json import dumps as _dumps
+            cur.execute("UPDATE public.orders SET status='Done', payload=%s WHERE id=%s", (_dumps(payload, ensure_ascii=False), rec["order_id"]))
+        cur.execute("UPDATE public.card_codes SET used=TRUE, used_by_order_id=%s, used_at=NOW() WHERE id=%s", (rec["order_id"], code["id"]))
+        out = {"order_id": rec["order_id"], "user_id": rec["user_id"], "code_id": code["id"]}
+    try:
+        _notify_user(conn, out["user_id"], out["order_id"], f"تم تنفيذ طلبك رصيد {telco}", f"الفئة {rec['category']} - الكود: {code['code']}")
+    except Exception:
+        pass
+    return out
+
+# =========================
+# Auto-Exec Daemons (scoped) + startup bootstrap
+# =========================
+import asyncio as _ae_asyncio
+
+def _ae_bg_create_task(coro):
+    try:
+        loop = _ae_asyncio.get_running_loop()
+    except RuntimeError:
+        loop = _ae_asyncio.get_event_loop()
+    try:
+        return loop.create_task(coro)
+    except Exception as _e:
+        try:
+            # Fallback: run a tiny wrapper
+            return loop.create_task(_ae_asyncio.sleep(0))
+        except Exception:
+            logger.exception("autoexec: failed to schedule task: %s", _e)
+            return None
+
+async def _itunes_autoexec_daemon(poll_interval: float = 1.5):
+    """
+    Background worker: if auto_exec_itunes flag is enabled, keep picking one iTunes order and process it.
+    """
+    logger.info("daemon[itunes]: started")
+    while True:
+        try:
+            conn = get_conn()
+            try:
+                with conn, conn.cursor() as cur:
+                    _ensure_settings_table(cur)
+                    enabled = _get_flag(cur, "auto_exec_itunes", False)
+            finally:
+                put_conn(conn)
+            if not enabled:
+                await _ae_asyncio.sleep(3.0)
+                continue
+
+            # try to process one
+            try:
+                conn = get_conn()
+                out = _itunes_auto_process_one(conn)
+            finally:
+                put_conn(conn)
+            if not out or out.get("skipped"):
+                await _ae_asyncio.sleep(poll_interval)
+            else:
+                # processed one; immediately try next (short pause)
+                await _ae_asyncio.sleep(0.2)
+        except Exception as e:
+            logger.exception("daemon[itunes]: loop error: %s", e)
+            await _ae_asyncio.sleep(2.0)
+
+async def _cards_autoexec_daemon(poll_interval: float = 1.5):
+    """
+    Background worker: if auto_exec_cards flag is enabled, keep picking one Phone Card order and process it.
+    """
+    logger.info("daemon[cards]: started")
+    while True:
+        try:
+            conn = get_conn()
+            try:
+                with conn, conn.cursor() as cur:
+                    _ensure_settings_table(cur)
+                    enabled = _get_flag(cur, "auto_exec_cards", False)
+            finally:
+                put_conn(conn)
+            if not enabled:
+                await _ae_asyncio.sleep(3.0)
+                continue
+
+            # try to process one
+            try:
+                conn = get_conn()
+                out = _cards_auto_process_one(conn)
+            finally:
+                put_conn(conn)
+            if not out or out.get("skipped"):
+                await _ae_asyncio.sleep(poll_interval)
+            else:
+                # processed one; immediately try next (short pause)
+                await _ae_asyncio.sleep(0.2)
+        except Exception as e:
+            logger.exception("daemon[cards]: loop error: %s", e)
+            await _ae_asyncio.sleep(2.0)
+
+@app.on_event("startup")
+async def _autoexec_bootstrap():
+    """
+    On startup, if any auto-exec flags are enabled, ensure daemons are running.
+    """
+    try:
+        conn = get_conn()
+        try:
+            with conn, conn.cursor() as cur:
+                _ensure_settings_table(cur)
+                itunes_on = _get_flag(cur, "auto_exec_itunes", False)
+                cards_on  = _get_flag(cur, "auto_exec_cards", False)
+        finally:
+            put_conn(conn)
+
+        if itunes_on:
+            _ae_bg_create_task(_itunes_autoexec_daemon())
+        if cards_on:
+            _ae_bg_create_task(_cards_autoexec_daemon())
+        logger.info("autoexec bootstrap: itunes=%s cards=%s", itunes_on, cards_on)
+    except Exception as e:
+        logger.exception("autoexec bootstrap failed: %s", e)
+
+
+
+# === UID password routes ===
+@app.post("/api/users/bind_password")
+def bind_password(req: dict):
+    uid = _normalize_ui_key(req.get("uid"))
+    password = str(req.get("password") or "")
+    if not uid or len(password) < 4:
+        raise HTTPException(status_code=400, detail="INVALID_PAYLOAD")
+    # store hash + encrypted copy
+    pw_hash = _auth_hash_password(password)
+    iv, ct = _auth_encrypt_password(uid, password)
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO public.user_passwords(uid, password_hash, password_cipher, password_iv)
+                VALUES(%s,%s,%s,%s)
+                ON CONFLICT(uid) DO UPDATE SET
+                    password_hash=EXCLUDED.password_hash,
+                    password_cipher=EXCLUDED.password_cipher,
+                    password_iv=EXCLUDED.password_iv,
+                    updated_at=NOW()
+            """, (uid, pw_hash, psycopg2.Binary(ct), psycopg2.Binary(iv)))
+        return {"ok": True}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/users/login")
+def login(req: dict):
+    uid = _normalize_ui_key(req.get("uid"))
+    password = str(req.get("password") or "")
+    if not uid or not password:
+        raise HTTPException(status_code=400, detail="INVALID_PAYLOAD")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT password_hash FROM public.user_passwords WHERE uid=%s", (uid,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+            if not _auth_verify_password(password, row[0]):
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+        return {"ok": True, "uid": uid}
+    finally:
+        put_conn(conn)
+
+@app.post("/api/users/reveal_password")
+def reveal_password(req: dict):
+    """
+    Return the stored password in plaintext for a given UID by decrypting the stored cipher.
+    - If "password" is provided, we verify it against the stored bcrypt hash (backward compatible).
+    - If "password" is omitted or empty, we still reveal (the app relies on device screen lock for auth).
+    """
+    uid = _normalize_ui_key(req.get("uid"))
+    # Optional: may be omitted by client when using device authentication
+    password = str(req.get("password") or "")
+    if not uid:
+        raise HTTPException(status_code=400, detail="INVALID_PAYLOAD")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT password_hash, password_cipher, password_iv FROM public.user_passwords WHERE uid=%s",
+                (uid,)
             )
-        }
-        if (unread > 0) {
-            Box(
-                modifier = Modifier
-                    .size(18.dp)
-                    .align(Alignment.TopEnd)
-                    .offset(x = (-2).dp, y = 2.dp)
-                    .background(Color(0xFFE53935), CircleShape),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = unread.toString(),
-                    color = Color.White,
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.Bold,
-                    textAlign = TextAlign.Center,
-                    maxLines = 1
-                )
-            }
-        }
-    }
-}
-
-
-// =========================
-// Firebase Messaging Service — يحفظ إشعارات FCM داخل أيقونة الجرس مع التفاصيل
-// =========================
-class AppFcmService : FirebaseMessagingService() {
-    override fun onMessageReceived(msg: RemoteMessage) {
-        val ctx = applicationContext
-        val d = msg.data
-        val title = d["title"] ?: msg.notification?.title ?: "إشعار"
-        val bodyTxt  = d["body"] ?: msg.notification?.body ?: ""
-        try {
-            val existing = loadNotices(ctx)
-            val nn = AppNotice(
-                title = title,
-                body = bodyTxt,
-                ts = System.currentTimeMillis(),
-                forOwner = false,
-                orderId = d["order_id"],
-                serviceName = d["service_name"],
-                amount = d["amount"],
-                code = d["code"],
-                status = d["status"]
-            )
-            saveNotices(ctx, existing + nn)
-        } catch (_: Throwable) { }
-        AppNotifier.notifyNow(ctx, title, bodyTxt)
-    }
-}
-
-
-@Composable
-private fun AdminAnnouncementsHub(
-    token: String,
-    onBack: () -> Unit
-) {
-    var screen by remember { mutableStateOf<String?>(null) } // "create" | "list"
-
-    if (screen == null) {
-        Column(Modifier.fillMaxSize().padding(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                Text("إعلانات التطبيق", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = OnBg, modifier = Modifier.weight(1f))
-                TextButton(onClick = onBack) { Text("رجوع") }
-            }
-            Spacer(Modifier.height(12.dp))
-            ElevatedButton(
-                onClick = { screen = "create" },
-                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
-            ) { Text("إنشاء إعلان") }
-            ElevatedButton(
-                onClick = { screen = "list" },
-                modifier = Modifier.fillMaxWidth()
-            ) { Text("عرض الإعلانات") }
-        }
-    } else {
-        when (screen) {
-            "create" -> AdminAnnouncementScreen(token = token, onBack = { screen = null })
-            "list" -> AdminAnnouncementsList(token = token, onBack = { screen = null })
-        }
-    }
-}
-
-@Composable
-private fun AdminAnnouncementsList(
-    token: String,
-    onBack: () -> Unit
-) {
-    val scope = rememberCoroutineScope()
-    var list by remember { mutableStateOf<List<Announcement>>(emptyList()) }
-    var loading by remember { mutableStateOf(true) }
-    var err by remember { mutableStateOf<String?>(null) }
-    var refreshKey by remember { mutableStateOf(0) }
-    var snack by remember { mutableStateOf<String?>(null) }
-
-    LaunchedEffect(refreshKey) {
-        loading = true; err = null
-        try {
-            list = apiFetchAdminAnnouncements(token, 200).sortedByDescending { it.createdAt }
-        } catch (e: Exception) {
-            err = "تعذر جلب الإعلانات"
-        } finally { loading = false }
-    }
-
-    Column(Modifier.fillMaxSize().padding(16.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = null, tint = OnBg) }
-            Spacer(Modifier.width(6.dp))
-            Text("عرض الإعلانات", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = OnBg)
-        }
-        Spacer(Modifier.height(10.dp))
-
-        when {
-            loading -> Text("يتم التحميل", color = Dim)
-            err != null -> Text(err!!, color = Bad)
-            list.isEmpty() -> Text("لا توجد إعلانات.", color = Dim)
-            else -> {
-                LazyColumn {
-                    items(list.size) { idx ->
-                        val ann = list[idx]
-                        var showEdit by remember { mutableStateOf(false) }
-                        var showDelete by remember { mutableStateOf(false) }
-                        Card(
-                            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                            colors = CardDefaults.cardColors(containerColor = Surface1, contentColor = OnBg)
-                        ) {
-                            Column(Modifier.padding(16.dp)) {
-                                Text(ann.title ?: "إعلان مهم 📢", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = OnBg)
-                                Spacer(Modifier.height(6.dp))
-                                Text(ann.body, color = OnBg)
-                                Spacer(Modifier.height(6.dp))
-                                val ts = if (ann.createdAt > 0) ann.createdAt else System.currentTimeMillis()
-                                val formatted = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
-                                    .format(java.util.Date(ts))
-                                Text(formatted, fontSize = 10.sp, color = Dim)
-                                Spacer(Modifier.height(8.dp))
-                                Row {
-                                    TextButton(onClick = { showEdit = true }) { Text("تعديل الإعلان") }
-                                    Spacer(Modifier.width(6.dp))
-                                    TextButton(onClick = { showDelete = true }) { Text("حذف الإعلان") }
-                                }
-                            }
-                        }
-
-                        if (showEdit) {
-                            var title by remember { mutableStateOf(ann.title ?: "") }
-                            var body by remember { mutableStateOf(ann.body) }
-                            AlertDialog(
-                                onDismissRequest = { showEdit = false },
-                                confirmButton = {
-                                    TextButton(onClick = {
-                                        val id = ann.id
-                                        if (id != null && id > 0) {
-                                            scope.launch {
-                                                val ok = apiAdminUpdateAnnouncement(token, id, title.ifBlank { null }, body)
-                                                showEdit = false
-                                                snack = if (ok) "تم الحفظ" else "فشل التعديل"
-                                                if (ok) refreshKey++
-                                            }
-                                        } else {
-                                            showEdit = false
-                                            snack = "لا يدعم الخادم تعديل هذا الإعلان (معرّف مفقود)"
-                                        }
-                                    }) { Text("حفظ") }
-                                },
-                                dismissButton = { TextButton(onClick = { showEdit = false }) { Text("إلغاء") } },
-                                title = { Text("تعديل الإعلان", color = OnBg) },
-                                text = {
-                                    Column {
-                                        OutlinedTextField(value = title, onValueChange = { title = it }, singleLine = true, label = { Text("العنوان (اختياري)") })
-                                        Spacer(Modifier.height(8.dp))
-                                        OutlinedTextField(value = body, onValueChange = { body = it }, minLines = 5, label = { Text("نص الإعلان") })
-                                    }
-                                }
-                            )
-                        }
-
-                        if (showDelete) {
-                            AlertDialog(
-                                onDismissRequest = { showDelete = false },
-                                confirmButton = {
-                                    TextButton(onClick = {
-                                        val id = ann.id
-                                        if (id != null && id > 0) {
-                                            scope.launch {
-                                                val ok = apiAdminDeleteAnnouncement(token, id)
-                                                showDelete = false
-                                                snack = if (ok) "تم الحذف" else "فشل الحذف"
-                                                if (ok) refreshKey++
-                                            }
-                                        } else {
-                                            showDelete = false
-                                            snack = "لا يدعم الخادم حذف هذا الإعلان (معرّف مفقود)"
-                                        }
-                                    }) { Text("تأكيد الحذف") }
-                                },
-                                dismissButton = { TextButton(onClick = { showDelete = false }) { Text("إلغاء") } },
-                                title = { Text("تأكيد الحذف", color = OnBg) },
-                                text = { Text("هل أنت متأكد من حذف هذا الإعلان؟", color = OnBg) }
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        snack?.let {
-            Spacer(Modifier.height(10.dp))
-            Text(it, color = OnBg)
-            androidx.compose.runtime.LaunchedEffect(it) { kotlinx.coroutines.delay(2000); snack = null }
-        }
-    }
-}
-
-
-
-/* ====== حوار ربط كلمة المرور ====== */
-@Composable
-private fun BindPasswordDialog(uid: String, onDismiss: () -> Unit, onBound: (String) -> Unit, onToast: (String)->Unit) {
-    val ctx = LocalContext.current
-    var pwd by remember { mutableStateOf("") }
-    var pwd2 by remember { mutableStateOf("") }
-    var show1 by remember { mutableStateOf(false) }
-    var show2 by remember { mutableStateOf(false) }
-    var sending by remember { mutableStateOf(false) }
-    AlertDialog(
-        onDismissRequest = { if (!sending) onDismiss() },
-        title = { Text("ربط كلمة المرور بالحساب") },
-        text = {
-            Column {
-                OutlinedTextField(value = pwd, onValueChange = { pwd = it }, label = { Text("كلمة المرور") },
-                    visualTransformation = if (show1) androidx.compose.ui.text.input.VisualTransformation.None else androidx.compose.ui.text.input.PasswordVisualTransformation(),
-                    trailingIcon = {
-                        TextButton(onClick = { show1 = !show1 }) { Text(if (show1) "إخفاء" else "عرض") }
-                    })
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(value = pwd2, onValueChange = { pwd2 = it }, label = { Text("تأكيد كلمة المرور") },
-                    visualTransformation = if (show2) androidx.compose.ui.text.input.VisualTransformation.None else androidx.compose.ui.text.input.PasswordVisualTransformation(),
-                    trailingIcon = {
-                        TextButton(onClick = { show2 = !show2 }) { Text(if (show2) "إخفاء" else "عرض") }
-                    })
-            }
-        },
-        confirmButton = {
-            TextButton(enabled = !sending, onClick = {
-                if (pwd.length < 4) { onToast("كلمة المرور قصيرة"); return@TextButton }
-                if (pwd != pwd2)   { onToast("كلمتا المرور غير متطابقتين"); return@TextButton }
-                sending = true
-                kotlinx.coroutines.GlobalScope.launch(kotlinx.coroutines.Dispatchers.Main) {
-                    try {
-                        val obj = org.json.JSONObject().put("uid", uid).put("password", pwd)
-                        val (code, _) = httpPost("/api/users/bind_password", obj)
-                        if (code in 200..299) {
-                            saveLocalPassword(ctx, uid, pwd)
-                            onToast("تم الربط بنجاح")
-                            onBound(pwd)
-                            onDismiss()
-                        } else onToast("فشل الربط ($code)")
-                    } catch (t: Throwable) { onToast("خطأ: ${t.message}") }
-                    finally { sending = false }
-                }
-            }) { Text(if (sending) "يرسل" else "تثبيت") }
-        },
-        dismissButton = { TextButton(enabled = !sending, onClick = onDismiss) { Text("إلغاء") } }
-    )
-}
-
-/* ====== حوار تسجيل الدخول ====== */
-@Composable
-private fun LoginUidDialog(onDismiss: () -> Unit, onLogged: (String) -> Unit, onToast: (String)->Unit) {
-    val ctx = LocalContext.current
-    var uidIn by remember { mutableStateOf("") }
-    var pwd by remember { mutableStateOf("") }
-    var show by remember { mutableStateOf(false) }
-    var sending by remember { mutableStateOf(false) }
-    AlertDialog(
-        onDismissRequest = { if (!sending) onDismiss() },
-        title = { Text("تسجيل دخول UID") },
-        text = {
-            Column {
-                OutlinedTextField(value = uidIn, onValueChange = { if (it.length <= 24) uidIn = it.filter { ch -> ch.isLetterOrDigit() } }, label = { Text("UID") })
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(value = pwd, onValueChange = { pwd = it }, label = { Text("كلمة المرور") },
-                    visualTransformation = if (show) androidx.compose.ui.text.input.VisualTransformation.None else androidx.compose.ui.text.input.PasswordVisualTransformation(),
-                    trailingIcon = { TextButton(onClick = { show = !show }) { Text(if (show) "إخفاء" else "عرض") } })
-            }
-        },
-        confirmButton = {
-            TextButton(enabled = !sending, onClick = {
-                if (uidIn.isBlank() || pwd.isBlank()) { onToast("أكمل الحقول") ; return@TextButton }
-                sending = true
-                kotlinx.coroutines.GlobalScope.launch(kotlinx.coroutines.Dispatchers.Main) {
-                    try {
-                        val obj = org.json.JSONObject().put("uid", uidIn).put("password", pwd)
-                        val (code, _) = httpPost("/api/users/login", obj)
-                        if (code in 200..299) {
-                            saveLocalPassword(ctx, uidIn, pwd)
-                            onToast("تم تسجيل الدخول")
-                            onLogged(uidIn)
-                            onDismiss()
-                        } else onToast("فشل تسجيل الدخول ($code)")
-                    } catch (t: Throwable) { onToast("خطأ: ${t.message}") }
-                    finally { sending = false }
-                }
-            }) { Text(if (sending) "يدخل" else "تسجيل الدخول") }
-        },
-        dismissButton = { TextButton(enabled = !sending, onClick = onDismiss) { Text("إلغاء") } }
-    )
-}
-
-/* ====== طلب تأكيد قفل الجهاز + إظهار كلمة المرور ====== */
-@Composable
-private fun revealPassword(ctx: Context, uid: String) {
-    var show by remember { mutableStateOf(false) }
-    var value by remember { mutableStateOf<String?>(null) }
-    val activity = LocalContext.current as? android.app.Activity
-    val launcher = androidx.activity.compose.rememberLauncherForActivityResult(
-        androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()
-    ) { res ->
-        if (res.resultCode == android.app.Activity.RESULT_OK) {
-            value = loadLocalPassword(ctx, uid)
-            show = true
-        }
-    }
-    LaunchedEffect(Unit) {
-        val km = ctx.getSystemService(Context.KEYGUARD_SERVICE) as android.app.KeyguardManager
-        val intent = km.createConfirmDeviceCredentialIntent("تأكيد الهوية", "أدخل قفل الجهاز لعرض كلمة المرور")
-        if (intent != null && activity != null) {
-            launcher.launch(intent)
-        } else {
-            value = loadLocalPassword(ctx, uid); show = true
-        }
-    }
-    if (show) {
-        AlertDialog(
-            onDismissRequest = { show = false },
-            title = { Text("كلمة المرور المحفوظة") },
-            text = {
-                val v = value ?: "لا توجد كلمة مرور محفوظة"
-                Column {
-                    SelectionContainer { Text(v, color = OnBg) }
-                    Spacer(Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        val clip = LocalClipboardManager.current
-                        OutlinedButton(onClick = { clip.setText(AnnotatedString(v)) }) { Text("نسخ") }
-                        OutlinedButton(onClick = { show = false }) { Text("تم") }
-                    }
-                }
-            },
-            confirmButton = {},
-            dismissButton = {}
-        )
-    }
-}
-
-/* ====== حوار عرض كلمة المرور (تحقّق خادم + تأكيد قفل الجهاز) ====== */
-
-@Composable
-private fun RevealPasswordDialog(uid: String, onDismiss: () -> Unit, onToast: (String) -> Unit) {
-    val ctx = LocalContext.current
-    val activity = LocalContext.current as? android.app.Activity
-    var sending by remember { mutableStateOf(false) }
-    var revealed by remember { mutableStateOf<String?>(null) }
-    var showResult by remember { mutableStateOf(false) }
-
-    val launcher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { res ->
-        if (res.resultCode == android.app.Activity.RESULT_OK) {
-            kotlinx.coroutines.GlobalScope.launch(kotlinx.coroutines.Dispatchers.Main) {
-                sending = true
-                try {
-                    val obj = org.json.JSONObject().put("uid", uid)
-                    val (code, body) = httpPost("/api/users/reveal_password", obj)
-                    if (code in 200..299) {
-                        val j = org.json.JSONObject(body ?: "{}")
-                        val pw = j.optString("password", "")
-                        if (pw.isNotBlank()) {
-                            saveLocalPassword(ctx, uid, pw)
-                            revealed = pw
-                            showResult = true
-                        } else onToast("لا توجد كلمة مرور محفوظة")
-                    } else onToast("فشل العرض ($code)")
-                } catch (t: Throwable) { onToast("خطأ: ${t.message}") }
-                finally { sending = false }
-            }
-        }
-    }
-
-    AlertDialog(
-        onDismissRequest = { if (!sending) onDismiss() },
-        title = { Text("عرض كلمة المرور") },
-        text = {
-            Column {
-                Text("لأمانك سيتم التحقق من قفل الجهاز مباشرةً، وبعد النجاح سنعرض كلمة المرور المخزّنة.", color = OnBg)
-                Spacer(Modifier.height(8.dp))
-            }
-        },
-        confirmButton = {
-            TextButton(enabled = !sending, onClick = {
-                val km = ctx.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-                val intent = km.createConfirmDeviceCredentialIntent("تأكيد الهوية", "أدخل قفل الجهاز للمتابعة")
-                if (intent != null && activity != null) launcher.launch(intent) else onToast("يتطلب قفل جهاز مُفعّل")
-            }) { Text(if (sending) "جاري..." else "متابعة") }
-        },
-        dismissButton = { TextButton(enabled = !sending, onClick = onDismiss) { Text("إلغاء") } }
-    )
-
-    if (showResult) {
-        AlertDialog(
-            onDismissRequest = { showResult = false },
-            title = { Text("كلمة المرور") },
-            text = {
-                val v = revealed ?: ""
-                Column {
-                    SelectionContainer { Text(v, color = OnBg) }
-                    Spacer(Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        val clip = LocalClipboardManager.current
-                        OutlinedButton(onClick = { clip.setText(AnnotatedString(v)) }) { Text("نسخ") }
-                        OutlinedButton(onClick = { showResult = false; onDismiss() }) { Text("تم") }
-                    }
-                }
-            },
-            confirmButton = {},
-            dismissButton = {}
-        )
-    }
-}
-
-
-
-    // --- Badge state persistence ---
-    private const val BADGE_PREF = "badge_state_v1"
-    private fun badgePrefs(ctx: Context): android.content.SharedPreferences =
-        ctx.getSharedPreferences(BADGE_PREF, android.content.Context.MODE_PRIVATE)
-    private fun saveBadge(ctx: Context, key: String, value: Boolean) {
-        badgePrefs(ctx).edit().putBoolean(key, value).apply()
-    }
-    private fun readBadge(ctx: Context, key: String): Boolean =
-        badgePrefs(ctx).getBoolean(key, false)
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="NO_PASSWORD_FOR_UID")
+            pw_hash, ct, iv = row[0], bytes(row[1]), bytes(row[2])
+            # If user supplied password, verify it (old behavior). Otherwise skip.
+            if password:
+                if not _auth_verify_password(password, pw_hash):
+                    raise HTTPException(status_code=401, detail="Invalid credentials")
+            plain = _auth_decrypt_password(uid, iv, ct)
+        return {"ok": True, "password": plain}
+    finally:
+        put_conn(conn)
