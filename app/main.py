@@ -838,18 +838,31 @@ def _push_user(conn, user_id: int, order_id: Optional[int], title: str, body: st
 
 def _format_amount_for_notification(amount) -> str:
     """
-    Format amount for display in notifications without تغيير القيمة الرقمية.
-    - إذا كان amount من نوع Decimal نرجعه كنص بصيغة عادية (بدون E).
-    - وباقي الأنواع نرجع str(amount) كما هي.
+    تنسيق المبلغ لعرضه في الإشعارات:
+    - يمنع الصيغة العلمية (E+3).
+    - يحدد عدد المنازل العشرية لحد 4 مراتب فقط.
+    - لا يغيّر الرصيد الفعلي في القاعدة، فقط شكل النص في الإشعار.
     """
     try:
-        from decimal import Decimal
+        from decimal import Decimal, ROUND_HALF_UP
+        # تحويل إلى Decimal من النص لتقليل أخطاء float
         if isinstance(amount, Decimal):
-            return format(amount, "f")
-        return str(amount)
+            dec = amount
+        else:
+            dec = Decimal(str(amount))
+        # تقريب إلى 4 منازل عشرية
+        dec = dec.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+        s = format(dec, "f")
+        # إزالة الأصفار الزائدة في النهاية
+        if "." in s:
+            s = s.rstrip("0").rstrip(".")
+        return s
     except Exception:
         try:
-            return str(amount)
+            # محاولة احتياطية باستعمال float
+            f = float(amount)
+            s = f"{f:.4f}".rstrip("0").rstrip(".")
+            return s
         except Exception:
             return "0"
 
