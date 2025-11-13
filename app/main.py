@@ -838,33 +838,18 @@ def _push_user(conn, user_id: int, order_id: Optional[int], title: str, body: st
 
 def _format_amount_for_notification(amount) -> str:
     """
-    Format amount for display in notifications without scientific notation
-    and without very long decimal tails. Keeps up to 3 decimal places:
-    1 -> "1", 1.1 -> "1.1", 1.01 -> "1.01", 1.001 -> "1.001".
+    Format amount for display in notifications without تغيير القيمة الرقمية.
+    - إذا كان amount من نوع Decimal نرجعه كنص بصيغة عادية (بدون E).
+    - وباقي الأنواع نرجع str(amount) كما هي.
     """
     try:
-        from decimal import Decimal, ROUND_HALF_UP
+        from decimal import Decimal
         if isinstance(amount, Decimal):
-            dec = amount
-        else:
-            dec = Decimal(str(amount))
-        # Round to 3 decimal places
-        dec = dec.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
-        s = format(dec, "f")
-        if "." in s:
-            s = s.rstrip("0").rstrip(".")
-        return s
+            return format(amount, "f")
+        return str(amount)
     except Exception:
         try:
-            s = str(amount)
-            # Best-effort cleanup for float repr like 1.0100000000000003
-            if "e" in s or "E" in s:
-                try:
-                    f = float(amount)
-                    s = f"{f:.3f}".rstrip("0").rstrip(".")
-                except Exception:
-                    pass
-            return s
+            return str(amount)
         except Exception:
             return "0"
 
@@ -1112,7 +1097,7 @@ async def wallet_paytabs_callback(request: Request):
                 (user_id, usd_amount, "paytabs_topup", Json({"paytabs": data, "iqd_amount": amount})),
             )
 
-                display_amount = _format_amount_for_notification(usd_amount)
+        display_amount = _format_amount_for_notification(usd_amount)
         _push_user(conn, user_id, None, "تمت إضافة رصيد", f"تم شحن رصيدك بمبلغ {display_amount} دولار.")
     finally:
         put_conn(conn)
