@@ -88,6 +88,13 @@ OWNER_UID = os.getenv("OWNER_UID", "OWNER-0001").strip()
 PROVIDER_API_URL = os.getenv("PROVIDER_API_URL", "https://kd1s.com/api/v2")
 PROVIDER_API_KEY = os.getenv("PROVIDER_API_KEY", "25a9ceb07be0d8b2ba88e70dcbe92e06")
 
+
+PAYTABS_PROFILE_ID = os.getenv("PAYTABS_PROFILE_ID")
+PAYTABS_SERVER_KEY = os.getenv("PAYTABS_SERVER_KEY")
+PAYTABS_BASE_URL = (os.getenv("PAYTABS_BASE_URL") or "").rstrip("/")
+PAYTABS_CURRENCY = os.getenv("PAYTABS_CURRENCY", "USD")
+BACKEND_PUBLIC_URL = (os.getenv("BACKEND_PUBLIC_URL") or "").rstrip("/")
+
 POOL_MIN, POOL_MAX = 1, int(os.getenv("DB_POOL_MAX", "5"))
 dbpool: pool.SimpleConnectionPool = pool.SimpleConnectionPool(POOL_MIN, POOL_MAX, dsn=DATABASE_URL)
 
@@ -861,6 +868,14 @@ class WalletCompatIn(BaseModel):
     amount: float
     reason: Optional[str] = None
 
+
+class PayTabsCreateIn(BaseModel):
+    uid: str
+    usd: float
+
+class PayTabsCreateOut(BaseModel):
+    payment_url: str
+
 # =========================
 # Middleware logging
 # =========================
@@ -976,6 +991,30 @@ def wallet_balance_alias4(uid: str):
 @app.get("/api/users/{uid}/balance")
 def wallet_balance_alias5(uid: str):
     return wallet_balance(uid)
+
+@app.post("/api/wallet/paytabs/create", response_model=PayTabsCreateOut)
+def wallet_paytabs_create(body: PayTabsCreateIn):
+    """
+    Create PayTabs hosted payment page for wallet top-up.
+    """
+    # basic sanity
+    if not body.uid or body.usd is None or body.usd <= 0:
+        raise HTTPException(422, "invalid amount")
+
+    # Optionally ensure user exists
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.users WHERE uid=%s", (body.uid,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "user not found")
+    finally:
+        put_conn(conn)
+
+    url = _create_paytabs_payment_page(body.uid, body.usd)
+    return PayTabsCreateOut(payment_url=url)
+
 
 # Create provider order core
 def _create_provider_order_core(cur, uid: str, service_id: Optional[int], service_name: str,
@@ -1184,6 +1223,66 @@ def _asiacell_submit_core(cur, uid: str, card_digits: str) -> int:
 
 def _extract_digits(raw: Any) -> str:
     return "".join(ch for ch in str(raw) if ch.isdigit())
+
+def _create_paytabs_payment_page(uid: str, amount: float) -> str:
+    """
+    Create PayTabs Hosted Payment Page and return redirect_url.
+    Uses PAYTABS_* env vars and BACKEND_PUBLIC_URL.
+    """
+    if not PAYTABS_PROFILE_ID or not PAYTABS_SERVER_KEY or not PAYTABS_BASE_URL:
+        raise HTTPException(500, "PayTabs is not configured")
+
+    try:
+        profile_id_int = int(PAYTABS_PROFILE_ID)
+    except Exception:
+        raise HTTPException(500, "PAYTABS_PROFILE_ID must be integer")
+
+    url = f"{PAYTABS_BASE_URL}/payment/request"
+
+    # simple unique cart id
+    cart_id = f"WALLET-{uid}-{int(time.time())}"[:64]
+
+    backend_domain = BACKEND_PUBLIC_URL or "https://example.com"
+    callback_url = backend_domain.rstrip("/") + "/api/wallet/paytabs/callback"
+    return_url = backend_domain.rstrip("/") + "/payment/result"
+
+    payload = {
+        "profile_id": profile_id_int,
+        "tran_type": "sale",
+        "tran_class": "ecom",
+        "cart_id": cart_id,
+        "cart_currency": PAYTABS_CURRENCY,
+        "cart_amount": round(float(amount), 2),
+        "cart_description": f"Wallet top-up for UID {uid}",
+        "payment_methods": ["creditcard"],
+        "callback": callback_url,
+        "return": return_url,
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "authorization": PAYTABS_SERVER_KEY,
+    }
+
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=20)
+    except Exception as e:
+        raise HTTPException(502, f"Error connecting to PayTabs: {e}")
+
+    if resp.status_code < 200 or resp.status_code >= 300:
+        raise HTTPException(502, f"PayTabs API error: HTTP {resp.status_code}")
+
+    try:
+        data = resp.json()
+    except Exception:
+        raise HTTPException(502, "Invalid JSON from PayTabs")
+
+    redirect_url = data.get("redirect_url") or data.get("invoice_link")
+    if not redirect_url:
+        raise HTTPException(502, "PayTabs did not return redirect_url")
+
+    return redirect_url
+
 
 ASIACELL_PATHS = [
     "/api/wallet/asiacell/submit",
