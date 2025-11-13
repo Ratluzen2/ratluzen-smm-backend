@@ -89,11 +89,11 @@ PROVIDER_API_URL = os.getenv("PROVIDER_API_URL", "https://kd1s.com/api/v2")
 PROVIDER_API_KEY = os.getenv("PROVIDER_API_KEY", "25a9ceb07be0d8b2ba88e70dcbe92e06")
 
 
-PAYTABS_PROFILE_ID = os.getenv("PAYTABS_PROFILE_ID")
-PAYTABS_SERVER_KEY = os.getenv("PAYTABS_SERVER_KEY")
-PAYTABS_BASE_URL = (os.getenv("PAYTABS_BASE_URL") or "").rstrip("/")
-PAYTABS_CURRENCY = os.getenv("PAYTABS_CURRENCY", "USD")
-BACKEND_PUBLIC_URL = (os.getenv("BACKEND_PUBLIC_URL") or "").rstrip("/")
+PAYTABS_PROFILE_ID = (os.getenv("PAYTABS_PROFILE_ID") or "").strip()
+PAYTABS_SERVER_KEY = (os.getenv("PAYTABS_SERVER_KEY") or "").strip()
+PAYTABS_BASE_URL = (os.getenv("PAYTABS_BASE_URL") or "").strip().rstrip("/")
+PAYTABS_CURRENCY = (os.getenv("PAYTABS_CURRENCY") or "USD").strip() or "USD"
+BACKEND_PUBLIC_URL = (os.getenv("BACKEND_PUBLIC_URL") or "").strip().rstrip("/")
 
 POOL_MIN, POOL_MAX = 1, int(os.getenv("DB_POOL_MAX", "5"))
 dbpool: pool.SimpleConnectionPool = pool.SimpleConnectionPool(POOL_MIN, POOL_MAX, dsn=DATABASE_URL)
@@ -1270,6 +1270,13 @@ def _create_paytabs_payment_page(uid: str, amount: float) -> str:
         raise HTTPException(502, f"Error connecting to PayTabs: {e}")
 
     if resp.status_code < 200 or resp.status_code >= 300:
+        # Log full error body to Heroku logs for debugging
+        logging.getLogger("smm").error(
+            "PayTabs API error: url=%s status=%s body=%s",
+            url,
+            resp.status_code,
+            (resp.text or "")[:400],
+        )
         raise HTTPException(502, f"PayTabs API error: HTTP {resp.status_code}")
 
     try:
