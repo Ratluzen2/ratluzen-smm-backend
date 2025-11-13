@@ -836,6 +836,28 @@ def _push_user(conn, user_id: int, order_id: Optional[int], title: str, body: st
     except Exception as e:
         logger.exception("push_user send failed: %s", e)
 
+
+def _format_amount_for_notification(amount) -> str:
+    """
+    Format amount (Decimal/float/int) for display in notifications
+    without scientific notation, e.g. 1.0E+3 -> 1000.
+    """
+    try:
+        # Prefer Decimal for consistent formatting
+        from decimal import Decimal as _Decimal
+        if isinstance(amount, _Decimal):
+            s = format(amount, "f")
+        else:
+            s = format(_Decimal(str(amount)), "f")
+        if "." in s:
+            s = s.rstrip("0").rstrip(".")
+        return s
+    except Exception:
+        try:
+            return str(amount)
+        except Exception:
+            return "0"
+
 # =========================
 
 # Models
@@ -1080,7 +1102,8 @@ async def wallet_paytabs_callback(request: Request):
                 (user_id, usd_amount, "paytabs_topup", Json({"paytabs": data, "iqd_amount": amount})),
             )
 
-        _push_user(conn, user_id, None, "تمت إضافة رصيد", f"تم شحن رصيدك بمبلغ {usd_amount} دولار.")
+        display_amount = _format_amount_for_notification(usd_amount)
+        _push_user(conn, user_id, None, "تمت إضافة رصيد", f"تم شحن رصيدك بمبلغ {display_amount} دولار.")
     finally:
         put_conn(conn)
 
