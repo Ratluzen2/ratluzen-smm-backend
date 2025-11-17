@@ -4785,3 +4785,282 @@ def reveal_password(req: dict):
         return {"ok": True, "password": plain}
     finally:
         put_conn(conn)
+
+
+# ------- START: TOON response middleware (added) -------
+from fastapi import Request as _RequestFastAPI
+from fastapi.responses import Response as _FastAPIResponse
+from typing import Iterable as _Iterable
+
+def _primitive_to_toon(v):
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        # avoid scientific notation for Decimal-like strings
+        return str(v)
+    # strings: escape newlines and commas minimally
+    s = str(v)
+    s = s.replace(\"\\n\", \"\\\\n\")
+    return s
+
+def _dict_to_toon(d: dict, prefix: str = "") -> str:
+    # Simple key: value lines. For nested dict/list we use braces and commas.
+    parts = []
+    for k, v in d.items():
+        key = str(k)
+        if isinstance(v, dict):
+            inner = _dict_to_toon(v, prefix=prefix + key + ".")
+            parts.append(f\"{key}{{{inner}}}\")
+        elif isinstance(v, list):
+            # list of primitives or dicts
+            if all(not isinstance(x, dict) for x in v):
+                vals = \", \".join(_primitive_to_toon(x) for x in v)
+                parts.append(f\"{key}: {vals}\")
+            else:
+                # list of dicts -> index them
+                inner_lines = []
+                for i, item in enumerate(v):
+                    if isinstance(item, dict):
+                        inner = _dict_to_toon(item)
+                        inner_lines.append(f\"[{i}]{{{inner}}}\")
+                    else:
+                        inner_lines.append(_primitive_to_toon(item))
+                parts.append(f\"{key}:[{';'.join(inner_lines)}]\")
+        else:
+            parts.append(f\"{key}: {_primitive_to_toon(v)}\")
+    return \", \".join(parts)
+
+def _to_toon(obj) -> str:
+    # Top-level can be dict, list, or primitive
+    if isinstance(obj, dict):
+        return _dict_to_toon(obj)
+    if isinstance(obj, list):
+        # list of dicts -> join by newline
+        if all(isinstance(x, dict) for x in obj):
+            return \"\\n\".join(_dict_to_toon(x) for x in obj)
+        else:
+            return \", \".join(_primitive_to_toon(x) for x in obj)
+    return _primitive_to_toon(obj)
+
+@app.middleware(\"http\")
+async def toon_middleware(request: _RequestFastAPI, call_next):
+    # Activate when header X-TOON: 1 or query param format=toon
+    try:
+        use_header = request.headers.get(\"X-TOON\", \"\").strip() == \"1\"
+        use_q = (request.query_params.get(\"format\") or \"\").strip().lower() == \"toon\"
+        if not (use_header or use_q):
+            return await call_next(request)
+        # call the inner handler
+        resp = await call_next(request)
+        # Only convert JSON responses with common media types and small bodies
+        content_type = (resp.headers.get(\"content-type\") or \"\").lower()
+        if \"application/json\" not in content_type and \"application\" not in content_type:
+            return resp
+        # read body bytes (ensure streaming responses handled)
+        body = b\"\"
+        async for chunk in resp.body_iterator:
+            body += chunk
+        # Try parse JSON
+        try:
+            import json as _json
+            parsed = _json.loads(body.decode(\"utf-8\"))
+        except Exception:
+            # fallback: return original response
+            return _FastAPIResponse(content=body, status_code=resp.status_code, headers=resp.headers, media_type=resp.media_type)
+        toon_text = _to_toon(parsed)
+        headers = dict(resp.headers)
+        # replace content-type with text/plain or custom
+        headers.pop(\"content-length\", None)
+        headers[\"content-type\"] = \"text/plain; charset=utf-8\"
+        return _FastAPIResponse(content=toon_text.encode(\"utf-8\"), status_code=resp.status_code, headers=headers, media_type=\"text/plain\")
+    except Exception as e:
+        # On any failure, return normal response to avoid breaking API
+        try:
+            return await call_next(request)
+        except Exception:
+            return _FastAPIResponse(content=b\"\", status_code=500)
+# ------- END: TOON middleware -------
+
+
+# ------- START: ENHANCED TOON (performance mode) -------
+# Goals:
+# - faster JSON parse/serialize using orjson if available (fallback to json)
+# - optional key-shortening via schema registry
+# - in-memory TTL cache for repeated responses
+# - gzip compression when client accepts it
+# - small API to register endpoint-specific schema maps
+# - safer fallbacks so original behavior is preserved on any error
+import time as _time
+import gzip as _gzip
+import io as _io
+try:
+    import orjson as _orjson  # fast JSON parsing/serialization
+    def _loads(b): return _orjson.loads(b)
+    def _dumps(o): return _orjson.dumps(o)
+except Exception:
+    import json as _json
+    def _loads(b): return _json.loads(b.decode("utf-8"))
+    def _dumps(o): return _json.dumps(o).encode("utf-8")
+
+# Simple in-memory TTL cache
+_toon_cache = {}  # key -> (ts, ttl_seconds, bytes_content, media_type)
+def _cache_set(key: str, content: bytes, media_type: str = "text/plain", ttl: int = 30):
+    _toon_cache[key] = (_time.time(), ttl, content, media_type)
+def _cache_get(key: str):
+    v = _toon_cache.get(key)
+    if not v: 
+        return None
+    ts, ttl, content, media_type = v
+    if _time.time() - ts > ttl:
+        try: del _toon_cache[key]
+        except Exception: pass
+        return None
+    return content, media_type
+
+# Schema registry: allows mapping long keys to short tokens for heavily-used endpoints.
+# Example: register_schema("/api/orders", {"order_id":"o","created_at":"t","items":"i"})
+_schema_registry = {}
+def register_schema(path: str, mapping: dict):
+    _schema_registry[path] = mapping
+
+def _apply_schema_shortening(obj, path):
+    # Replace dict keys according to mapping (non-destructive copy)
+    mapping = _schema_registry.get(path)
+    if not mapping or not isinstance(obj, dict):
+        return obj
+    out = {}
+    for k, v in obj.items():
+        nk = mapping.get(k, k)
+        if isinstance(v, dict):
+            out[nk] = _apply_schema_shortening(v, path)
+        elif isinstance(v, list):
+            out[nk] = [_apply_schema_shortening(x, path) if isinstance(x, dict) else x for x in v]
+        else:
+            out[nk] = v
+    return out
+
+# More compact primitive -> toon (avoid quotes when safe, escape minimally)
+def _primitive_to_toon_fast(v):
+    if v is None: return "n"
+    if isinstance(v, bool): return "1" if v else "0"
+    if isinstance(v, (int,)): return str(v)
+    if isinstance(v, float):
+        # format float with no trailing zeros
+        s = ('{:.8f}'.format(v)).rstrip('0').rstrip('.')
+        return s if s != '' else '0'
+    s = str(v)
+    # minimal escaping: replace newline and '|' which we use as separator
+    s = s.replace("\n","\\n").replace("|","\\|")
+    # if it contains spaces or commas, keep as-is (no quotes to save bytes)
+    return s
+
+def _dict_to_toon_fast(d: dict) -> str:
+    # compact form: key:val|k2:val2  (lists are bracketed with ; between items)
+    parts = []
+    for k, v in d.items():
+        key = str(k)
+        if isinstance(v, dict):
+            parts.append(f\"{key}:{{{_dict_to_toon_fast(v)}}}\")
+        elif isinstance(v, list):
+            if all(not isinstance(x, dict) for x in v):
+                vals = \";\".join(_primitive_to_toon_fast(x) for x in v)
+                parts.append(f\"{key}:[{vals}]\")
+            else:
+                inner = \";\".join(\"{\" + _dict_to_toon_fast(x) + \"}\" if isinstance(x, dict) else _primitive_to_toon_fast(x) for x in v)
+                parts.append(f\"{key}:[{inner}]\")
+        else:
+            parts.append(f\"{key}:{_primitive_to_toon_fast(v)}\")
+    return \"|\".join(parts)
+
+def _to_toon_fast(obj, path_hint=None):
+    # apply schema shortening for top-level dicts when available
+    try:
+        if path_hint and isinstance(obj, dict):
+            obj = _apply_schema_shortening(obj, path_hint)
+        if isinstance(obj, dict):
+            return _dict_to_toon_fast(obj)
+        if isinstance(obj, list):
+            if all(isinstance(x, dict) for x in obj):
+                return \"\\n\".join(_dict_to_toon_fast(x) for x in obj)
+            else:
+                return \";\".join(_primitive_to_toon_fast(x) for x in obj)
+        return _primitive_to_toon_fast(obj)
+    except Exception:
+        # fallback to simple serializer
+        return _to_toon(obj)
+
+# Helper: gzip compress bytes if client accepts gzip
+def _maybe_gzip_bytes(req, bts: bytes):
+    enc = req.headers.get(\"accept-encoding\",\"\" )
+    if \"gzip\" in enc.lower():
+        out = _io.BytesIO()
+        with _gzip.GzipFile(fileobj=out, mode=\"wb\") as f:
+            f.write(bts)
+        return out.getvalue(), \"gzip\"
+    return bts, None
+
+# Enhanced middleware that uses cache, schema shortening, and gzip
+@app.middleware(\"http\")
+async def toon_middleware_enhanced(request: _RequestFastAPI, call_next):
+    try:
+        use_header = request.headers.get(\"X-TOON\", \"\").strip() == \"1\"
+        use_q = (request.query_params.get(\"format\") or \"\").strip().lower() == \"toon\"
+        if not (use_header or use_q):
+            return await call_next(request)
+        # build cache key from path, query, uid header/body (if exists)
+        cache_key = f\"toon:{request.url.path}?{request.url.query}\"
+        # include UID if header exists to avoid serving others' private responses
+        uid_h = request.headers.get(\"x-uid\") or request.headers.get(\"x-user-id\") or \"\"
+        if uid_h: cache_key += \":\" + uid_h
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            content, media_type = cached
+            # respect gzip handling
+            if request.headers.get(\"accept-encoding\",\"").lower().find(\"gzip\") >= 0 and media_type == \"text/plain+gzip\":
+                return _FastAPIResponse(content=content, status_code=200, media_type=\"text/plain\", headers={\"Content-Encoding\":\"gzip\"})
+            return _FastAPIResponse(content=content, status_code=200, media_type=media_type)
+        resp = await call_next(request)
+        content_type = (resp.headers.get(\"content-type\") or \"\").lower()
+        if not (\"application/json\" in content_type or \"application\" in content_type):
+            return resp
+        # read body
+        body = b\"\"
+        async for chunk in resp.body_iterator:
+            body += chunk
+        try:
+            parsed = _loads(body)
+        except Exception:
+            return _FastAPIResponse(content=body, status_code=resp.status_code, headers=resp.headers, media_type=resp.media_type)
+        # produce toon (fast)
+        toon_text = _to_toon_fast(parsed, path_hint=request.url.path)
+        b = toon_text.encode(\"utf-8\")
+        # maybe gzip
+        gz_b, gz_flag = _maybe_gzip_bytes(request, b)
+        headers = dict(resp.headers)
+        headers.pop(\"content-length\", None)
+        if gz_flag:
+            headers[\"content-encoding\"] = \"gzip\"
+            headers[\"content-type\"] = \"text/plain; charset=utf-8\"
+            _cache_set(cache_key, gz_b, media_type=\"text/plain+gzip\", ttl=60)
+            return _FastAPIResponse(content=gz_b, status_code=resp.status_code, headers=headers, media_type=\"text/plain\")
+        else:
+            headers[\"content-type\"] = \"text/plain; charset=utf-8\"
+            _cache_set(cache_key, b, media_type=\"text/plain\", ttl=30)
+            return _FastAPIResponse(content=b, status_code=resp.status_code, headers=headers, media_type=\"text/plain\")
+    except Exception:
+        # fallback: don't break API
+        try:
+            return await call_next(request)
+        except Exception:
+            return _FastAPIResponse(content=b\"\", status_code=500)
+
+# Example: register a small schema map for common endpoints to shrink keys
+try:
+    register_schema(\"/api/orders\", {\"order_id\":\"o\",\"created_at\":\"t\",\"items\":\"i\",\"price\":\"p\",\"quantity\":\"q\",\"status\":\"s\"})
+    register_schema(\"/api/public/pricing\", {\"price_per_k\":\"ppk\",\"min_qty\":\"mn\",\"max_qty\":\"mx\"})
+except Exception:
+    pass
+
+# ------- END: ENHANCED TOON (performance mode) -------
